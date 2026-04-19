@@ -39,6 +39,7 @@ def save_trajectory(trajectory: List[Dict[str, Any]], model: str, completed: boo
     if filename is None:
         filename = "trajectory_samples.jsonl" if completed else "failed_trajectories.jsonl"
     entry = {"conversations": trajectory, "timestamp": datetime.now().isoformat(), "model": model, "completed": completed}
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
     try:
         line = json.dumps(entry, ensure_ascii=False) + "\n"  # serialize before taking the lock
         with open(filename, "a", encoding="utf-8") as f:
