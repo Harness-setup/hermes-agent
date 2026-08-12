@@ -71,9 +71,34 @@ try {
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr hWnd);
 [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int dwProcessId);
 [DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);
+[DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();
 '@ -ErrorAction Stop
     $script:Win32 = $true
 } catch { $script:Win32 = $false }
+# Belt-and-suspenders console hide: the `cmd /d /s /c start "" /min` launch
+# (updater-process.ts) is a *hint* at process-creation time, not a
+# guarantee -- it's been observed not holding on at least one real Windows
+# 11 machine, leaving this console fully visible for the whole hand-off
+# instead of backgrounded. A true CREATE_NO_WINDOW/windowsHide at spawn
+# time was already tried and rejected (see the big comment above
+# wrapHandoffForDetachedConsole in updater-process.ts: it makes PowerShell
+# 5.1 die during console init before -File even runs). This is a different
+# mechanism -- a normal user32 call made from WITHIN the script, well after
+# PowerShell has already finished console init and is running real code --
+# so it carries none of that risk. Purely additive: if GetConsoleWindow/
+# ShowWindow ever fails for any reason, the script continues exactly as it
+# did before this existed, no worse off than today. Skipped under
+# -SelfTestUi: that mode is a developer manually driving the shim through
+# its states, and losing live console output would be pure friction for
+# no safety benefit (there's no real Desktop hand-off to keep invisible).
+if ($script:Win32 -and -not $SelfTestUi) {
+    try {
+        $consoleHwnd = [HermesHandoff.Win32]::GetConsoleWindow()
+        if ($consoleHwnd -ne [System.IntPtr]::Zero) {
+            [HermesHandoff.Win32]::ShowWindow($consoleHwnd, 0) | Out-Null  # SW_HIDE
+        }
+    } catch {}
+}
 # Render UTF-8 glyphs (checkmarks, arrows) correctly in our own console echo
 # too; the legacy conhost default OEM codepage shows them as mojibake.
 try {
