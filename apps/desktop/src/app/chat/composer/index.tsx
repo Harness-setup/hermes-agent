@@ -736,7 +736,19 @@ export function ChatBar({
     // Tab must not fall through to the browser — it would move focus out of
     // the composer mid-completion, which reads as the popover "eating" the
     // keypress. Swallow it; the refresh lands with the items.
-    if (trigger && triggerLoading && triggerItems.length === 0 && event.key === 'Tab') {
+    //
+    // Loading alone (not just an empty triggerItems) is the right gate: the
+    // re-fetch effect in useComposerTrigger calls triggerAdapter.search() the
+    // instant the query changes (e.g. expanding `/mode` to its arg stage),
+    // and search() synchronously returns the PREVIOUS stage's cached items
+    // while the real fetch is still in flight — triggerLoading is true, but
+    // triggerItems briefly holds stale leftovers, not the empty array this
+    // guard used to require. A fast double-Tab landed inside that window,
+    // matched `triggerItems.length > 0` below, and "accepted" the stale item
+    // (silently re-running the expand step) instead of ever seeing the real
+    // arg-stage dropdown — reproducible on any first-time (uncached) query,
+    // not something specific to one command.
+    if (trigger && triggerLoading && event.key === 'Tab') {
       event.preventDefault()
       triggerKeyConsumedRef.current = true
 
