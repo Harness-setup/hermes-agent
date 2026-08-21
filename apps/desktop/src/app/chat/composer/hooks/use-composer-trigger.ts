@@ -367,10 +367,20 @@ export function useComposerTrigger({
     // already an arg pick (`/personality alice`), so it commits normally. An
     // inline (mid-message) pick never expands: it's a reference inside prose, so
     // there's no command invocation for the args to belong to.
+    //
+    // Trim before checking for that space: the backend appends a trailing
+    // space to any EXACT command-name match (so the completion menu stays
+    // open rather than looking like a no-op) -- see
+    // SlashCommandCompleter._completion_text. That trailing space carries no
+    // argument, but an untrimmed check reads it as one, so accepting a
+    // plugin-registered options command (e.g. /mode) by typing it out and
+    // pressing Space/Tab committed it as a flat chip instead of expanding to
+    // its argument dropdown -- live-confirmed 2026-08-20.
     const command = (item.metadata as { command?: string } | undefined)?.command ?? ''
 
     const argumentMode = desktopSlashCommandArgumentMode(command)
-    const expandsToArgs = trigger.kind === '/' && !trigger.inline && !serialized.includes(' ') && argumentMode !== null
+    const expandsToArgs =
+      trigger.kind === '/' && !trigger.inline && !serialized.trim().includes(' ') && argumentMode !== null
 
     const text = starter || serialized.endsWith(' ') ? serialized : `${serialized} `
     const directive = !starter && serialized.match(/^@([^:]+):(.+)$/)
