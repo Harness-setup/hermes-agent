@@ -469,6 +469,32 @@ def test_ensure_db_session_runs_after_system_prompt_restore():
     assert agent._cached_system_prompt == "REBUILT-SYSTEM"
 
 
+from unittest.mock import MagicMock
+
+
+def test_pre_llm_call_hook_receives_fallback_activated_true(monkeypatch):
+    agent = _FakeAgent()
+    agent._fallback_activated = True
+    mock_invoke = MagicMock(return_value=[])
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", mock_invoke)
+
+    _build(agent)
+
+    assert mock_invoke.call_args.kwargs["fallback_activated"] is True
+
+
+def test_pre_llm_call_hook_receives_fallback_activated_false_by_default(monkeypatch):
+    """_FakeAgent never sets _fallback_activated -- the hook call must not
+    raise (AttributeError) and must default the flag to False."""
+    agent = _FakeAgent()
+    mock_invoke = MagicMock(return_value=[])
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", mock_invoke)
+
+    _build(agent)
+
+    assert mock_invoke.call_args.kwargs["fallback_activated"] is False
+
+
 # ── Between-turns MCP refresh (cache-safe late-binding) ──────────────────────
 #
 # A slow MCP server that connects after the agent's build-time tool snapshot
