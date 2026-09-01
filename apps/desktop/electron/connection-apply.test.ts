@@ -83,12 +83,46 @@ describe('resolveTerminalConnection', () => {
   })
 
   it('does not start a local terminal while configured SSH remains unavailable', async () => {
+    const ensureBackend = vi.fn(async () => undefined)
+
     await expect(
       resolveTerminalConnection(
         () => 'pending',
-        async () => undefined
+        ensureBackend,
+        async () => undefined // no real delay -- getTarget stays 'pending' regardless
       )
     ).rejects.toThrow('not ready')
+    // A persistently-unavailable target must not retry the backend itself
+    // over and over -- only re-poll the already-cheap getTarget() call.
+    expect(ensureBackend).toHaveBeenCalledOnce()
+  })
+
+  it('resolves once getTarget flips after a few polls, without calling ensureBackend again', async () => {
+    // Tony: "Terminal failed to start: ... Remote connection is not ready
+    // yet." -- the real bug this covers: getTarget() can still say
+    // 'pending' immediately after ensureBackend()'s single await
+    // resolves (a real SSH/WSL cold start finishing a moment later, not
+    // synchronized with that exact promise). Simulates getTarget flipping
+    // to the real target on the 4th poll, not the 1st.
+    const target = { ssh: {}, scope: '' }
+    const getTarget = vi
+      .fn()
+      .mockReturnValueOnce('pending') // pre-check
+      .mockReturnValueOnce('pending') // immediately after ensureBackend
+      .mockReturnValueOnce('pending') // poll 1
+      .mockReturnValueOnce('pending') // poll 2
+      .mockReturnValueOnce('pending') // poll 3
+      .mockReturnValueOnce(target) // poll 4
+    const ensureBackend = vi.fn(async () => undefined)
+    const delays: number[] = []
+
+    await expect(
+      resolveTerminalConnection(getTarget, ensureBackend, async ms => {
+        delays.push(ms)
+      })
+    ).resolves.toBe(target)
+    expect(ensureBackend).toHaveBeenCalledOnce()
+    expect(delays).toHaveLength(4)
   })
 })
 
