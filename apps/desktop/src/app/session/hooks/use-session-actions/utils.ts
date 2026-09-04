@@ -21,6 +21,7 @@ import {
   ownerLookupSessionRows,
   releaseWorkspaceCwdOwner,
   sessionMatchesStoredId,
+  setUnlistedSessionOwnerRows,
   setCronSessions,
   setCurrentBranch,
   setCurrentCwdTransient,
