@@ -1225,8 +1225,9 @@ def _close_sessions_for_transport(
     detached = 0
     for sid, session in owned:
         if session.get("close_on_disconnect"):
-            _close_session_by_id(sid, end_reason=end_reason)
-            reaped += 1
+            if _close_session_by_id(sid, end_reason=end_reason):
+                reaped += 1
+                _maybe_schedule_uncensored_erasure(sid)
         else:
             # Point detached sessions at the drop sentinel (NOT real stdio) so
             # _ws_session_is_orphaned recognizes them and the grace-reap can

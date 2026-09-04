@@ -92,3 +92,32 @@ def test_missing_state_file_is_a_silent_no_op(tmp_path):
         "s1", state_path=tmp_path / "does-not-exist.json",
     )
     # No exception is the assertion here.
+
+
+def test_close_on_disconnect_teardown_also_schedules_uncensored_erasure(monkeypatch):
+    """Live investigation, 2026-09-03: a close_on_disconnect=True session
+    (e.g. Desktop's sidecar chat, ChatSidebar.tsx) is torn down IMMEDIATELY
+    by _close_sessions_for_transport, via a separate branch that never goes
+    through _schedule_ws_orphan_reap -- the only place the 4th erasure
+    trigger was wired in. That session could carry the tracked uncensored
+    session_id and simply vanish from erasure coverage on disconnect,
+    silently defeating the whole point of this trigger for that path."""
+    seen = []
+    monkeypatch.setattr(
+        server,
+        "_teardown_popped_session",
+        lambda session, *, end_reason: True,
+    )
+    monkeypatch.setattr(
+        server,
+        "_maybe_schedule_uncensored_erasure",
+        lambda sid: seen.append(sid),
+    )
+    transport = object()
+    server._sessions.clear()
+    server._sessions["s1"] = {"transport": transport, "close_on_disconnect": True}
+    try:
+        server._close_sessions_for_transport(transport, end_reason="ws_disconnect")
+        assert seen == ["s1"]
+    finally:
+        server._sessions.clear()
