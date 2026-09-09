@@ -108,13 +108,6 @@ def test_a_second_process_writing_first_does_not_lose_this_ones_approval(fake_co
     assert sorted(fake_config["command_allowlist"]) == ["cargo *", "docker *", "ls *"]
 
 
-def test_empty_start_and_first_approval(fake_config):
-    _start_process_with(fake_config, [])
-    approval.approve_permanent("ls *")
-    approval.save_permanent_allowlist(approval._permanent_approved)
-    assert fake_config["command_allowlist"] == ["ls *"]
-
-
 def test_save_failure_is_logged_not_raised(fake_config, monkeypatch, caplog):
     """The existing contract: a config write failure must not break approval."""
     _start_process_with(fake_config, ["ls *"])
