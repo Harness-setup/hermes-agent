@@ -1,41 +1,34 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen } from '@testing-library/react'
+import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { requestGateway } = vi.hoisted(() => ({ requestGateway: vi.fn() }))
+const { requestGateway } = vi.hoisted(() => ({
+  requestGateway: vi.fn(async () => ({ plugins: [] }))
+}))
 
 vi.mock('@/app/gateway/hooks/use-gateway-request', () => ({
   useGatewayRequest: () => ({ requestGateway })
 }))
 
 import { $pluginRecords } from '@/contrib/plugins-store'
-import {
-  $agentPluginBusy,
-  $agentPlugins,
-  $agentPluginsError,
-  $agentPluginsStatus,
-  type AgentPluginRow
-} from '@/store/agent-plugins'
-import { $connection, $gatewayState } from '@/store/session'
+import { $agentPlugins, $agentPluginsStatus } from '@/store/agent-plugins'
+import { $gatewayState } from '@/store/session'
 
 import { PluginsSettings } from './plugins-settings'
 
-const legacyRow = {
-  name: 'Legacy plugin',
-  version: '0.20.0',
-  description: 'Returned by a pre-key backend',
-  source: 'user',
-  status: 'disabled'
-} satisfies AgentPluginRow
+const renderSettings = () =>
+  render(
+    <MemoryRouter>
+      <PluginsSettings />
+    </MemoryRouter>
+  )
 
 beforeEach(() => {
-  requestGateway.mockReset()
+  requestGateway.mockClear()
   $pluginRecords.set({})
-  $agentPlugins.set([legacyRow])
+  $agentPlugins.set([])
   $agentPluginsStatus.set('ready')
-  $agentPluginsError.set(null)
-  $agentPluginBusy.set(null)
   $gatewayState.set('idle')
-  $connection.set(null)
 })
 
 afterEach(() => {
@@ -44,63 +37,93 @@ afterEach(() => {
 })
 
 describe('PluginsSettings', () => {
-  it('renders and searches plugin rows returned without a canonical key', () => {
-    render(<PluginsSettings />)
+  it('points agent-plugin management at Capabilities instead of duplicating the list', () => {
+    // Agent plugins are profile-scoped and managed in Capabilities → Plugins;
+    // Settings keeps desktop plugins only, plus a pointer.
+    $agentPlugins.set([
+      {
+        description: 'Should NOT be listed here anymore',
+        key: 'demo-plugin',
+        name: 'demo-plugin',
+        source: 'git',
+        status: 'enabled',
+        version: '1.0.0'
+      }
+    ])
 
-    expect(screen.getByText('Legacy plugin')).toBeTruthy()
+    renderSettings()
 
-    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'pre-key' } })
-
-    expect(screen.getByText('Legacy plugin')).toBeTruthy()
+    expect(screen.queryByText('demo-plugin')).toBeNull()
+    expect(screen.getByText(/managed per profile in Capabilities/)).toBeTruthy()
+    expect(screen.getByRole('link', { name: /Capabilities/ }).getAttribute('href')).toContain('/skills?tab=plugins')
   })
 
-  it('renders keyless rows read-only instead of falling back to name-addressed toggles', () => {
-    // Name-addressed toggles flip every same-named plugin across category
-    // dirs (image_gen/fal vs video_gen/fal) — the reason toggles moved to
-    // canonical keys. A pre-contract-v6 row must never reach the RPC.
-    render(<PluginsSettings />)
+  it('flags a unified-root desktop half whose agent half is missing on this backend', () => {
+    $pluginRecords.set({
+      'pixel-overlay': {
+        id: 'pixel-overlay',
+        name: 'Pixel Overlay',
+        kind: 'disk',
+        status: 'loaded',
+        file: '/home/user/.hermes/plugins/pixel-overlay/desktop/plugin.js'
+      }
+    })
+    $agentPlugins.set([]) // connected backend has no agent half
+    $agentPluginsStatus.set('ready')
 
-    const toggle = screen.getByRole('switch', { name: 'Enable Legacy plugin' })
+    renderSettings()
 
-    expect(toggle.hasAttribute('disabled') || toggle.getAttribute('aria-disabled') === 'true').toBe(true)
-
-    fireEvent.click(toggle)
-
-    expect(requestGateway).not.toHaveBeenCalledWith('plugins.manage', expect.objectContaining({ action: 'toggle' }))
+    expect(screen.getByText('agent half missing here')).toBeTruthy()
   })
 
-  it('keeps duplicate-named keyless rows distinct (no React key collision)', () => {
-    const sibling = {
-      ...legacyRow,
-      description: 'A second plugin category with the same legacy name'
-    }
+  it('does not flag when the agent half exists on the connected backend', () => {
+    $pluginRecords.set({
+      'pixel-overlay': {
+        id: 'pixel-overlay',
+        name: 'Pixel Overlay',
+        kind: 'disk',
+        status: 'loaded',
+        file: '/home/user/.hermes/plugins/pixel-overlay/desktop/plugin.js'
+      }
+    })
+    $agentPlugins.set([
+      {
+        description: '',
+        key: 'pixel-overlay',
+        name: 'pixel-overlay',
+        source: 'user',
+        status: 'enabled',
+        version: '1.0.0'
+      }
+    ])
 
-    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    renderSettings()
 
-    $agentPlugins.set([legacyRow, sibling])
-
-    render(<PluginsSettings />)
-
-    expect(screen.getAllByRole('switch', { name: 'Enable Legacy plugin' })).toHaveLength(2)
-    expect(screen.getByText(sibling.description)).toBeTruthy()
-    expect(consoleError.mock.calls.flat().join(' ')).not.toContain('same key')
+    expect(screen.queryByText('agent half missing here')).toBeNull()
   })
 
-  it('keeps using the canonical key when the backend provides one', async () => {
-    const keyedRow = { ...legacyRow, key: 'image_gen/legacy' }
+  it('does not flag standalone desktop plugins (not from the unified root)', () => {
+    $pluginRecords.set({
+      standalone: {
+        id: 'standalone',
+        name: 'Standalone Theme',
+        kind: 'disk',
+        status: 'loaded',
+        file: '/home/user/.config/hermes-desktop/desktop-plugins/standalone/plugin.js'
+      }
+    })
+    $agentPlugins.set([])
 
-    $agentPlugins.set([keyedRow])
-    requestGateway.mockResolvedValue({ ok: true, plugin: { ...keyedRow, status: 'enabled' } })
+    renderSettings()
 
-    render(<PluginsSettings />)
-    fireEvent.click(screen.getByRole('switch', { name: 'Enable Legacy plugin' }))
+    expect(screen.queryByText('agent half missing here')).toBeNull()
+  })
 
-    await waitFor(() =>
-      expect(requestGateway).toHaveBeenCalledWith('plugins.manage', {
-        action: 'toggle',
-        key: 'image_gen/legacy',
-        enable: true
-      })
-    )
+  it('loads the connected backend plugin list once the gateway opens (badge data)', () => {
+    $gatewayState.set('open')
+
+    renderSettings()
+
+    expect(requestGateway).toHaveBeenCalledWith('plugins.manage', expect.objectContaining({ action: 'list' }))
   })
 })

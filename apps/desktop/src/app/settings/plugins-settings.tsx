@@ -1,5 +1,6 @@
 import { useStore } from '@nanostores/react'
-import { type ReactNode, useEffect, useState } from 'react'
+import { type ReactNode, useEffect } from 'react'
+import { Link } from 'react-router'
 
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { Button } from '@/components/ui/button'
@@ -11,42 +12,18 @@ import { discoverRuntimePlugins } from '@/contrib/runtime-loader'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { FolderOpen, Monitor, Package, RefreshCw } from '@/lib/icons'
-import { normalize } from '@/lib/text'
-import {
-  $agentPluginBusy,
-  $agentPlugins,
-  $agentPluginsError,
-  $agentPluginsStatus,
-  type AgentPluginRow,
-  type GatewayRequest,
-  loadAgentPlugins,
-  toggleAgentPlugin
-} from '@/store/agent-plugins'
+import { $agentPlugins, $agentPluginsStatus, loadAgentPlugins } from '@/store/agent-plugins'
 import { notifyError } from '@/store/notifications'
-import { $connection, $gatewayState } from '@/store/session'
+import { openPluginInstallRequest } from '@/store/plugin-install-request'
+import { $gatewayState } from '@/store/session'
 
-import { EmptyState, ListRowSkeleton, Pill, SettingsContent, SettingsSection } from './primitives'
+import { EmptyState, Pill, SettingsContent, SettingsSection } from './primitives'
+import { useDeepLinkHighlight } from './use-deep-link-highlight'
 
 const KIND_ORDER: Record<PluginRecord['kind'], number> = { disk: 0, runtime: 1, bundled: 2 }
 
-// User-installed plugins first, bundled last — mirrors `hermes plugins list`.
-const SOURCE_ORDER: Record<string, number> = { user: 0, git: 0, project: 1, entrypoint: 2, bundled: 3 }
-
-// Plugin categories (by registry key prefix) that other surfaces own — same
-// curation stance as desktop-slash-commands.ts. dashboard_auth/* only matters
-// to `hermes dashboard`; model-providers/* are configured in Settings →
-// Models; platforms/* are managed from Messaging. The plugin switch is not
-// the user-facing control for any of them, so listing them here is noise.
-const HIDDEN_KEY_PREFIXES = ['dashboard_auth/', 'model-providers/', 'platforms/']
-
-const isDesktopRelevant = (row: AgentPluginRow) => {
-  const key = row.key
-
-  return !key || !HIDDEN_KEY_PREFIXES.some(prefix => key.startsWith(prefix))
-}
-
-const agentPluginRowKey = (row: AgentPluginRow) =>
-  row.key ?? [row.name, row.source, row.version, row.description].join('\0')
+/** Deep-link anchor for a plugin row (`?tab=plugins&plugin=<id>`). */
+export const pluginElementId = (target: string) => `plugin-${target}`
 
 function reveal(file: string) {
   void window.hermesDesktop?.revealPath?.(file)?.catch(() => undefined)
@@ -76,44 +53,21 @@ async function revealPluginsDir() {
   }
 }
 
-// Agent plugins live under the BACKEND's hermes home (profile-aware), so the
-// path comes from the gateway — not from the renderer's local HERMES_HOME.
-// Callers gate on a local connection: openDir mkdir-creates the path, which
-// must never happen for a directory that belongs to a remote box.
-async function revealAgentPluginsDir(request: GatewayRequest) {
-  try {
-    const result = await request<{ home?: string }>('config.get', { key: 'profile' })
-    const home = (result?.home ?? '').trim()
-
-    if (!home) {
-      notifyError('The backend did not report its home directory', 'Could not open the plugins folder')
-
-      return
-    }
-
-    const opened = await window.hermesDesktop?.openDir?.(`${home}/plugins`)
-
-    if (opened && !opened.ok) {
-      notifyError(opened.error ?? 'unknown error', 'Could not open the plugins folder')
-    }
-  } catch (err) {
-    notifyError(err, 'Could not open the plugins folder')
-  }
-}
-
 // Compact row: name + pills and a wrapping description on the left, controls
 // pinned top-right. Same type scale as ListRow, without its wide control grid.
 function PluginLine({
   title,
   description,
-  controls
+  controls,
+  id
 }: {
   title: ReactNode
   description?: ReactNode
   controls: ReactNode
+  id?: string
 }) {
   return (
-    <div className="flex items-start gap-3 py-2">
+    <div className="flex items-start gap-3 rounded-lg py-2" id={id}>
       <div className="min-w-0 flex-1 pr-4">
         <div className="flex flex-wrap items-center gap-2 text-[length:var(--conversation-text-font-size)] font-medium text-foreground">
           {title}
@@ -129,140 +83,59 @@ function PluginLine({
   )
 }
 
-function AgentPluginRowView({ row }: { row: AgentPluginRow }) {
-  const { t } = useI18n()
-  const p = t.settings.plugins
-  const { requestGateway } = useGatewayRequest()
-  const busy = useStore($agentPluginBusy)
-  const key = row.key
+/** Folder name when a desktop plugin entry lives in the UNIFIED agent-plugins
+ *  root (`~/.hermes/plugins/<name>/desktop/plugin.js`) — i.e. it is the
+ *  desktop half of a bundled agent+desktop package. Null for standalone
+ *  desktop plugins. */
+function unifiedPackageName(file?: string): null | string {
+  if (!file) {
+    return null
+  }
 
-  // Pre-contract-v6 backends return rows without a canonical key. Name-addressed
-  // toggles silently flip every same-named plugin across category dirs
-  // (image_gen/fal vs video_gen/fal), so keyless rows are read-only — the
-  // backend-contract skew toast tells the user to update.
-  const toggle = (
-    <Switch
-      aria-label={`${row.status === 'enabled' ? p.disable : p.enable} ${row.name}`}
-      checked={row.status === 'enabled'}
-      disabled={!key || busy === key}
-      onCheckedChange={on => {
-        if (!key) {
-          return
-        }
+  const match = /[\\/]plugins[\\/]([^\\/]+)[\\/]desktop[\\/]plugin\.js$/.exec(file)
 
-        triggerHaptic('selection')
-        void toggleAgentPlugin(requestGateway, key, on, p.agent.toggleFailed(row.name))
-      }}
-    />
-  )
+  return match ? match[1] : null
+}
 
-  return (
-    <PluginLine
-      controls={key ? toggle : <Tip label={p.agent.updateBackendToManage}>{toggle}</Tip>}
-      description={row.description || (row.version ? `v${row.version}` : undefined)}
-      title={
-        <>
-          <span>{row.name}</span>
-          <Pill>{p.agent.sources[row.source] ?? row.source}</Pill>
-          {row.portable && <Pill tone="primary">{p.agent.portable}</Pill>}
-        </>
+/** Open the dual-target install modal pre-filled to install ONLY the agent
+ *  half of a bundled package (drift repair). Provenance comes from the
+ *  package's catalog sidecar when present; otherwise the git remote of the
+ *  plugin folder is unknown and we fall back to asking the user via the
+ *  standard flow with the folder name as identifier hint. */
+async function repairAgentHalf(record: PluginRecord, packageName: string) {
+  let repo = ''
+  let catalogName: string | undefined
+  let sha: string | undefined
+
+  try {
+    const pluginDir = record.file?.replace(/[\\/]desktop[\\/]plugin\.js$/, '')
+
+    const raw = pluginDir ? await window.hermesDesktop?.readFileText?.(`${pluginDir}/.hermes-catalog.json`) : null
+
+    if (raw) {
+      const sidecar = JSON.parse(typeof raw === 'string' ? raw : ((raw as { content?: string }).content ?? '')) as {
+        catalog_name?: string
+        repo?: string
+        sha?: string
       }
-    />
-  )
-}
 
-function AgentPluginsSection() {
-  const { t } = useI18n()
-  const p = t.settings.plugins
-  const { requestGateway } = useGatewayRequest()
-  const gatewayState = useStore($gatewayState)
-  const connection = useStore($connection)
-  const rows = useStore($agentPlugins)
-  const status = useStore($agentPluginsStatus)
-  const error = useStore($agentPluginsError)
-  const [query, setQuery] = useState('')
-
-  useEffect(() => {
-    if (gatewayState !== 'open') {
-      return
+      repo = sidecar.repo ?? ''
+      catalogName = sidecar.catalog_name
+      sha = sidecar.sha
     }
+  } catch {
+    // No sidecar (raw-git bundled install) — fall through to the name hint.
+  }
 
-    void loadAgentPlugins(requestGateway)
-  }, [gatewayState, requestGateway])
-
-  const needle = normalize(query)
-
-  const sorted = rows
-    .filter(isDesktopRelevant)
-    .filter(
-      row =>
-        !needle ||
-        row.name.toLowerCase().includes(needle) ||
-        (row.key ?? '').toLowerCase().includes(needle) ||
-        row.description.toLowerCase().includes(needle)
-    )
-    .sort((a, b) => (SOURCE_ORDER[a.source] ?? 9) - (SOURCE_ORDER[b.source] ?? 9) || a.name.localeCompare(b.name))
-
-  return (
-    <SettingsSection
-      icon={Package}
-      meta={status === 'ready' ? p.count(sorted.length) : undefined}
-      title={p.agent.title}
-    >
-      <p className="mb-2 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
-        {p.agent.blurb}
-      </p>
-
-      {connection?.mode !== 'remote' && (
-        <div className="mb-2 flex items-center gap-3">
-          <Button
-            onClick={() => void revealAgentPluginsDir(requestGateway)}
-            size="sm"
-            type="button"
-            variant="textStrong"
-          >
-            <FolderOpen className="size-3.5" />
-            <span>{p.openFolder}</span>
-          </Button>
-        </div>
-      )}
-
-      <input
-        className="mb-2 w-full rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) px-3 py-1.5 text-[length:var(--conversation-caption-font-size)] outline-none placeholder:text-(--ui-text-tertiary) focus:border-(--ui-stroke-secondary)"
-        onChange={event => setQuery(event.target.value)}
-        placeholder={p.agent.search}
-        spellCheck={false}
-        value={query}
-      />
-
-      {status === 'loading' || status === 'idle' ? (
-        <div>
-          <ListRowSkeleton />
-          <ListRowSkeleton />
-          <ListRowSkeleton />
-        </div>
-      ) : status === 'error' ? (
-        <EmptyState description={error ?? undefined} title={p.agent.loadFailed} />
-      ) : sorted.length === 0 ? (
-        needle ? (
-          <p className="text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
-            {p.agent.noMatches}
-          </p>
-        ) : (
-          <EmptyState title={p.agent.empty} />
-        )
-      ) : (
-        <div>
-          {sorted.map(row => (
-            <AgentPluginRowView key={agentPluginRowKey(row)} row={row} />
-          ))}
-        </div>
-      )}
-    </SettingsSection>
-  )
+  openPluginInstallRequest({
+    catalogName,
+    legacyHint: 'agent',
+    repo: repo || packageName,
+    sha
+  })
 }
 
-function PluginRow({ record }: { record: PluginRecord }) {
+function PluginRow({ record, agentHalfMissing }: { record: PluginRecord; agentHalfMissing?: boolean }) {
   const { t } = useI18n()
   const p = t.settings.plugins
 
@@ -294,11 +167,24 @@ function PluginRow({ record }: { record: PluginRecord }) {
           (record.description ?? record.file ?? record.id)
         )
       }
+      id={pluginElementId(record.id)}
       title={
         <>
           <span>{record.name}</span>
           <Pill>{p.kinds[record.kind]}</Pill>
           {record.status === 'error' && <Pill tone="primary">{p.failed}</Pill>}
+          {agentHalfMissing && (
+            <Tip label={p.agentHalfMissingTip}>
+              <Button
+                className="h-5 px-1.5 text-[0.65rem]"
+                onClick={() => void repairAgentHalf(record, unifiedPackageName(record.file) ?? record.name)}
+                size="xs"
+                variant="outline"
+              >
+                {p.agentHalfMissing}
+              </Button>
+            </Tip>
+          )}
         </>
       }
     />
@@ -309,6 +195,34 @@ export function PluginsSettings() {
   const { t } = useI18n()
   const p = t.settings.plugins
   const records = useStore($pluginRecords)
+  const { requestGateway } = useGatewayRequest()
+  const gatewayState = useStore($gatewayState)
+  // The agent-plugin list for the CURRENTLY connected backend's active
+  // profile — used only to flag bundled packages whose desktop half is local
+  // but whose agent half is not installed where the app is now pointing (one
+  // desktop app, N agents: switching gateway/profile makes this drift visible
+  // instead of silent). Management of agent plugins lives in Capabilities →
+  // Plugins; this page keeps just the badge.
+  const agentRows = useStore($agentPlugins)
+  const agentStatus = useStore($agentPluginsStatus)
+  const agentNames = new Set(agentRows.flatMap(row => [row.name, row.key ?? row.name]))
+
+  useEffect(() => {
+    if (gatewayState !== 'open') {
+      return
+    }
+
+    void loadAgentPlugins(requestGateway)
+  }, [gatewayState, requestGateway])
+
+  // Deep-link from settings search (?plugin=<id or key>): rows render as soon
+  // as their store hydrates, so "ready" is simply target-present; the polling
+  // in the hook rides out the async list loads (agent rows arrive via RPC).
+  useDeepLinkHighlight({
+    param: 'plugin',
+    ready: () => true,
+    elementId: pluginElementId
+  })
 
   const rows = Object.values(records).sort(
     (a, b) => KIND_ORDER[a.kind] - KIND_ORDER[b.kind] || a.name.localeCompare(b.name)
@@ -316,6 +230,11 @@ export function PluginsSettings() {
 
   return (
     <SettingsContent>
+      <div className="mb-4">
+        <Button onClick={() => openPluginInstallRequest({ repo: '' })} size="sm" type="button" variant="secondary">
+          {p.installModal.installFromGit}
+        </Button>
+      </div>
       <SettingsSection icon={Monitor} meta={p.count(rows.length)} title={p.title}>
         <p className="mb-2 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">{p.blurb}</p>
 
@@ -342,14 +261,29 @@ export function PluginsSettings() {
           <EmptyState title={p.empty} />
         ) : (
           <div>
-            {rows.map(record => (
-              <PluginRow key={record.id} record={record} />
-            ))}
+            {rows.map(record => {
+              const packageName = unifiedPackageName(record.file)
+
+              return (
+                <PluginRow
+                  agentHalfMissing={packageName !== null && agentStatus === 'ready' && !agentNames.has(packageName)}
+                  key={record.id}
+                  record={record}
+                />
+              )
+            })}
           </div>
         )}
       </SettingsSection>
 
-      <AgentPluginsSection />
+      <SettingsSection icon={Package} title={p.agent.title}>
+        <p className="text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+          {p.agent.movedToCapabilities}{' '}
+          <Link className="text-(--ui-text-link,var(--ui-accent))" to="/skills?tab=plugins">
+            {p.agent.openCapabilities}
+          </Link>
+        </p>
+      </SettingsSection>
     </SettingsContent>
   )
 }
