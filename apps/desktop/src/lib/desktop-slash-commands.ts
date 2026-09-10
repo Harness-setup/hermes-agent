@@ -236,44 +236,12 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     argumentMode: 'mixed'
   },
 
-<<<<<<< HEAD
-  // Backend-executed commands that render useful inline output.
-  // Commands with a dedicated gateway RPC (@method in tui_gateway/server.py)
-  // route to it directly via `rpc(...)` — bypassing slash.exec avoids the
-  // slash-worker pipe timeout and the "not a quick/plugin/skill command"
-  // fallback noise for commands the dispatcher doesn't handle inline.
-  // These commands have gateway RPCs, but their established desktop behavior
-  // carries richer CLI semantics: /agents includes delegations, /stop cancels
-  // them, /steer falls back to a next-turn prompt, and /usage is a formatted
-  // live report. Keep them on slash.exec until their RPC contracts are fully
-  // equivalent.
-  {
-    name: '/approvals',
-    description: 'Show or set approval mode [manual|smart|off]',
-    surface: exec(),
-    argumentMode: 'options'
-  },
   {
     name: '/mode',
     description: 'Switch model mode: cloud|local [model]|uncensored [model]|status',
     surface: exec(),
     argumentMode: 'options'
   },
-  {
-    name: '/agents',
-    description: 'Show active desktop sessions and running tasks',
-    aliases: ['/tasks'],
-    surface: exec()
-  },
-  {
-    name: '/background',
-    description: 'Run a prompt in the background',
-    aliases: ['/bg', '/btw'],
-    surface: exec(),
-    argumentMode: 'text'
-  },
-=======
->>>>>>> main
   // /compress must be an action (session.compress RPC), not exec: the slash
   // worker route times out on large sessions (30s WS / 45s pipe) before the
   // LLM summarise call finishes, then command.dispatch surfaces a bogus

@@ -389,9 +389,83 @@ def _rollup_children_cost(parent_agent, children_cost_total: float) -> None:
     except Exception:
         logger.debug("Subagent cost rollup failed", exc_info=True)
 
+# Tony, 2026-09-03: mirrors ~/.hermes/plugins/mode/lmstudio.py's
+# MODEL_TO_GPU_SLOT_ROLE. Duplicated rather than imported -- plugins/ isn't
+# on hermes-agent's own import path (it's loaded dynamically as a plugin at
+# runtime, not a package this repo depends on). Keep in sync with that
+# module's own mapping and with ~/.openclaw/scripts/gpu-roles.conf, the
+# actual source of truth gpu-slot.sh itself reads.
+_GPU_SLOT_SCRIPT = "/home/openclaw/.openclaw/scripts/gpu-slot.sh"
+_MODEL_TO_GPU_SLOT_ROLE = {
+    "qwen/qwen3.5-9b": "qwen",
+    "qwen3.5-9b-uncensored-hauhaucs-aggressive": "uncensored",
+}
+
+
+def _restore_parent_model_after_delegation(
+    parent_agent, delegation_cfg: dict, *, run=None
+) -> None:
+    """Reload the parent conversation's own model if a delegate_task batch
+    just evicted it.
+
+    Root cause (Tony, 2026-09-03 -- "the local model is being unloaded in
+    the middle of the conversation or middle of its thinking state"):
+    delegation.model (config.yaml) is a single hardcoded model sharing the
+    same 8GB LM Studio instance as the main conversation's own local/
+    uncensored model. gpu-slot.sh's own `use` role-switch (the mechanism
+    mode/lmstudio.py's load_model already uses for every local/uncensored
+    mode switch) evicts whichever model was previously loaded, because LM
+    Studio itself is configured with unloadPreviousJITModelOnLoad=true (a
+    real constraint -- the GPU can't hold two ~5-6GB models on an 8GB
+    card). So a delegate_task call mid-conversation silently unloads the
+    parent's active model out from under it. gpu-contention-watch.sh's
+    periodic (~1min) reconciliation (f69a7a6) already heals this
+    reactively, but that leaves up to a minute where the parent's very next
+    turn would hit a cold/missing model. This closes that window
+    synchronously, right after every delegation batch finishes.
+
+    Deliberately a no-op when:
+    - delegation isn't configured with a model at all (nothing could have
+      been evicted).
+    - the child model equals the parent's own model already (uncensored
+      mode: delegation.model IS the active model -- no eviction occurred,
+      so an unconditional reload here would just be a wasted round-trip).
+    - the parent's own model isn't a known gpu-slot.sh role (a cloud-mode
+      parent, e.g. an Anthropic model, has nothing local to restore).
+
+    Best-effort like lmstudio.py's own unload_model: a failed reload here
+    must never raise into the caller, since the delegation batch itself
+    already completed successfully by the time this runs -- the periodic
+    reconciliation timer remains the safety net if this fails.
+    """
+    child_model = str((delegation_cfg or {}).get("model") or "").strip()
+    parent_model = str(getattr(parent_agent, "model", "") or "").strip()
+    if not child_model or not parent_model or child_model == parent_model:
+        return
+    role = _MODEL_TO_GPU_SLOT_ROLE.get(parent_model)
+    if not role:
+        return
+    import subprocess
+    run = run or subprocess.run
+    try:
+        run(
+            [_GPU_SLOT_SCRIPT, "use", role],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=True,
+        )
+    except Exception:
+        logger.debug(
+            "delegate_task: post-delegation model restore failed (role=%s)",
+            role,
+            exc_info=True,
+        )
+
+
 def _finalize_child_results(
     results: List[Dict[str, Any]], task_list: List[Dict[str, Any]], children: List[tuple[int, Dict[str, Any], Any]],
-    parent_agent,
+    parent_agent, cfg: Optional[dict] = None,
 ) -> None:
     """Apply host-owned summary, memory, hook, and cost contracts once."""
     with _parent_finalization_lock(parent_agent):
@@ -399,6 +473,21 @@ def _finalize_child_results(
         child_by_index = {index: child for index, _task, child in children}
         _notify_memory_manager(results, task_list, child_by_index, parent_agent)
         _rollup_children_cost(parent_agent, _fire_subagent_stop_hooks(results, child_by_index, parent_agent))
+
+    # Outside the finalization lock above (not part of that critical section): this can shell
+    # out to gpu-slot.sh and block up to 90s on a wedged GPU, and nothing here needs
+    # serializing against a concurrent finalization for the same parent.
+    try:
+        from tools.delegate_tool_config import _load_config
+        effective_cfg = cfg if cfg is not None else _load_config()
+    except Exception:
+        effective_cfg = {}
+    # Call through tools.delegate_tool (not the bare name) so tests can monkeypatch
+    # tools.delegate_tool._restore_parent_model_after_delegation and have it actually
+    # take effect here -- same lazy-import-to-break-the-cycle pattern as
+    # _run_child_lifecycle's own import of _run_single_child below.
+    import tools.delegate_tool as _dt
+    _dt._restore_parent_model_after_delegation(parent_agent, effective_cfg)
 
 def _run_child_lifecycle(task_index: int, goal: str, child=None, parent_agent=None) -> Dict[str, Any]:
     """Run one child and apply the same host lifecycle used by delegate_task."""
