@@ -2721,6 +2721,7 @@ class GatewayTurnMixin:
                 getattr(_agent_display, _setter)(_cast(_val))
 
         # Resolve the mode and its provenance together: null inherits, tier off is not intent.
+        from gateway.display_config import resolve_tool_progress
         progress_mode, _tool_progress_explicit = resolve_tool_progress(
             user_config, platform_key, os.getenv("HERMES_TOOL_PROGRESS_MODE"),
         )
