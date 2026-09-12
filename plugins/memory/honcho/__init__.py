@@ -426,8 +426,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         """Render the prefetch context, keeping only the ``injection.sessionStart`` components when pinned.
         The summary passes usable_honcho_summary here, so a contaminated one never reaches _base_context_cache."""
         ctx = {**ctx, "summary": usable_honcho_summary(ctx.get("summary")) or ""}
-        # getattr: tests build the provider without initialize().
-        allowed = getattr(self, "_session_start_components", None)
+        allowed = self._session_start_components
         parts, suppressed = [], []
         for name, key, header in _CONTEXT_SECTIONS:
             value = ctx.get(key, "")
