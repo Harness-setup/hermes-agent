@@ -761,10 +761,7 @@ class TestGetHermesDir:
         """
         self._set_home(tmp_path, monkeypatch)
         legacy = tmp_path / "pairing"
-        try:
-            legacy.symlink_to(tmp_path / "does-not-exist")
-        except (OSError, NotImplementedError) as exc:
-            pytest.skip(f"Symlink not supported on this platform/permission: {exc}")
+        legacy.symlink_to(tmp_path / "does-not-exist")
         new = tmp_path / "platforms" / "pairing"
         new.mkdir(parents=True)
         (new / "discord-approved.json").write_text("[]")
@@ -779,10 +776,7 @@ class TestGetHermesDir:
         real.mkdir()
         (real / "cached.png").write_bytes(b"x")
         legacy = tmp_path / "image_cache"
-        try:
-            legacy.symlink_to(real)
-        except (OSError, NotImplementedError) as exc:
-            pytest.skip(f"Symlink not supported on this platform/permission: {exc}")
+        legacy.symlink_to(real)
         result = get_hermes_dir("cache/images", "image_cache")
         assert result == legacy
 
