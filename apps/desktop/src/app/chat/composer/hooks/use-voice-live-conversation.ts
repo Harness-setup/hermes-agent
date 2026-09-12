@@ -116,7 +116,6 @@ export function useVoiceLiveConversation({
   const spokenResponseIdRef = useRef<null | string>(null)
   const lastToolLabelRef = useRef<null | string>(null)
   const wasEnabledRef = useRef(enabled)
-
   const latest = useRef({
     activeToolLabel,
     beforeMicOpen,
@@ -128,7 +127,6 @@ export function useVoiceLiveConversation({
     consumePendingResponse,
     seedHistory
   })
-
   latest.current = {
     activeToolLabel,
     beforeMicOpen,
