@@ -443,15 +443,20 @@ def _apply_output_hooks(
     agent, final_response, logger, *, platform, effective_task_id, turn_id, original_user_message,
     messages,
 ) -> None:
-    """Fire ``post_llm_call`` once per turn after the tool loop -- unconditionally, even when
-    ``interrupted`` or ``final_response`` is falsy. ``pre_llm_call`` fires unconditionally at
-    turn start, and plugins that track turn lifecycle as a start/end pair (pebble-signal's
-    droplet state) rely on ``post_llm_call`` as the only paired "turn ended" signal. Gating it
-    the same way as ``transform_llm_output`` (see ``_apply_transform_hook``) left an interrupted
-    (e.g. mid-turn /steer) or textless turn with no matching event -- pebble-signal's tracker
-    never cleared the session, so the droplet got stuck showing "thinking" forever. Plugins can
-    still use it to persist conversation data; assistant_response may be None/empty and callers
-    should handle that."""
+    """Fire ``post_llm_call`` once per turn after the tool loop -- unconditionally with respect to
+    ``interrupted``/textless, even though ``transform_llm_output`` (see ``_apply_transform_hook``)
+    stays gated on a real, uninterrupted response. ``pre_llm_call`` fires unconditionally at turn
+    start, and plugins that track turn lifecycle as a start/end pair (pebble-signal's droplet
+    state) rely on ``post_llm_call`` as the only paired "turn ended" signal -- gating it the same
+    way as the transform left an interrupted (e.g. mid-turn /steer) or textless turn with no
+    matching event, so the droplet got stuck showing "thinking" forever. Plugins can still use it
+    to persist conversation data; assistant_response may be None/empty and callers should handle
+    that.
+
+    Still skipped for a persist_disabled agent (background skill/memory review fork): detached
+    forks are internal work and must not publish turns under the parent's session ID."""
+    if getattr(agent, "_persist_disabled", False):
+        return
     _invoke_hook_safely(
         "post_llm_call", logger,
         session_id=agent.session_id,
@@ -688,18 +693,19 @@ def finalize_turn(
 
     # Memory provider on_session_end()/shutdown_all() are NOT called here:
     # run_conversation() runs once per message; CLI/gateway own session-end cleanup.
-    _invoke_hook_safely(
-        "on_session_end", logger,
-        session_id=agent.session_id,
-        task_id=effective_task_id,
-        turn_id=turn_id,
-        completed=completed,
-        failed=failed,
-        interrupted=interrupted,
-        turn_exit_reason=_turn_exit_reason,
-        model=agent.model,
-        platform=_platform,
-    )
+    if not getattr(agent, "_persist_disabled", False):
+        _invoke_hook_safely(
+            "on_session_end", logger,
+            session_id=agent.session_id,
+            task_id=effective_task_id,
+            turn_id=turn_id,
+            completed=completed,
+            failed=failed,
+            interrupted=interrupted,
+            turn_exit_reason=_turn_exit_reason,
+            model=agent.model,
+            platform=_platform,
+        )
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
