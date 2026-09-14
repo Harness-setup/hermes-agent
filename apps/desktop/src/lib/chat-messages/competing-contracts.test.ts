@@ -22,7 +22,6 @@ describe('D1 competing implementation contracts', () => {
       result: { success: true },
       isError: true
     }
-
     expect(summarizeToolRun([part], false)).toContain('Loaded skill')
   })
   it('does not report a failed skill as loaded in the settled summary', () => {
@@ -30,7 +29,6 @@ describe('D1 competing implementation contracts', () => {
       [{ toolName: 'skill_view', args: { name: 'missing-skill' }, result: { error: 'missing' }, isError: true }],
       false
     )
-
     expect(summary.toLowerCase()).toContain('failed')
     expect(summary).not.toContain('Loaded')
   })
