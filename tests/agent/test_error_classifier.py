@@ -71,7 +71,6 @@ class TestFailoverReason:
             "thinking_signature", "long_context_tier",
             "oauth_long_context_beta_forbidden",
             "llama_cpp_grammar_pattern",
-            "engine_startup_aborted",
             "unknown",
         }
         actual = {r.value for r in FailoverReason}
@@ -446,34 +445,6 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.rate_limit
         assert result.retryable is True
         assert result.should_rotate_credential is True
-
-    def test_engine_startup_aborted_is_retryable(self):
-        """Local-engine (LM Studio) JIT-load race: transient, must retry.
-
-        Found live 2026-07-24: a credit-exhaustion fallback to a local
-        model hit this exact message when the fresh JIT load collided with
-        GPU teardown from the prior request finishing on the same GPU.
-        """
-        e = MockAPIError(
-            'Failed to load model "qwen/qwen3.5-9b". Error: Engine protocol '
-            "startup was aborted",
-            status_code=400,
-        )
-        result = classify_api_error(e)
-        assert result.reason == FailoverReason.engine_startup_aborted
-        assert result.retryable is True
-
-    def test_engine_startup_aborted_does_not_shadow_genuine_model_not_found(self):
-        """A real typo'd/never-downloaded model name must NOT be swept into
-        the retryable engine-startup-race bucket -- only the specific
-        "Engine protocol startup was aborted" phrase should match."""
-        e = MockAPIError(
-            'Failed to load model "totally-made-up-model". Error: model not found',
-            status_code=400,
-        )
-        result = classify_api_error(e)
-        assert result.reason == FailoverReason.model_not_found
-        assert result.retryable is False
 
     # ── Server errors ──
 

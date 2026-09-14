@@ -231,7 +231,6 @@ def _is_local_validation_error(api_error: Any) -> bool:
 _RETRYABLE_CLIENT_REASONS = frozenset({
     FailoverReason.rate_limit, FailoverReason.overloaded, FailoverReason.context_overflow,
     FailoverReason.payload_too_large, FailoverReason.long_context_tier, FailoverReason.thinking_signature,
-    FailoverReason.engine_startup_aborted,
 })
 
 

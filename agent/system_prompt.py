@@ -537,56 +537,6 @@ def _alibaba_identity_part(agent: Any) -> List[str]:
     ]
 
 
-def _lmstudio_identity_part(agent: Any) -> List[str]:
-    """Tony, 2026-08-24: "the agent does not know what model is it running
-    on. jarvis can run on cloud, qwen3.5 9b or uncensored version. it just
-    says qwen when on uncensored mode." Same underlying gap as
-    ``_alibaba_identity_part`` above (the agent otherwise has no real
-    signal for this and just guesses from base-model training
-    association), just for a different provider: /mode local|uncensored
-    (~/.hermes/plugins/mode) both point the `default` profile at
-    lmstudio-chat, swapping only agent.model between the plain local build
-    and the uncensored fine-tune -- with nothing telling the agent which
-    one it currently is, "uncensored" and "local" were indistinguishable
-    from the inside. Checking the model ID for "uncensored" is a simple,
-    robust signal here since both DEFAULT_MODEL_BY_KIND entries in
-    mode/state.py reliably differ on exactly that substring.
-
-    Also tells the agent it can't delegate/dispatch in this mode -- Tony:
-    "we turned it off on purpose for local and uncensored, and I want them
-    to know that they can't use dispatch on those modes." The delegation/
-    kanban toolset gate itself (mode/toggle.py's _GATED_TOOLSETS) already
-    works correctly and stays as-is; this is purely a self-awareness gap
-    so a request to delegate doesn't just silently fail or confuse."""
-    if agent.provider != "lmstudio-chat":
-        return []
-    _is_uncensored_model = "uncensored" in agent.model.lower()
-    return [
-        f"You are running locally via LM Studio, not in the cloud. "
-        f"The exact model ID is {agent.model}. "
-        + (
-            "This is the uncensored fine-tune, switched to via /mode uncensored -- "
-            "when asked what model or mode you're in, say so explicitly rather than "
-            "just naming the base model."
-            if _is_uncensored_model
-            else "This is the standard local build, switched to via /mode local -- "
-            "when asked what model or mode you're in, say so explicitly rather than "
-            "assuming you're in the cloud."
-        )
-        + (
-            " Tony: \"we turned it off on purpose for local and uncensored, and I "
-            "want them to know that they can't use dispatch on those modes.\" You "
-            "cannot delegate tasks to other specialist agents or use the kanban "
-            "board while running in this mode (~/.hermes/plugins/mode gates the "
-            "delegation and kanban toolsets off deliberately here) -- if asked to "
-            "hand off, delegate, or dispatch work, say plainly that this isn't "
-            "available in local/uncensored mode rather than attempting it or "
-            "staying silent about why it's not happening. Switching back to cloud "
-            "mode (/mode cloud) restores it."
-        )
-    ]
-
-
 def _coding_parts(agent: Any) -> Tuple[List[str], List[str], List[str]]:
     """``(prefix, workspace, trailing)`` coding-posture blocks; all empty
     without tools or when probing fails (it must never block prompt build).
@@ -677,7 +627,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if "skill_view" in (agent.valid_tool_names or set()) and "- hermes-agent:" in skills_prompt:
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
     stable_parts.extend(_alibaba_identity_part(agent))
-    stable_parts.extend(_lmstudio_identity_part(agent))
     # Coding posture: the operating brief stays in the stable prefix. The
     # environment block contains the current cwd/backend and belongs after
     # project context, not ahead of a large shared AGENTS.md block.

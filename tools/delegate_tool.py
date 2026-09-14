@@ -52,7 +52,6 @@ from tools.delegate_tool_toolsets import (  # noqa: F401
 )
 from tools.delegate_tool_results import (  # noqa: F401
     _apply_summary_budget, _build_child_preserving_parent_tools, _finalize_child_results,
-    _GPU_SLOT_SCRIPT, _MODEL_TO_GPU_SLOT_ROLE, _restore_parent_model_after_delegation,
     _run_child_lifecycle, _summarize_tool_arguments,
 )
 

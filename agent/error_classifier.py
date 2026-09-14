@@ -51,12 +51,11 @@ class FailoverReason(enum.Enum):
     long_context_tier = "long_context_tier"    # Anthropic "extra usage" tier gate
     oauth_long_context_beta_forbidden = "oauth_long_context_beta_forbidden"  # Anthropic OAuth rejects 1M beta — disable beta and retry
     llama_cpp_grammar_pattern = "llama_cpp_grammar_pattern"  # llama.cpp grammar rejects regex `pattern`/`format` — strip from tools and retry
-    # Local-engine (LM Studio/llama.cpp-style) JIT model load collided with GPU
-    # teardown from a request that just finished on the same engine -- transient,
-    # clears on retry. Found live 2026-07-24 during a credit-exhaustion fallback
-    # whose only tier is a local model; re-derived twice after `hermes update`
-    # wiped it (see the local-fixes branch's root-cause writeup, 6422ac808).
-    engine_startup_aborted = "engine_startup_aborted"  # 400 "Engine protocol startup was aborted" — transient local-engine race, retry
+    # engine_startup_aborted removed 2026-09-14: migrated to a
+    # transform_api_error_classification plugin hook
+    # (~/.hermes/plugins/mode/error_classification.py), which reuses the
+    # `timeout` reason below instead of a dedicated enum member -- see that
+    # module's docstring for why no core change was needed at all here.
     unknown = "unknown"                  # Unclassifiable — retry with backoff
 
 
@@ -390,11 +389,6 @@ _V_MULTIMODAL, _V_INVALID_ENCRYPTED = _v(_R.multimodal_tool_content_unsupported)
 _V_REASONING_MANDATORY = _v(_R.reasoning_mandatory, should_compress=False, should_fallback=False)
 # A reasoning-mandatory route answering ``reasoning: {enabled: false}`` (Nous Portal + OpenRouter wording).
 _REASONING_MANDATORY_PATTERN = "reasoning is mandatory"
-# Checked via the specific phrase, not just "failed to load model", so a
-# genuinely-invalid model name (typo, never-downloaded model) is NOT swept
-# into this retryable bucket -- retryable=True is the ClassifiedError default.
-_ENGINE_STARTUP_ABORTED_PATTERNS = ("engine protocol startup was aborted",)
-_V_ENGINE_STARTUP_ABORTED = _v(_R.engine_startup_aborted)
 
 
 def _billing_hints(error_msg: str) -> Verdict:
@@ -437,7 +431,6 @@ _404_RULES = (
 # 400 tail after the deterministic request-shape checks. Some providers return
 # model-not-found / rate-limit / billing as 400 instead of 404/429/402.
 _400_TAIL_RULES = _OVERFLOW_AS_5XX_RULES + (
-    (_ENGINE_STARTUP_ABORTED_PATTERNS, _V_ENGINE_STARTUP_ABORTED),
     (_PROVIDER_POLICY_BLOCKED_PATTERNS, _V_POLICY_BLOCKED), (_MODEL_NOT_FOUND_PATTERNS, _V_MODEL_NOT_FOUND),
     (_RATE_LIMIT_PATTERNS, _V_RATE_LIMIT), (_BILLING_PATTERNS, _billing_hints),
 )
