@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from tools import tts_command_provider
@@ -22,7 +23,8 @@ from tools.tts_command_provider import (
     render_command_template as _render_command_tts_template)
 from tools.tts_tool_delivery import _origin
 from tools.tts_tool_local import (
-    _LOCAL_TTS_MODEL_CACHES, _load_kittentts_model_for_config, _load_piper_voice_for_config)
+    _LOCAL_TTS_MODEL_CACHES, _load_kittentts_model_for_config, _load_piper_voice_for_config,
+    _load_neutts_model_for_config, _neutts_encoded_reference, _NEUTTS_SAMPLES)
 from tools.tts_tool_plugins import _lookup_plugin_provider
 
 logger = logging.getLogger("tools.tts_tool")
@@ -31,11 +33,23 @@ _tts_lease_lock = threading.Lock()
 _tts_leases: set = set()
 
 
+def _warm_neutts(cfg: Dict[str, Any]) -> Any:
+    """Loads the model AND pre-encodes the reference voice, so warm-up pays the full ~2min cold
+    cost up front (backbone + codec + phonemizer + reference encoding) and the first real
+    synthesis call after warming only pays the genuinely-per-utterance ``infer`` step (~9s)."""
+    entry, neutts_config = _load_neutts_model_for_config(cfg)
+    ref_audio = str(Path(neutts_config.get("ref_audio", "") or (_NEUTTS_SAMPLES / "jo.wav")).expanduser())
+    ref_text_path = Path(neutts_config.get("ref_text", "") or (_NEUTTS_SAMPLES / "jo.txt")).expanduser()
+    _neutts_encoded_reference(entry, ref_audio, ref_text_path.read_text(encoding="utf-8").strip())
+    return entry
+
+
 def _local_tts_warmers() -> Dict[str, Callable[[Dict[str, Any]], Any]]:
     """Provider name → loader populating that engine's cache slot (same key synthesis uses)."""
     return {
         "piper": lambda cfg: _load_piper_voice_for_config(cfg)[0],
-        "kittentts": lambda cfg: _load_kittentts_model_for_config(cfg)[0]}
+        "kittentts": lambda cfg: _load_kittentts_model_for_config(cfg)[0],
+        "neutts": _warm_neutts}
 
 
 # tools.lazy_deps feature key for providers whose SDK installs on first use.

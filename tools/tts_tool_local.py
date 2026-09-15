@@ -33,8 +33,10 @@ _TTS_MODEL_CACHE_MAX = 3
 # (+cuda flag); KittenTTS on model name.
 _piper_voice_cache: Dict[str, Any] = {}
 _kittentts_model_cache: Dict[str, Any] = {}
+_neutts_model_cache: Dict[str, Any] = {}
 _LOCAL_TTS_MODEL_CACHES: Dict[str, Dict[str, Any]] = {
-    "piper": _piper_voice_cache, "kittentts": _kittentts_model_cache}
+    "piper": _piper_voice_cache, "kittentts": _kittentts_model_cache,
+    "neutts": _neutts_model_cache}
 
 
 def _tts_cache_get_or_load(cache: Dict[str, Any], key: str, load: Callable[[], Any]) -> Any:
@@ -56,22 +58,64 @@ def _run_helper(cmd: list, timeout: int) -> subprocess.CompletedProcess:
     )
 
 
-# --- NeuTTS (subprocess via tools/neutts_synth.py so the ~500MB model exits after use) ---
+# --- NeuTTS (in-process, warmed/released through the same lease system as Piper/KittenTTS) ---
+# Cold measured live: torch+neutts import ~28s, NeuTTS() init (backbone GGUF + phonemizer + the
+# neucodec codec -- a full, unquantized ~1.16GB torch model, NOT the quantized backbone, and the
+# actual RAM cost: ~5.6GB resident) ~59s, encode_reference (the reference voice clip) ~48s. A
+# subprocess-per-call design (the original approach here) re-pays ALL of that on every single
+# utterance -- measured 144s-200s end to end, well past any reasonable voice-turn latency and past
+# the old subprocess timeout, so every real call would have just failed. Loading in-process instead
+# and caching the encoded reference means only the ~9s `infer` step (the one cost that's genuinely
+# per-utterance) recurs after the first call. Released, same as Piper/KittenTTS, only when the last
+# tts lease lets go (tools.tts_tool_lifecycle) -- not on an idle timer -- so it stays warm across an
+# entire voice session and is freed once nothing needs speech at all.
+def _load_neutts_model_for_config(tts_config: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Load (or fetch from cache) the NeuTTS model -> ``({"tts": NeuTTS, "references": {}}, neutts_config)``.
+    ``references`` is a small bounded cache of already-encoded reference voices (keyed by resolved
+    ref_audio path + ref_text), populated by :func:`_neutts_encoded_reference` -- kept alongside the
+    model instance (not a separate top-level cache) so releasing this one cache entry drops both."""
+    neutts_config = _section(tts_config, "neutts")
+    model_repo = neutts_config.get("model", "neuphonic/neutts-air-q4-gguf")
+    device = neutts_config.get("device", "cpu")
+    cache_key = f"{model_repo}::{device}"
+
+    def _load_neutts() -> Dict[str, Any]:
+        from neutts import NeuTTS
+        logger.info("[NeuTTS] Loading model: %s (device=%s)", model_repo, device)
+        # llama_cpp (backbone) offloads to GPU only for the literal string "gpu"; torch (codec)
+        # only accepts "cuda" -- a single device value can't satisfy both (see neutts_synth.py).
+        instance = NeuTTS(
+            backbone_repo=model_repo, backbone_device=("gpu" if device == "cuda" else device),
+            codec_repo="neuphonic/neucodec", codec_device=device)
+        logger.info("[NeuTTS] Model loaded")
+        return {"tts": instance, "references": {}}
+
+    return _tts_cache_get_or_load(_neutts_model_cache, cache_key, _load_neutts), neutts_config
+
+
+def _neutts_encoded_reference(entry: Dict[str, Any], ref_audio: str, ref_text: str) -> Any:
+    """Return the cached encoding for this reference voice, computing it once. Bounded the same way
+    as the piper/kittentts caches (a config change mid-session shouldn't grow this unbounded)."""
+    refs = entry["references"]
+    ref_key = f"{ref_audio}::{hash(ref_text)}"
+    if ref_key not in refs:
+        logger.info("[NeuTTS] Encoding reference voice: %s", ref_audio)
+        refs[ref_key] = entry["tts"].encode_reference(ref_audio)
+        while len(refs) > _TTS_MODEL_CACHE_MAX:
+            refs.pop(next(iter(refs)), None)
+    return refs[ref_key]
+
+
 def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
-    neutts_config = tts_config.get("neutts") or {}
+    entry, neutts_config = _load_neutts_model_for_config(tts_config)
+    ref_audio = str(Path(neutts_config.get("ref_audio", "") or (_NEUTTS_SAMPLES / "jo.wav")).expanduser())
+    ref_text_path = Path(neutts_config.get("ref_text", "") or (_NEUTTS_SAMPLES / "jo.txt")).expanduser()
+    ref_text = ref_text_path.read_text(encoding="utf-8").strip()
+    encoded_ref = _neutts_encoded_reference(entry, ref_audio, ref_text)
+    wav = entry["tts"].infer(text, encoded_ref, ref_text)
     wav_path = _wav_sidecar_path(output_path)
-    cmd = [
-        sys.executable, str(Path(__file__).parent / "neutts_synth.py"),
-        "--text", text,
-        "--out", wav_path,
-        "--ref-audio", neutts_config.get("ref_audio", "") or str(_NEUTTS_SAMPLES / "jo.wav"),
-        "--ref-text", neutts_config.get("ref_text", "") or str(_NEUTTS_SAMPLES / "jo.txt"),
-        "--model", neutts_config.get("model", "neuphonic/neutts-air-q4-gguf"),
-        "--device", neutts_config.get("device", "cpu")]
-    result = _run_helper(cmd, 120)
-    if result.returncode != 0:  # the synth script reports success lines as "OK:" on stderr too
-        error_lines = [l for l in result.stderr.strip().splitlines() if not l.startswith("OK:")]
-        raise RuntimeError(f"NeuTTS synthesis failed: {chr(10).join(error_lines) or 'unknown error'}")
+    import soundfile as sf
+    sf.write(wav_path, wav, 24000)
     return _finalize_wav_output(wav_path, output_path)
 
 
