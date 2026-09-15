@@ -341,6 +341,10 @@ def start_continuous(
     vad_enabled: bool = False,
     vad_confidence_threshold: float = 0.15,
     vad_fast_silence_duration: float = 0.6,
+    smart_turn_enabled: bool = False,
+    smart_turn_confidence_threshold: float = 0.5,
+    smart_turn_extend_seconds: float = 2.0,
+    smart_turn_max_extensions: int = 2,
 ) -> bool:
     """Start a VAD-driven continuous recording loop.
 
@@ -373,6 +377,10 @@ def start_continuous(
         rec._vad_enabled = vad_enabled
         rec._vad_confidence_threshold = vad_confidence_threshold
         rec._vad_fast_silence_duration = vad_fast_silence_duration
+        rec._smart_turn_enabled = smart_turn_enabled
+        rec._smart_turn_confidence_threshold = smart_turn_confidence_threshold
+        rec._smart_turn_extend_seconds = smart_turn_extend_seconds
+        rec._smart_turn_max_extensions = smart_turn_max_extensions
         # Same numeric-with-bool-excluded guard as cli.py:_voice_start_recording.
         cap_ok = isinstance(max_recording_seconds, (int, float)) and not isinstance(max_recording_seconds, bool)
         rec._max_recording_seconds = max_recording_seconds if cap_ok and max_recording_seconds > 0 else 0.0

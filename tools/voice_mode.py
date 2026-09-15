@@ -123,6 +123,13 @@ def vad_speech_probability(model, chunk_int16):
     return speech_probability(model, chunk_int16)
 
 
+def smart_turn_complete_probability(session, audio_int16):
+    """Thin proxy to tools.smart_turn.turn_complete_probability, same reasoning and same
+    module-level-name-for-patchability convention as vad_speech_probability above."""
+    from tools.smart_turn import turn_complete_probability
+    return turn_complete_probability(session, audio_int16)
+
+
 def _voice_capture_install_hint() -> str:
     # sounddevice imports but PortAudio's shared library is missing — a pip install can't fix that; point at
     # the system package instead of misreporting missing Python packages (#18432).
@@ -640,6 +647,18 @@ class AudioRecorder(_RecorderBase):
         # retry the ~60ms load on every callback for the rest of the
         # recording (see _vad_probability_for_chunk).
         self._vad_load_failed: bool = False
+        # Smart Turn v3.1 semantic turn-completion classifier (tools/smart_turn.py).
+        # Disabled by default until config wiring turns it on; layered ON TOP of the
+        # VAD fast-path above, not a replacement -- VAD is the acoustic gate (is this
+        # silence at all), Smart Turn is the semantic gate (does the content sound
+        # finished), consulted only when the acoustic layer already wants to stop.
+        self._smart_turn_enabled: bool = False
+        self._smart_turn_confidence_threshold: float = 0.5
+        self._smart_turn_extend_seconds: float = 2.0
+        self._smart_turn_max_extensions: int = 2
+        self._smart_turn_model = None
+        self._smart_turn_load_failed: bool = False
+        self._smart_turn_extension_count: int = 0
         # Hard cap, wired from voice.max_recording_seconds by the CLI before each recording; 0 = none.
         self._max_recording_seconds: float = 0.0
         self._peak_rms: int = 0  # for the speech-presence check in stop()
@@ -650,6 +669,7 @@ class AudioRecorder(_RecorderBase):
         # speech attempt / its dip / silence run / sustained resume after silence / resume dip
         self._speech_start = self._dip_start = self._silence_start = 0.0
         self._resume_start = self._resume_dip_start = 0.0
+        self._smart_turn_extension_count = 0
 
     def _max_duration_reached(self, elapsed: float) -> bool:
         """``voice.max_recording_seconds`` cap elapsed (<= 0 / unset disables it)."""
@@ -689,6 +709,47 @@ class AudioRecorder(_RecorderBase):
         from tools.vad_lite import resample_for_vad
         resampled = resample_for_vad(chunk.flatten(), self._sample_rate, VAD_SAMPLE_RATE)
         return vad_speech_probability(self._vad_model, resampled)
+
+    def _smart_turn_probability_for_buffer(self) -> float:
+        """Lazily loads the Smart Turn model on first real use (never at __init__, so
+        recorders with smart_turn_enabled=False -- the default -- pay zero cost), scoring
+        the WHOLE in-progress recording buffer (self._frames, already accumulated for the
+        entire utterance -- see tools.smart_turn's module docstring) rather than one chunk.
+        Resampled to tools.smart_turn.SMART_TURN_SAMPLE_RATE via the same
+        tools.vad_lite.resample_for_vad helper the VAD fast-path already uses (same target
+        rate, reused rather than reimplemented). A load or inference failure fails open to
+        probability=1.0 ("assume complete") -- the OPPOSITE bias from VAD's own
+        fail-open-to-speech convention, because a broken semantic layer must never cause
+        dead air to hang forever; letting the turn end is the safe direction here. Latches
+        (_smart_turn_load_failed) so a failed load doesn't retry the download/build-session
+        cost on every subsequent callback for the rest of the recording."""
+        if self._smart_turn_load_failed:
+            return 1.0
+        from tools.smart_turn import SMART_TURN_SAMPLE_RATE
+        if self._smart_turn_model is None:
+            try:
+                from tools.smart_turn import load_smart_turn_model
+                self._smart_turn_model = load_smart_turn_model()
+            except Exception:
+                self._smart_turn_load_failed = True
+                logger.warning(
+                    "Smart Turn model failed to load; disabling semantic turn detection "
+                    "for this recording (falling back to acoustic-only silence detection)",
+                    exc_info=True,
+                )
+                return 1.0
+        try:
+            import numpy as np
+            from tools.vad_lite import resample_for_vad
+            buffer = (
+                np.concatenate(self._frames, axis=0).flatten() if self._frames
+                else np.zeros(0, dtype=np.int16)
+            )
+            resampled = resample_for_vad(buffer, self._sample_rate, SMART_TURN_SAMPLE_RATE)
+            return smart_turn_complete_probability(self._smart_turn_model, resampled)
+        except Exception:
+            logger.warning("Smart Turn inference failed; treating turn as complete", exc_info=True)
+            return 1.0
 
     def _resume_speech_confirmed(self, chunk) -> bool:
         """Decides whether a sustained (>= min_speech_duration) stretch of
@@ -755,7 +816,19 @@ class AudioRecorder(_RecorderBase):
         (vad_fast_silence_duration) applies instead of the full silence_duration. When VAD is
         uncertain, disabled, or fails (fails open to probability=1.0 -- "assume speech"),
         silence_duration applies unchanged -- the fast path can only make this fire SOONER
-        than before, never later."""
+        than before, never later.
+
+        Smart Turn semantic gate: layered on TOP of the acoustic decision above, not a
+        replacement for it. Once the acoustic layer already wants to fire, and
+        smart_turn_enabled, and the per-turn extension budget (smart_turn_max_extensions)
+        isn't exhausted: consult Smart Turn on the WHOLE buffered utterance so far. If it
+        reads the content as unfinished (probability below smart_turn_confidence_threshold),
+        grant smart_turn_extend_seconds of extra runway instead of firing -- so this can only
+        make the turn end LATER than the acoustic decision alone, never sooner. Uncertain,
+        disabled, extension budget exhausted, or a failed load/inference (fails open to
+        probability=1.0 -- "assume complete", the opposite bias from VAD's own fail-open,
+        since a broken semantic layer must never hang the recorder forever) all fall through
+        to firing on the acoustic layer's own schedule unchanged."""
         if self._silence_start == 0.0:
             self._silence_start = now
             return False
@@ -767,6 +840,21 @@ class AudioRecorder(_RecorderBase):
                 required_duration = min(required_duration, self._vad_fast_silence_duration)
 
         if now - self._silence_start >= required_duration:
+            if (
+                self._smart_turn_enabled
+                and self._smart_turn_extension_count < self._smart_turn_max_extensions
+            ):
+                turn_probability = self._smart_turn_probability_for_buffer()
+                if turn_probability < self._smart_turn_confidence_threshold:
+                    self._smart_turn_extension_count += 1
+                    self._silence_start = now - required_duration + self._smart_turn_extend_seconds
+                    logger.info(
+                        "Smart Turn reads utterance as unfinished (p=%.2f), extending "
+                        "silence window by %.1fs (extension %d/%d)",
+                        turn_probability, self._smart_turn_extend_seconds,
+                        self._smart_turn_extension_count, self._smart_turn_max_extensions,
+                    )
+                    return False
             logger.info("Silence detected (%.2fs), auto-stopping", required_duration)
             return True
         return False

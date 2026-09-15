@@ -775,6 +775,32 @@ def _(rid, params: dict) -> dict:
             if isinstance(vad_fast, (int, float)) and not isinstance(vad_fast, bool) and vad_fast > 0
             else 0.6
         )
+        # voice.smart_turn_enabled / smart_turn_confidence_threshold / smart_turn_extend_seconds /
+        # smart_turn_max_extensions -- semantic turn-completion classifier (tools/smart_turn.py),
+        # layered on top of the VAD fast-path above. Same guard shape as the vad_* reads above.
+        smart_turn_enabled = voice_cfg.get("smart_turn_enabled")
+        safe_smart_turn_enabled = bool(smart_turn_enabled) if isinstance(smart_turn_enabled, bool) else False
+        smart_turn_conf = voice_cfg.get("smart_turn_confidence_threshold")
+        safe_smart_turn_conf = (
+            smart_turn_conf
+            if isinstance(smart_turn_conf, (int, float)) and not isinstance(smart_turn_conf, bool)
+            and 0.0 <= smart_turn_conf <= 1.0
+            else 0.5
+        )
+        smart_turn_extend = voice_cfg.get("smart_turn_extend_seconds")
+        safe_smart_turn_extend = (
+            smart_turn_extend
+            if isinstance(smart_turn_extend, (int, float)) and not isinstance(smart_turn_extend, bool)
+            and smart_turn_extend > 0
+            else 2.0
+        )
+        smart_turn_max_ext = voice_cfg.get("smart_turn_max_extensions")
+        safe_smart_turn_max_ext = (
+            smart_turn_max_ext
+            if isinstance(smart_turn_max_ext, int) and not isinstance(smart_turn_max_ext, bool)
+            and smart_turn_max_ext >= 0
+            else 2
+        )
         # Hand the mic to STT if the wake detector holds it; a terminal capture event resumes it.
         with contextlib.suppress(Exception):
             from tools.wake_word import pause_listening
@@ -790,7 +816,11 @@ def _(rid, params: dict) -> dict:
             auto_restart=False, max_recording_seconds=max_rec if max_rec > 0 else 0.0,
             on_stop_phrase=_vr_on_stop_phrase,
             no_speech_limit=safe_no_speech_limit, vad_enabled=safe_vad_enabled,
-            vad_confidence_threshold=safe_vad_conf, vad_fast_silence_duration=safe_vad_fast)
+            vad_confidence_threshold=safe_vad_conf, vad_fast_silence_duration=safe_vad_fast,
+            smart_turn_enabled=safe_smart_turn_enabled,
+            smart_turn_confidence_threshold=safe_smart_turn_conf,
+            smart_turn_extend_seconds=safe_smart_turn_extend,
+            smart_turn_max_extensions=safe_smart_turn_max_ext)
         if started is False:
             _resume_voice_wake()
         return _ok(rid, {"status": "busy" if started is False else "recording"})

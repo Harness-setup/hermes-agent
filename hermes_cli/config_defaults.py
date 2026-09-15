@@ -1152,6 +1152,10 @@ DEFAULT_CONFIG = {
         "vad_enabled": False,         # Silero VAD fast-path: end the turn sooner than silence_duration when VAD is confident this is silence (never later; strict no-op when False)
         "vad_confidence_threshold": 0.15,  # VAD probability below this = confident silence (0.0-1.0)
         "vad_fast_silence_duration": 0.6,  # Seconds of confident silence before auto-stop (only used when vad_enabled)
+        "smart_turn_enabled": False,  # Smart Turn v3.1 semantic turn-completion classifier: extends the silence window when the utterance sounds unfinished, rather than cutting the user off (never sooner; layered on top of vad_enabled, not a replacement; strict no-op when False)
+        "smart_turn_confidence_threshold": 0.5,  # Model's own sigmoid probability of "complete" (0.0-1.0); >= this = treat as finished
+        "smart_turn_extend_seconds": 2.0,  # Extra silence runway granted per "sounds unfinished" read
+        "smart_turn_max_extensions": 2,  # Hard cap on extensions per turn -- after this many, the turn ends regardless of Smart Turn's opinion
         "barge_in": True,  # interrupt the agent / stop TTS when the user starts talking
         # Trip suppression after TTS onset (mic stays live the whole turn).
         "barge_in_grace_seconds": 0.5,
