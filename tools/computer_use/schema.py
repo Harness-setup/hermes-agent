@@ -32,13 +32,27 @@ _PROPERTIES: Dict[str, Any] = {
             "list_apps",
             "list_windows",
             "focus_app",
+            "batch",
         ],
         "description": (
             "Which action to perform. `capture` is free (no side effects). All other actions "
             "require approval unless auto-approved. Use `set_value` for select/popup elements and "
             "sliders — it selects the matching option directly without opening the native menu (no "
-            "focus steal)."
+            "focus steal). Use `batch` to run a sequence of the actions above in one call instead "
+            "of one round-trip per action — each entry in `actions` is a normal action object (its "
+            "own approval/validation rules still apply per entry); the batch stops at the first "
+            "failing step and reports how far it got."
         ),
+    },
+    "actions": {
+        "type": "array",
+        "description": (
+            "Only used when action='batch': an ordered list of action objects to run in sequence, "
+            "each shaped exactly like a normal top-level call (its own 'action' plus whatever "
+            "fields that action needs). Runs stop at the first step that fails. A nested 'batch' "
+            "entry is rejected."
+        ),
+        "items": {"type": "object"},
     },
     "mode": {
         "type": "string",

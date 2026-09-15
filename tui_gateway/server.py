@@ -2498,6 +2498,22 @@ def _deferred_session_record(
     }
 
 
+def _emit_voice_state_hook(state: str) -> None:
+    """Fire the voice_state_changed plugin hook so backend plugins (e.g.
+    pebble-signal) can reflect listening/speaking on a visual indicator.
+    wake.detected/voice.status/voice.transcript only reach the JSON-RPC
+    transport straight to the connected UI client -- no plugin hook exists
+    for any of them today, so this is new, additive instrumentation, not a
+    refactor of an existing signal. Fail-open, matching every other hook
+    call site in this file (e.g. _notify_session_boundary's on_session_end):
+    a broken or absent plugin must never break voice mode."""
+    try:
+        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+        _invoke_hook("voice_state_changed", state=state)
+    except Exception as exc:
+        logger.warning("voice_state_changed hook failed: %s", exc)
+
+
 _ANY_PROFILE = object()  # default: match a live session regardless of profile
 
 
@@ -2658,7 +2674,6 @@ def _session_live_status(sid: str, session: dict) -> str:
     if ready is not None and not ready.is_set() and session.get("agent_build_started"):
         return "starting"
     return "working" if session.get("running") else "idle"
-
 
 def _session_live_title(session: dict, key: str) -> str:
     title = str(session.get("pending_title") or "").strip()
@@ -3098,7 +3113,6 @@ def _start_usage_ticker(sid: str, agent, interval: float = 1.0) -> tuple[threadi
     thread = _RealThread(target=_loop, daemon=True)
     thread.start()
     return stop, thread
-
 
 # ── Methods: tools & system ──────────────────────────────────────────
 

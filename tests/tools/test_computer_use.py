@@ -177,6 +177,147 @@ class TestDispatch:
         assert len(capture_calls) == 0, "capture must not be called after a failed action"
 
 # ---------------------------------------------------------------------------
+# Batch action (one tool call for a sequence of actions)
+# ---------------------------------------------------------------------------
+
+class TestBatchAction:
+
+    def test_runs_each_action_in_order(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch", "actions": [
+            {"action": "click", "element": 1},
+            {"action": "type", "text": "hi"},
+            {"action": "key", "keys": "Return"},
+        ]})
+        parsed = json.loads(out)
+        assert parsed["batch"] is True
+        assert parsed["completed"] == 3
+        assert parsed["requested"] == 3
+        assert [s["ok"] for s in parsed["steps"]] == [True, True, True]
+        assert [c[0] for c in noop_backend.calls] == ["click", "type", "key"]
+
+    def test_stops_at_first_failing_step(self, noop_backend):
+        from unittest.mock import patch
+        from tools.computer_use.backend import ActionResult
+        from tools.computer_use.tool import handle_computer_use
+
+        with patch.object(noop_backend, "click",
+                          return_value=ActionResult(ok=False, action="click",
+                                                    message="element not found")):
+            out = handle_computer_use({"action": "batch", "actions": [
+                {"action": "click", "element": 99},
+                {"action": "type", "text": "should never run"},
+            ]})
+        parsed = json.loads(out)
+        assert parsed["completed"] == 1
+        assert parsed["requested"] == 2
+        assert parsed["steps"][0]["ok"] is False
+        assert parsed["steps"][0]["error"] == "element not found"
+        # the second step must never have been dispatched (patch.object with
+        # return_value= replaces click() wholesale, so it never reaches the
+        # real body that appends to self.calls -- absence of "type" is what
+        # actually proves the batch stopped)
+        assert "type" not in [c[0] for c in noop_backend.calls]
+
+    def test_validation_error_shape_is_also_treated_as_failure(self, noop_backend):
+        """A pre-dispatch validation error is {"error": ...} with no "ok" key
+        at all -- a different shape than a dispatched action's own failure.
+        Both must stop the batch."""
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch", "actions": [
+            {"action": "nope"},
+            {"action": "click", "element": 1},
+        ]})
+        parsed = json.loads(out)
+        assert parsed["steps"][0]["ok"] is False
+        assert "error" in parsed["steps"][0]
+        assert parsed["completed"] == 1
+        assert [c[0] for c in noop_backend.calls] == []
+
+    def test_empty_actions_list_is_rejected(self):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch", "actions": []})
+        parsed = json.loads(out)
+        assert "error" in parsed
+
+    def test_missing_actions_key_is_rejected(self):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch"})
+        parsed = json.loads(out)
+        assert "error" in parsed
+
+    def test_over_max_batch_size_is_rejected(self):
+        from tools.computer_use.tool import handle_computer_use, _MAX_BATCH_SIZE
+        out = handle_computer_use({"action": "batch", "actions": [
+            {"action": "key", "keys": "a"} for _ in range(_MAX_BATCH_SIZE + 1)
+        ]})
+        parsed = json.loads(out)
+        assert "error" in parsed
+
+    def test_nested_batch_is_rejected(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch", "actions": [
+            {"action": "batch", "actions": [{"action": "click", "element": 1}]},
+        ]})
+        parsed = json.loads(out)
+        assert parsed["steps"][0]["ok"] is False
+        assert "nested" in parsed["steps"][0]["error"]
+        assert noop_backend.calls == []
+
+    def test_capture_as_last_step_returns_multimodal_with_batch_summary(self):
+        """The noop backend's capture() has no real image bytes (png_b64=None),
+        so it can never actually produce a multimodal envelope -- swap in a
+        backend that does, same pattern as TestCaptureResponse above."""
+        from tools.computer_use.backend import ActionResult, CaptureResult
+        from tools.computer_use import tool as cu_tool
+
+        fake_png = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAADUlEQVR4nGNgGAUgAAABCAABgukLHQAAAABJRU5ErkJggg=="
+
+        class FakeBackend:
+            def start(self): pass
+            def stop(self): pass
+            def is_available(self): return True
+            def click(self, **kw): return ActionResult(ok=True, action="click")
+            def capture(self, mode="som", app=None, pid=None, window_id=None):
+                return CaptureResult(
+                    mode=mode, width=1024, height=768,
+                    png_b64=fake_png, elements=[],
+                    app="Safari", window_title="example.com",
+                    png_bytes_len=100,
+                )
+
+        cu_tool.reset_backend_for_tests()
+        with patch.object(cu_tool, "_get_backend", return_value=FakeBackend()), \
+             patch.object(cu_tool, "_should_route_through_aux_vision",
+                          return_value=False):
+            out = cu_tool.handle_computer_use({"action": "batch", "actions": [
+                {"action": "click", "element": 1},
+                {"action": "capture", "mode": "vision"},
+            ]})
+        cu_tool.reset_backend_for_tests()
+        assert isinstance(out, dict)
+        assert out.get("_multimodal") is True
+        assert "2/2" in out["text_summary"]
+        assert any(part.get("type") == "image_url" for part in out["content"])
+
+    def test_approval_denial_inside_batch_stops_it(self, noop_backend):
+        """Batching must not widen what gets auto-approved -- each entry still
+        goes through the normal per-action approval gate."""
+        from tools.computer_use.tool import handle_computer_use, set_approval_callback
+        set_approval_callback(lambda action, args, summary: "deny")
+        try:
+            out = handle_computer_use({"action": "batch", "actions": [
+                {"action": "key", "keys": "ctrl+a"},
+                {"action": "type", "text": "should never run"},
+            ]})
+        finally:
+            set_approval_callback(None)
+        parsed = json.loads(out)
+        assert parsed["steps"][0]["ok"] is False
+        assert parsed["completed"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Safety guards (type / key block lists)
 # ---------------------------------------------------------------------------
 

@@ -415,7 +415,12 @@ def _catalog_plugin_commands(cat: _Catalog) -> None:
         cat.add(key, str(info.get("description") or "Plugin command"), "Plugin commands")
         mode = info.get("argument_mode")
         if mode not in {"options", "text", "mixed"}:
-            mode = "text" if str(info.get("args_hint") or "").strip() else None
+            if info.get("subcommands"):
+                mode = "options"
+            elif str(info.get("args_hint") or "").strip():
+                mode = "text"
+            else:
+                mode = None
         cat.commands[key] = {"argument_mode": mode, "desktop": None}
 
 

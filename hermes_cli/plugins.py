@@ -196,6 +196,14 @@ VALID_HOOKS: Set[str] = {
     # IGNORED in v1 — a plugin returning a directive-shaped dict gets a debug log so future block/rewrite
     # adopters are discoverable once the middleware variant ships against the #64231 taxonomy.
     "pre_command",
+    # Voice-loop state hook. Fired by tui_gateway.server._emit_voice_state_hook
+    # at wake detection, STT status changes, and TTS playback start/stop --
+    # the only places voice-loop state changes today, previously reaching the
+    # JSON-RPC transport straight to the connected UI client with no plugin
+    # visibility. Observers only: return values are ignored. Fail-open at the
+    # call site, so a broken/absent plugin never breaks voice mode.
+    # Kwargs: state: "listening" | "speaking" | "idle".
+    "voice_state_changed",
 }
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
@@ -661,17 +669,37 @@ class PluginContext:
 
     @_serialized_replacement
     def register_command(
-        self, name: str, handler: Callable, description: str = "", args_hint: str = "",
-        argument_mode: str | None = None, subcommands: tuple[str, ...] = (),
+        self,
+        name: str,
+        handler: Callable,
+        description: str = "",
+        args_hint: str = "",
+        argument_mode: str | None = None,
+        subcommands: tuple[str, ...] = (),
     ) -> Optional[PluginRegistration]:
-        """Register an in-session slash command (``/name``); handler ``fn(raw_args: str) -> str | None``
-        (sync or async). ``args_hint`` (e.g. ``"<file>"``) lets adapters like Discord surface an argument
-        field; without it the command registers parameterless there but still accepts trailing text.
+        """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
-        ``subcommands`` is an optional tuple of literal first-argument values (e.g. ``("on", "off",
-        "status")``) that CLI/TUI/desktop completers offer as a dropdown after the command name --
-        mirrors the built-in ``CommandDef.subcommands`` field (``hermes_cli/commands.py``). Empty by
-        default: no dropdown, matching every plugin command's behavior before this field existed."""
+        The handler signature is ``fn(raw_args: str) -> str | None``.
+        It may also be an async callable — the gateway dispatch handles both.
+
+        Unlike ``register_cli_command()`` (which creates ``hermes <subcommand>``
+        terminal commands), this registers in-session slash commands that users
+        invoke during a conversation.
+
+        ``args_hint`` is an optional short string (e.g. ``"<file>"`` or
+        ``"dias:7 formato:json"``) used by gateway adapters to surface the
+        command with an argument field — for example Discord's native slash
+        command picker. Plugin commands without ``args_hint`` register as
+        parameterless in Discord and still accept trailing text when invoked
+        as free-form chat.
+
+        ``argument_mode`` tells the desktop composer how text after the command
+        name behaves (``options``, ``text``, or ``mixed``). Omit it to infer:
+        ``options`` when ``subcommands`` is a fixed choice list, else ``text``
+        whenever ``args_hint`` is set, so ``/myplugin `` stays typeable.
+
+        Names conflicting with built-in commands are rejected with a warning.
+        """
         clean = name.lower().strip().lstrip("/").replace(" ", "-")
         if not clean:
             logger.warning("Plugin '%s' tried to register a command with an empty name.", self.manifest.name)
@@ -683,11 +711,21 @@ class PluginContext:
                                "with a built-in command. Skipping.", self.manifest.name, clean)
                 return
         hint = (args_hint or "").strip()
+        if argument_mode in {"options", "text", "mixed"}:
+            mode = argument_mode
+        elif subcommands:
+            mode = "options"
+        elif hint:
+            mode = "text"
+        else:
+            mode = None
         entry = {
-            "handler": handler, "description": description or "Plugin command",
-            "plugin": self.manifest.name, "plugin_key": self.plugin_id, "args_hint": hint,
-            "argument_mode": argument_mode if argument_mode in {"options", "text", "mixed"}
-            else ("text" if hint else None),
+            "handler": handler,
+            "description": description or "Plugin command",
+            "plugin": self.manifest.name,
+            "plugin_key": self.manifest.key or self.manifest.name,
+            "args_hint": hint,
+            "argument_mode": mode,
             "subcommands": tuple(subcommands or ()),
         }
         return self._register_entry("command", clean, self._manager._plugin_commands, entry,

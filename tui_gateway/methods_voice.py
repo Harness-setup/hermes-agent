@@ -111,6 +111,7 @@ def _tts_stream_begin() -> Optional[queue.Queue]:
     with _tts_stream_lock:
         _tts_stream_state = {"stop": stop, "done": done}
     _arm_barge_listener_if_enabled()
+    _emit_voice_state_hook("speaking")
     return text_queue
 
 
@@ -132,6 +133,10 @@ def _tts_stream_stop(user_barge: bool = True) -> None:
     with contextlib.suppress(Exception):
         from tools.voice_mode import stop_playback
         stop_playback()
+    # Only reached when a real active stream was stopped (the `if state is
+    # None: return` above already handled the no-op case) -- so this never
+    # fires a spurious "idle" when nothing was speaking to begin with.
+    _emit_voice_state_hook("idle")
 
 
 # ── Full-duplex agent-turn listener: arms at utterance-submit, spans generation AND playback
@@ -426,6 +431,7 @@ def _wake_detect_handler(transport, sid: str, phrase: str, new_session: bool):
             _emit("wake.detected", sid, {
                 "phrase": matched_phrase or phrase, "profile": matched_profile or None,
                 "start_new_session": new_session})
+            _emit_voice_state_hook("listening")
         finally:
             reset_transport(token)
     return _on_detect
@@ -696,6 +702,11 @@ def _vr_on_stop_phrase(t):
 
 def _vr_on_status(state):
     _voice_emit("voice.status", {"state": state})
+    # "transcribing" is a brief in-between STT step; folded into "listening"
+    # rather than introducing a new visual state -- jarvis-voice's own state
+    # machine doesn't distinguish it either (see docs/superpowers/specs/
+    # 2026-08-04-hermes-native-voice-pebble-bridge-design.md).
+    _emit_voice_state_hook("listening" if state == "transcribing" else state)
     if state == "idle":
         _resume_voice_wake()
 

@@ -56,6 +56,8 @@ class FailoverReason(enum.Enum):
     # (~/.hermes/plugins/mode/error_classification.py), which reuses the
     # `timeout` reason below instead of a dedicated enum member -- see that
     # module's docstring for why no core change was needed at all here.
+
+    # Catch-all
     unknown = "unknown"                  # Unclassifiable — retry with backoff
 
 

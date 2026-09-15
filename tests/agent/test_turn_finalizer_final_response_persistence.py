@@ -447,3 +447,50 @@ def test_delivery_only_reasoning_excerpt_does_not_fill_blank_assistant(monkeypat
         for m in result["messages"]
     )
 
+
+def test_transform_llm_output_swap_is_persisted_durably(monkeypatch):
+    """A transform_llm_output plugin swap (e.g. refusal->uncensored reroute,
+    or this repo's own kanban dispatch relay) must reach the durable
+    transcript, not just the returned result dict.
+
+    Regression: transform_llm_output runs BEFORE _persist_session within
+    finalize_turn (_apply_transform_hook, called from _persist_step).
+    _session_db.append_message is a pure insert with no update path, so a
+    swap applied after the turn's one-and-only persist call cannot be
+    written back into the same row without creating a duplicate -- the
+    swapped text must already be in `messages[-1]` by the time
+    _persist_session runs. See _close_transcript_tail's
+    `_response_transformed` branch.
+    """
+    def fake_invoke_hook(hook_name, **_kwargs):
+        if hook_name == "transform_llm_output":
+            return ["[via uncensored]\n\nswapped answer"]
+        return []
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", fake_invoke_hook)
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "how do I do X"},
+        {"role": "assistant", "content": "I cannot provide that."},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="I cannot provide that.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="how do I do X",
+        original_user_message="how do I do X",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == "[via uncensored]\n\nswapped answer"
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["content"] == "[via uncensored]\n\nswapped answer"
+
