@@ -24,7 +24,8 @@ from tools.tts_command_provider import (
 from tools.tts_tool_delivery import _origin
 from tools.tts_tool_local import (
     _LOCAL_TTS_MODEL_CACHES, _load_kittentts_model_for_config, _load_piper_voice_for_config,
-    _load_neutts_model_for_config, _neutts_encoded_reference, _NEUTTS_SAMPLES)
+    _load_neutts_model_for_config, _neutts_encoded_reference, _NEUTTS_SAMPLES,
+    _load_chatterbox_model_for_config, _load_pocket_tts_model_for_config, _pocket_tts_voice_state)
 from tools.tts_tool_plugins import _lookup_plugin_provider
 
 logger = logging.getLogger("tools.tts_tool")
@@ -44,12 +45,22 @@ def _warm_neutts(cfg: Dict[str, Any]) -> Any:
     return entry
 
 
+def _warm_pocket_tts(cfg: Dict[str, Any]) -> Any:
+    """Loads the model AND resolves the configured voice (catalog or cloned), so warm-up pays the
+    voice-state cost up front too, matching _warm_neutts's own rationale."""
+    entry, pt_config = _load_pocket_tts_model_for_config(cfg)
+    _pocket_tts_voice_state(entry, pt_config)
+    return entry
+
+
 def _local_tts_warmers() -> Dict[str, Callable[[Dict[str, Any]], Any]]:
     """Provider name → loader populating that engine's cache slot (same key synthesis uses)."""
     return {
         "piper": lambda cfg: _load_piper_voice_for_config(cfg)[0],
         "kittentts": lambda cfg: _load_kittentts_model_for_config(cfg)[0],
-        "neutts": _warm_neutts}
+        "neutts": _warm_neutts,
+        "chatterbox": lambda cfg: _load_chatterbox_model_for_config(cfg)[0],
+        "pocket_tts": _warm_pocket_tts}
 
 
 # tools.lazy_deps feature key for providers whose SDK installs on first use.
