@@ -145,7 +145,7 @@ def _uncensored_mode_persist_disabled(profile_name: str, state_path=None) -> boo
         return True
 
 
-def _reconcile_uncensored_session_tracking(session_id: str, state_path=None) -> None:
+def _reconcile_uncensored_session_tracking(session_id: str, state_path=None, db_path=None) -> None:
     """Tony, 2026-08-24: "I want to see all the conversation we had [during
     the uncensored session]. but after I go to a different session or make
     a new one or change mode, it will erase everything including the one
@@ -196,6 +196,37 @@ def _reconcile_uncensored_session_tracking(session_id: str, state_path=None) -> 
     tracked = data.get("uncensored_session_id")
     if tracked and tracked != session_id and tracked not in pending:
         pending.append(tracked)
+
+    # Defensive sweep for sessions this single `tracked` pointer already lost track of.
+    # Live incident, 2026-09-15: a session persisted under the uncensored model was found
+    # NEITHER as `uncensored_session_id` NOR in `uncensored_pending_cleanup` -- outside
+    # both of this function's own bookkeeping, so it would never get deleted no matter how
+    # many later sessions started. Root cause not fully pinned down (a `/mode` restore
+    # racing a near-simultaneous re-switch is the leading theory -- toggle.py's
+    # _restore_backup, the third abandonment trigger this function's own docstring
+    # says it does NOT cover, runs outside session init entirely), but the fix that
+    # actually closes the privacy gap doesn't require pinning it down: catch ANY stray
+    # uncensored-model session by construction, every reconcile call, regardless of how
+    # it got orphaned. Same "uncensored" substring convention already used elsewhere
+    # (system_prompt.py's lmstudio_identity_section) -- both DEFAULT_MODEL_BY_KIND
+    # entries (plugins/mode/state.py) reliably differ on exactly that substring, and
+    # core code must not import the mode plugin to get the canonical name instead.
+    with suppress(Exception):
+        import sqlite3
+        _db_path = db_path or (get_hermes_home() / "state.db")
+        if _db_path.exists():
+            conn = sqlite3.connect(f"file:{_db_path}?mode=ro", uri=True, timeout=2.0)
+            try:
+                rows = conn.execute(
+                    "SELECT id FROM sessions WHERE lower(model) LIKE '%uncensored%' "
+                    "AND id != ? AND (archived IS NULL OR archived = 0)",
+                    (session_id,),
+                ).fetchall()
+            finally:
+                conn.close()
+            for (sid,) in rows:
+                if sid != tracked and sid not in pending:
+                    pending.append(sid)
 
     still_pending = []
     for sid in pending:

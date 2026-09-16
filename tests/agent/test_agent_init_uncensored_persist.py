@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from unittest.mock import patch
 
 from agent.agent_init import (
@@ -6,6 +7,15 @@ from agent.agent_init import (
     _reconcile_uncensored_session_tracking,
     _delete_session_with_retries,
 )
+
+
+def _make_state_db(db_path, sessions):
+    """sessions: list of (id, model, archived) tuples."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT, archived INTEGER)")
+    conn.executemany("INSERT INTO sessions (id, model, archived) VALUES (?, ?, ?)", sessions)
+    conn.commit()
+    conn.close()
 
 
 def test_returns_false_when_state_file_missing(tmp_path):
@@ -183,3 +193,82 @@ def test_a_previously_queued_failure_is_retried_on_the_next_reconcile_call(tmp_p
     data = json.loads(state_path.read_text())
     assert data["uncensored_pending_cleanup"] == []
     assert data["uncensored_session_id"] == "s_new"
+
+
+# --- defensive sweep for sessions orphaned outside `tracked`/`pending_cleanup` ---
+#
+# Live incident, 2026-09-15: a session persisted under the uncensored model was
+# found neither as uncensored_session_id nor in uncensored_pending_cleanup --
+# outside this function's own bookkeeping entirely, so it would never get
+# deleted no matter how many later sessions started. The sweep below catches
+# any stray uncensored-model session by construction, every reconcile call,
+# regardless of how it became orphaned.
+
+def test_sweep_catches_a_session_orphaned_outside_tracked_and_pending(tmp_path):
+    state_path = tmp_path / "mode-state.json"
+    db_path = tmp_path / "state.db"
+    _write_state(state_path, uncensored_session_id="s_current")
+    _make_state_db(db_path, [
+        ("s_orphan", "qwen3.5-9b-uncensored-hauhaucs-aggressive", 0),
+        ("s_current", "qwen3.5-9b-uncensored-hauhaucs-aggressive", 0),
+    ])
+    with patch("hermes_state.SessionDB") as m_db:
+        _reconcile_uncensored_session_tracking("s_current", state_path=state_path, db_path=db_path)
+    m_db.return_value.delete_session.assert_called_once_with("s_orphan")
+    data = json.loads(state_path.read_text())
+    assert data["uncensored_pending_cleanup"] == []
+    assert data["uncensored_session_id"] == "s_current"
+
+
+def test_sweep_ignores_non_uncensored_sessions(tmp_path):
+    state_path = tmp_path / "mode-state.json"
+    db_path = tmp_path / "state.db"
+    _write_state(state_path, uncensored_session_id="s_current")
+    _make_state_db(db_path, [
+        ("s_cloud", "claude-sonnet-5", 0),
+        ("s_local", "qwen/qwen3.5-9b", 0),
+        ("s_current", "qwen3.5-9b-uncensored-hauhaucs-aggressive", 0),
+    ])
+    with patch("hermes_state.SessionDB") as m_db:
+        _reconcile_uncensored_session_tracking("s_current", state_path=state_path, db_path=db_path)
+    m_db.return_value.delete_session.assert_not_called()
+
+
+def test_sweep_ignores_already_archived_sessions(tmp_path):
+    """An archived session is already effectively gone from view -- don't
+    churn a delete attempt on it every single reconcile call."""
+    state_path = tmp_path / "mode-state.json"
+    db_path = tmp_path / "state.db"
+    _write_state(state_path, uncensored_session_id="s_current")
+    _make_state_db(db_path, [
+        ("s_archived", "qwen3.5-9b-uncensored-hauhaucs-aggressive", 1),
+        ("s_current", "qwen3.5-9b-uncensored-hauhaucs-aggressive", 0),
+    ])
+    with patch("hermes_state.SessionDB") as m_db:
+        _reconcile_uncensored_session_tracking("s_current", state_path=state_path, db_path=db_path)
+    m_db.return_value.delete_session.assert_not_called()
+
+
+def test_sweep_does_not_duplicate_the_already_tracked_session(tmp_path):
+    """The sweep must not re-add the session already handled by the normal
+    tracked-pointer path as a duplicate pending entry."""
+    state_path = tmp_path / "mode-state.json"
+    db_path = tmp_path / "state.db"
+    _write_state(state_path, uncensored_session_id="s_old")
+    _make_state_db(db_path, [
+        ("s_old", "qwen3.5-9b-uncensored-hauhaucs-aggressive", 0),
+        ("s_new", "qwen3.5-9b-uncensored-hauhaucs-aggressive", 0),
+    ])
+    with patch("hermes_state.SessionDB") as m_db:
+        _reconcile_uncensored_session_tracking("s_new", state_path=state_path, db_path=db_path)
+    m_db.return_value.delete_session.assert_called_once_with("s_old")
+
+
+def test_sweep_is_silent_no_op_when_state_db_missing(tmp_path):
+    state_path = tmp_path / "mode-state.json"
+    _write_state(state_path, uncensored_session_id="s_current")
+    with patch("hermes_state.SessionDB") as m_db:
+        _reconcile_uncensored_session_tracking(
+            "s_current", state_path=state_path, db_path=tmp_path / "does-not-exist.db")
+    m_db.return_value.delete_session.assert_not_called()
+    assert json.loads(state_path.read_text())["uncensored_session_id"] == "s_current"
