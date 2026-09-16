@@ -222,6 +222,45 @@ def _is_full_sha(value: Optional[str]) -> bool:
 
 _compare_payload_cache: Dict[tuple, dict] = {}
 
+# Memoized per process -- a token doesn't change mid-run, and a missing/expired
+# one shouldn't be re-probed (subprocess spawn) on every single API call.
+_github_token_cache: Dict[str, Optional[str]] = {}
+
+
+def _github_token() -> Optional[str]:
+    """A GitHub token to raise these calls from the anonymous 60/hour-per-IP
+    limit to the authenticated 5000/hour one, or None to stay anonymous.
+
+    Tony/backend hit "GitHub time limit" errors 2026-09-17 from fully
+    unauthenticated api.github.com calls (confirmed live: no Authorization
+    header anywhere in this module). Optional, never required -- a missing
+    token just means these calls stay anonymous, same as before. Priority:
+    GITHUB_TOKEN/GH_TOKEN env (explicit, works anywhere including the
+    Windows desktop build) -- then `gh auth token` (convenient default on a
+    dev machine that already has `gh` authenticated, but never required)."""
+    if "token" in _github_token_cache:
+        return _github_token_cache["token"]
+    token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip() or None
+    if not token and shutil.which("gh"):
+        try:
+            result = subprocess.run(
+                ["gh", "auth", "token"], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0 and result.stdout.strip():
+                token = result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    _github_token_cache["token"] = token
+    return token
+
+
+def _github_api_headers(accept: str) -> Dict[str, str]:
+    """Common headers for an api.github.com request, with auth when available."""
+    headers = {"Accept": accept, "User-Agent": "hermes-cli-update-check"}
+    token = _github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
 
 def _github_compare(current_rev: str, target_rev: str) -> Optional[dict]:
     """Compare payload for ``current...target`` from the GitHub API; memoized per process.
@@ -240,8 +279,7 @@ def _github_compare(current_rev: str, target_rev: str) -> Optional[dict]:
     def _fetch():
         import urllib.request
         # api.github.com 403s requests without a User-Agent.
-        req = urllib.request.Request(
-            url, headers={"Accept": "application/vnd.github+json", "User-Agent": "hermes-cli-update-check"})
+        req = urllib.request.Request(url, headers=_github_api_headers("application/vnd.github+json"))
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
     payload = _quiet(_fetch)
@@ -306,15 +344,14 @@ def _tips_behind(head_rev: Optional[str], target_rev: Optional[str], repo_dir: O
 
 
 def _github_branch_tip(repo_slug: str, branch: str) -> Optional[str]:
-    """Tip SHA of ``branch`` on GitHub via the REST API (40-byte body, no git, no auth)."""
+    """Tip SHA of ``branch`` on GitHub via the REST API (40-byte body, no git; auth optional)."""
     from urllib.parse import quote
 
     url = f"https://api.github.com/repos/{repo_slug}/commits/{quote(branch, safe='')}"
 
     def _fetch():
         import urllib.request
-        req = urllib.request.Request(
-            url, headers={"Accept": "application/vnd.github.sha", "User-Agent": "hermes-cli-update-check"})
+        req = urllib.request.Request(url, headers=_github_api_headers("application/vnd.github.sha"))
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.read().decode("utf-8").strip()
     sha = _quiet(_fetch)

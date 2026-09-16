@@ -396,7 +396,7 @@ import {
   windowOpacityFor,
   windowOpacityOptions
 } from './translucency'
-import { branchTipApiUrl, cacheIsFresh, compareApiUrl, githubRepoSlug, parseCompare } from './update-api-check'
+import { branchTipApiUrl, cacheIsFresh, compareApiUrl, githubApiHeaders, githubRepoSlug, parseCompare } from './update-api-check'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
@@ -3386,16 +3386,40 @@ function describeUpdateCheckFailure(error) {
   return `api.github.com: ${error?.message || String(error)}`
 }
 
+// Memoized per process -- a token doesn't change mid-run, and a missing one
+// shouldn't be re-probed (subprocess spawn) on every single API call.
+let cachedGithubToken
+
+function githubToken() {
+  if (cachedGithubToken !== undefined) {
+    return cachedGithubToken
+  }
+
+  let token = (process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '').trim() || null
+
+  if (!token) {
+    try {
+      const out = execFileSync('gh', ['auth', 'token'], { encoding: 'utf8', timeout: 5_000 }).trim()
+
+      if (out) {
+        token = out
+      }
+    } catch {
+      // gh not installed / not authenticated -- stay anonymous, exactly as before.
+    }
+  }
+
+  cachedGithubToken = token
+
+  return token
+}
+
 function fetchGitHubApi(url, accept = 'application/vnd.github+json') {
   return new Promise((resolve, reject) => {
     const req = https.get(
       url,
       {
-        headers: {
-          Accept: accept,
-          // GitHub requires a UA on api.github.com; requests without one 403.
-          'User-Agent': 'hermes-desktop-update-check'
-        },
+        headers: githubApiHeaders(accept, githubToken()),
         timeout: 10_000
       },
       res => {

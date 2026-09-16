@@ -45,6 +45,32 @@ export function compareApiUrl(slug: string, currentSha: string, targetSha: strin
 }
 
 /**
+ * Headers for an api.github.com request, with auth when a token is available.
+ *
+ * Tony hit "GitHub time limit" errors on both the desktop app and the backend
+ * 2026-09-17 -- both were fully unauthenticated, subject to GitHub's 60
+ * requests/hour PER-IP anonymous limit (verified live: no Authorization
+ * header anywhere in this call path). A token raises that to 5000/hour.
+ * Optional, never required -- pass `token: null` to stay anonymous exactly
+ * as before. Token DISCOVERY (env vars, `gh auth token`) is impure and lives
+ * in main.ts next to the actual network call; this stays a pure function so
+ * it's testable without booting Electron, matching every other helper here.
+ */
+export function githubApiHeaders(accept: string, token: string | null): Record<string, string> {
+  const headers: Record<string, string> = {
+    Accept: accept,
+    // GitHub requires a UA on api.github.com; requests without one 403.
+    'User-Agent': 'hermes-desktop-update-check'
+  }
+
+  if (token) {
+    headers.Authorization = `Bearer ${token}`
+  }
+
+  return headers
+}
+
+/**
  * Whether a cached result still answers a passive check. The cache is keyed on
  * the local HEAD and branch: applying an update or switching branches changes
  * HEAD and invalidates it immediately, so a 24h TTL never shows a stale

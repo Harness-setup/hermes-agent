@@ -16,6 +16,7 @@ import { test } from 'vitest'
 import {
   branchTipApiUrl,
   cacheIsFresh,
+  githubApiHeaders,
   githubRepoSlug,
   parseCompare,
   UPDATE_CHECK_FAILURE_TTL_MS,
@@ -78,4 +79,22 @@ test('compare payload maps to the behind count and a newest-first commit list; m
     branchTipApiUrl('nousresearch/hermes-agent', 'bb/gui'),
     'https://api.github.com/repos/nousresearch/hermes-agent/commits/bb%2Fgui'
   )
+})
+
+test('github request headers: no token stays anonymous exactly as before, a token adds auth', () => {
+  // Tony hit "GitHub time limit" errors on both desktop and backend 2026-09-17 --
+  // fully unauthenticated requests hit GitHub's 60/hour-per-IP anonymous limit.
+  const anonymous = githubApiHeaders('application/vnd.github.sha', null)
+  assert.deepEqual(anonymous, {
+    Accept: 'application/vnd.github.sha',
+    'User-Agent': 'hermes-desktop-update-check'
+  })
+  assert.equal('Authorization' in anonymous, false)
+
+  const authed = githubApiHeaders('application/vnd.github+json', 'gho_abc123')
+  assert.deepEqual(authed, {
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'hermes-desktop-update-check',
+    Authorization: 'Bearer gho_abc123'
+  })
 })
