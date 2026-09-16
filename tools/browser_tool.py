@@ -754,6 +754,8 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     _lp._copy_fallback_warning(response, result)
     _add_navigate_warnings(response, title, session_info if is_first_nav else None)
     _attach_auto_snapshot(response, nav_session_key)
+    from tools.browser_cdp_tool import _annotate_family_safety_block
+    _annotate_family_safety_block(response)
     return _dumps(response)
 
 
