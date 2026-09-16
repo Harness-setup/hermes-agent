@@ -1604,6 +1604,52 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
             str(fb.get("base_url") or "").strip().rstrip("/"))
 
 
+def _fallback_entry_would_evict_active_local_mode(fb: dict) -> Optional[str]:
+    """Skip a fallback entry that targets the shared local/uncensored GPU slot (LM Studio,
+    the single 8GB card gpu-slot.sh manages) while /mode has a DIFFERENT model actively
+    loaded there for the user's own local/uncensored session.
+
+    Root cause found live 2026-09-15: this exact fallback path (e.g. cloud auth
+    degrading -- "Copilot token exchange degraded to RAW token" -- activating a
+    {"provider": "lmstudio-chat", "model": "qwen/qwen3.5-9b"} entry) and a user's
+    independently-active `/mode uncensored` session both target the SAME physical GPU
+    slot through the SAME LM Studio instance. LM Studio's own
+    unloadPreviousJITModelOnLoad=true means whichever one JIT-loads second silently
+    evicts the other -- invisible to gpu-slot.sh's own role tracking, since this
+    fallback path calls the OpenAI-compatible endpoint directly and never goes through
+    gpu-slot.sh's `use` command. Confirmed via LM Studio's own server log: repeated
+    "unexpected-eviction: mode expects X loaded but lms ps does not show it" cycles,
+    several minutes apart, correlating with cloud-auth-degradation warnings while
+    `/mode uncensored` was independently active.
+
+    Reads ~/.hermes/mode-state.json directly -- the established cross-plugin,
+    read-by-path pattern already used elsewhere in this file (see
+    agent_init.py's _uncensored_mode_persist_disabled) -- rather than importing the
+    mode plugin, which core code must not depend on. Fails OPEN (returns None, i.e.
+    don't skip) on any read/parse error or when the file doesn't exist: refusing a
+    legitimate cloud-outage fallback is the worse failure here, the opposite direction
+    from the privacy-motivated uncensored-mode check this pattern is borrowed from --
+    only a successfully-read, ACTIVE mode-state.json with a genuinely different model
+    suppresses this fallback candidate."""
+    fb_provider = (fb.get("provider") or "").strip().lower()
+    fb_base_url = (fb.get("base_url") or "").strip().lower()
+    fb_model = (fb.get("model") or "").strip()
+    if fb_provider != "lmstudio-chat" and "127.0.0.1:11434" not in fb_base_url and "localhost:11434" not in fb_base_url:
+        return None
+    try:
+        from hermes_constants import get_hermes_home
+        path = get_hermes_home() / "mode-state.json"
+        if not path.exists():
+            return None
+        state = json.loads(path.read_text())
+        active_model = str(state.get("model") or "").strip()
+    except Exception:
+        return None
+    if active_model and fb_model and active_model != fb_model:
+        return f"would_evict_active_local_mode:{active_model}"
+    return None
+
+
 def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
     """Return a skip reason for fallback entries known to be unusable locally."""
     if (fb.get("provider") or "").strip().lower() != "nous":
@@ -1733,6 +1779,15 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
         return True
     if not fb_provider or not fb_model:
+        return True
+    # NOT cached in `unavailable` below, unlike the other checks in this function --
+    # local/uncensored mode state is dynamic (can end mid-session) and must be
+    # re-evaluated on every fallback attempt, not permanently suppressed for the rest
+    # of this agent's lifetime the first time it happens to be active.
+    _gpu_role_skip = _fallback_entry_would_evict_active_local_mode(fb)
+    if _gpu_role_skip:
+        logger.warning("Fallback skip: %s/%s %s -- would silently evict the active local/uncensored session",
+                       fb_provider, fb_model, _gpu_role_skip)
         return True
     from agent.fallback_cooldown import _is_entitlement_rejected
     if _is_entitlement_rejected(agent, fb_provider, fb_model):
