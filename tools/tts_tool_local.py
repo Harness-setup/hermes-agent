@@ -34,12 +34,10 @@ _TTS_MODEL_CACHE_MAX = 3
 _piper_voice_cache: Dict[str, Any] = {}
 _kittentts_model_cache: Dict[str, Any] = {}
 _neutts_model_cache: Dict[str, Any] = {}
-_chatterbox_model_cache: Dict[str, Any] = {}
 _pocket_tts_model_cache: Dict[str, Any] = {}
 _LOCAL_TTS_MODEL_CACHES: Dict[str, Dict[str, Any]] = {
     "piper": _piper_voice_cache, "kittentts": _kittentts_model_cache,
-    "neutts": _neutts_model_cache, "chatterbox": _chatterbox_model_cache,
-    "pocket_tts": _pocket_tts_model_cache}
+    "neutts": _neutts_model_cache, "pocket_tts": _pocket_tts_model_cache}
 
 
 def _tts_cache_get_or_load(cache: Dict[str, Any], key: str, load: Callable[[], Any]) -> Any:
@@ -119,50 +117,6 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
     wav_path = _wav_sidecar_path(output_path)
     import soundfile as sf
     sf.write(wav_path, wav, 24000)
-    return _finalize_wav_output(wav_path, output_path)
-
-
-# --- Chatterbox (Resemble AI, zero-shot voice cloning; in-process, warmed/released the same
-# way as NeuTTS) --- Tony, 2026-09-16: wanted a lighter-weight cloning-capable TTS after NeuTTS
-# measured 5-7s/utterance even warm on GPU. "turbo" variant (350M params) targets GPU, ~75ms
-# latency, 2-3GB VRAM; "nano" (110M, same architecture/training data/cloning support) targets
-# CPU-only, no VRAM at all -- both loaded through the same ChatterboxTurboTTS class, `nano=True`
-# selecting the smaller checkpoint. Reference audio only (no separate ref_text transcript needed,
-# unlike NeuTTS) -- passed straight to .generate() each call; the library itself doesn't expose a
-# separate encode-once step the way NeuTTS's encode_reference() does, so there's no analogous
-# cross-call reference cache here, only the model instance itself.
-_CHATTERBOX_DEFAULT_VARIANT = "turbo"
-
-
-def _load_chatterbox_model_for_config(tts_config: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-    """Load (or fetch from cache) the Chatterbox model -> ``(model, chatterbox_config)``."""
-    cb_config = _section(tts_config, "chatterbox")
-    variant = (cb_config.get("variant") or _CHATTERBOX_DEFAULT_VARIANT).lower().strip()
-    is_nano = variant == "nano"
-    device = cb_config.get("device") or ("cpu" if is_nano else "cuda")
-    cache_key = f"{variant}::{device}"
-
-    def _load_chatterbox():
-        from chatterbox.tts_turbo import ChatterboxTurboTTS
-        logger.info("[Chatterbox] Loading model: variant=%s device=%s", variant, device)
-        model = ChatterboxTurboTTS.from_pretrained(device=device, nano=is_nano)
-        logger.info("[Chatterbox] Model loaded")
-        return model
-
-    return _tts_cache_get_or_load(_chatterbox_model_cache, cache_key, _load_chatterbox), cb_config
-
-
-def _generate_chatterbox(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
-    model, cb_config = _load_chatterbox_model_for_config(tts_config)
-    ref_audio = str(Path(cb_config.get("ref_audio", "") or (_NEUTTS_SAMPLES / "jo.wav")).expanduser())
-    kwargs: Dict[str, Any] = {"audio_prompt_path": ref_audio}
-    for knob in ("exaggeration", "cfg_weight"):
-        if knob in cb_config:
-            kwargs[knob] = float(cb_config[knob])
-    wav = model.generate(text, **kwargs)
-    wav_path = _wav_sidecar_path(output_path)
-    import torchaudio as ta
-    ta.save(wav_path, wav, model.sr)
     return _finalize_wav_output(wav_path, output_path)
 
 

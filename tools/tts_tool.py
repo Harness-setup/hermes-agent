@@ -42,7 +42,7 @@ from tools.tts_tool_delivery import (
 from tools.tts_tool_providers import (
     _generate_edge_tts, _generate_elevenlabs, _generate_gemini_tts, _generate_minimax_tts,
     _generate_mistral_tts, _generate_xai_tts, _resolve_minimax_tts_runtime)
-from tools.tts_tool_local import _generate_chatterbox, _generate_kittentts, _generate_neutts, _generate_piper_tts, _generate_pocket_tts
+from tools.tts_tool_local import _generate_kittentts, _generate_neutts, _generate_piper_tts, _generate_pocket_tts
 from tools.tts_tool_plugins import (
     _dispatch_to_plugin_provider, _plugin_provider_is_available,
     _plugin_provider_is_voice_compatible)
@@ -93,7 +93,6 @@ def _package_installed(name: str) -> bool:
 
 def _check_neutts_available() -> bool: return _package_installed("neutts")
 def _check_kittentts_available() -> bool: return _package_installed("kittentts")
-def _check_chatterbox_available() -> bool: return _package_installed("chatterbox")
 def _check_pocket_tts_available() -> bool: return _package_installed("pocket_tts")
 def _check_piper_available() -> bool: return _package_installed("piper")
 
@@ -150,7 +149,7 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
 OPUS_VOICE_PLATFORMS = frozenset({"telegram", "matrix", "feishu", "whatsapp", "signal"})
 # Built-ins that emit Opus natively when asked for .ogg; the rest need ffmpeg for voice bubbles.
 _NATIVE_OPUS_PROVIDERS = frozenset({"openai", "elevenlabs", "mistral", "gemini"})
-_FFMPEG_OPUS_PROVIDERS = frozenset({"edge", "neutts", "minimax", "xai", "kittentts", "piper", "chatterbox", "pocket_tts"})
+_FFMPEG_OPUS_PROVIDERS = frozenset({"edge", "neutts", "minimax", "xai", "kittentts", "piper", "pocket_tts"})
 
 
 # --- Built-in provider dispatch ---
@@ -180,9 +179,6 @@ _BUILTIN_DISPATCH: Dict[str, tuple] = {
               "Piper provider selected but 'piper-tts' package not installed. "
               "Run 'hermes tools' and select Piper under TTS, or install manually: "
               "pip install piper-tts"),
-    "chatterbox": (lambda: _check_chatterbox_available(), "Chatterbox (local, zero-shot cloning)", "_generate_chatterbox",
-                   "Chatterbox provider selected but 'chatterbox-tts' package not installed. "
-                   "Run: pip install chatterbox-tts"),
     "pocket_tts": (lambda: _check_pocket_tts_available(), "Pocket TTS (local, CPU-first)", "_generate_pocket_tts",
                    "Pocket TTS provider selected but 'pocket-tts' package not installed. "
                    "Run: pip install pocket-tts")}
@@ -504,7 +500,6 @@ _BUILTIN_REQUIREMENTS: Dict[str, Callable[[], bool]] = {
     "neutts": lambda: _check_neutts_available(),
     "kittentts": lambda: _check_kittentts_available(),
     "piper": lambda: _check_piper_available(),
-    "chatterbox": lambda: _check_chatterbox_available(),
     "pocket_tts": lambda: _check_pocket_tts_available()}
 
 

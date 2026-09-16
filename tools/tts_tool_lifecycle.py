@@ -25,7 +25,7 @@ from tools.tts_tool_delivery import _origin
 from tools.tts_tool_local import (
     _LOCAL_TTS_MODEL_CACHES, _load_kittentts_model_for_config, _load_piper_voice_for_config,
     _load_neutts_model_for_config, _neutts_encoded_reference, _NEUTTS_SAMPLES,
-    _load_chatterbox_model_for_config, _load_pocket_tts_model_for_config, _pocket_tts_voice_state)
+    _load_pocket_tts_model_for_config, _pocket_tts_voice_state)
 from tools.tts_tool_plugins import _lookup_plugin_provider
 
 logger = logging.getLogger("tools.tts_tool")
@@ -59,7 +59,6 @@ def _local_tts_warmers() -> Dict[str, Callable[[Dict[str, Any]], Any]]:
         "piper": lambda cfg: _load_piper_voice_for_config(cfg)[0],
         "kittentts": lambda cfg: _load_kittentts_model_for_config(cfg)[0],
         "neutts": _warm_neutts,
-        "chatterbox": lambda cfg: _load_chatterbox_model_for_config(cfg)[0],
         "pocket_tts": _warm_pocket_tts}
 
 
