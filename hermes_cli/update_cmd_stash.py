@@ -6,6 +6,7 @@ Origin helpers are imported lazily per function (no cycle; test patches on the o
 
 import logging
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -70,11 +71,22 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     stash_name = datetime.now(timezone.utc).strftime(f"{_AUTOSTASH_NAME_PREFIX}%Y%m%d-%H%M%S")
     print("→ Local changes detected — stashing before update...")
     prev_stash = _git_run(git_cmd, ["rev-parse", "--verify", "refs/stash"], cwd).stdout.strip()
-    push = _git_run(git_cmd, ["stash", "push", "--include-untracked", "-m", stash_name], cwd)
+    # A just-killed gateway process (Windows update stops it right before this call)
+    # can leave a transient file lock (AV scan, not-yet-released handle) that makes
+    # git's index write fail once and recover on retry -- same class of race as
+    # gpu-slot.sh's "Engine protocol startup was aborted" retry.
+    _STASH_RETRY_DELAYS = (0.5, 1.5)
+    for attempt in range(len(_STASH_RETRY_DELAYS) + 1):
+        push = _git_run(git_cmd, ["stash", "push", "--include-untracked", "-m", stash_name], cwd)
+        stash_probe = _git_run(git_cmd, ["rev-parse", "--verify", "refs/stash"], cwd)
+        stash_ref = stash_probe.stdout.strip()
+        stash_created = stash_probe.returncode == 0 and bool(stash_ref) and stash_ref != prev_stash
+        if push.returncode == 0 or stash_created:
+            break
+        if attempt < len(_STASH_RETRY_DELAYS):
+            print(f"  ⚠ Stash attempt {attempt + 1} failed ({push.stderr.strip().splitlines()[-1] if push.stderr.strip() else 'unknown error'}) -- retrying...")
+            time.sleep(_STASH_RETRY_DELAYS[attempt])
     _print_nonempty(push.stdout)
-    stash_probe = _git_run(git_cmd, ["rev-parse", "--verify", "refs/stash"], cwd)
-    stash_ref = stash_probe.stdout.strip()
-    stash_created = stash_probe.returncode == 0 and bool(stash_ref) and stash_ref != prev_stash
     if push.returncode != 0:
         if not stash_created:
             # No entry created: changes NOT saved — bail before touching HEAD.

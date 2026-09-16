@@ -709,6 +709,51 @@ def test_bootstrap_marker_not_autostashed_by_update(tmp_path):
 
 
 
+def test_stash_push_retries_after_transient_index_write_failure(monkeypatch, tmp_path):
+    """A one-shot "could not write index" (Windows AV/handle race right after
+    force-killing the previous gateway) must not permanently strand the update --
+    retry succeeds on the next attempt. (client update stuck 2026-09-15)"""
+    import shutil
+    import subprocess as subprocess_module
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    def git(*args, check=True):
+        return subprocess_module.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=check
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "tracked.txt").write_text("v1\n")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+    (tmp_path / "tracked.txt").write_text("v2 local change\n")
+
+    real_git_run = update_cmd._git_run
+    calls = {"stash_push_attempts": 0}
+
+    def flaky_git_run(git_cmd, args, cwd=None, **kwargs):
+        if args[:2] == ["stash", "push"]:
+            calls["stash_push_attempts"] += 1
+            if calls["stash_push_attempts"] == 1:
+                return SimpleNamespace(
+                    returncode=1, stdout="", stderr="error: could not write index"
+                )
+        return real_git_run(git_cmd, args, cwd, **kwargs)
+
+    monkeypatch.setattr(update_cmd, "_git_run", flaky_git_run)
+    monkeypatch.setattr("hermes_cli.update_cmd_stash.time.sleep", lambda *a, **kw: None)
+
+    stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+
+    assert stash_ref, "stash should succeed on the retry, not abort on the first transient failure"
+    assert calls["stash_push_attempts"] == 2
+    assert (tmp_path / "tracked.txt").read_text() == "v1\n"
+
+
 def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
     """Behavioral E2E of the whole permission-denied class with real git:
     root-owned-style undeletable untracked dir → stash succeeds, update-style
