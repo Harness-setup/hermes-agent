@@ -283,6 +283,7 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
     type_text, key, set_value = _noop_stub("type", "text"), _noop_stub("key", "keys"), _noop_stub("set_value", "value", "element")
     list_apps, list_windows = _noop_stub("list_apps", result=[]), _noop_stub("list_windows", result=[])
     focus_app = _noop_stub("focus_app", "app", "raise_window")
+    launch_app = _noop_stub("launch_app", "app")
 
 # ── Dispatch ────────────────────────────────────────────────────────────────
 _MAX_BATCH_SIZE = 20
@@ -516,6 +517,18 @@ _ACTIONS: Dict[str, _ActionSpec] = {
         json.dumps({"error": "focus_app requires `app`"}) if not args.get("app")
         else backend.focus_app(args["app"], raise_window=bool(args.get("raise_window")))), destructive=True,
         summarize=lambda a, args, fg: f"focus {args.get('app', '')!r}" + (" (raise)" if args.get("raise_window") else "")),
+    # Tony, 2026-09-22: "not good at opening apps, example Notion." Root cause: the backend has a
+    # real, idempotent launch_app(name=...) (cua_backend.py) that starts an app whether or not it's
+    # already running -- it was just never exposed as a callable action here, forcing the model to
+    # improvise via generic click-simulation on a taskbar/Start-menu icon, which is exactly the
+    # unreliable path this replaces. Mirrors focus_app's dispatch shape; falls back to a clear error
+    # (not an AttributeError crash) on any backend that doesn't implement it.
+    "launch_app": _ActionSpec(lambda backend, action, args, **_: (
+        json.dumps({"error": "launch_app requires `app`"}) if not args.get("app")
+        else json.dumps({"error": "launch_app is not supported by this backend"})
+        if not hasattr(backend, "launch_app")
+        else json.dumps(backend.launch_app(name=args["app"]))), destructive=True,
+        summarize=lambda a, args, fg: f"launch {args.get('app', '')!r}"),
     "capture": _ActionSpec(_do_capture),
     "wait": _ActionSpec(lambda backend, action, args, **_: _text_response(backend.wait(float(args.get("seconds", 1.0))))),
     "list_apps": _ActionSpec(partial(_do_listing, key="apps")),

@@ -32,6 +32,7 @@ _PROPERTIES: Dict[str, Any] = {
             "list_apps",
             "list_windows",
             "focus_app",
+            "launch_app",
             "batch",
         ],
         "description": (
@@ -41,7 +42,11 @@ _PROPERTIES: Dict[str, Any] = {
             "focus steal). Use `batch` to run a sequence of the actions above in one call instead "
             "of one round-trip per action — each entry in `actions` is a normal action object (its "
             "own approval/validation rules still apply per entry); the batch stops at the first "
-            "failing step and reports how far it got."
+            "failing step and reports how far it got. Use `launch_app` (not clicking a taskbar/Start "
+            "icon) to open an app that may not be running yet — `focus_app` only finds an "
+            "already-open window and fails outright if the app isn't running; `launch_app` starts it "
+            "(idempotent — safe to call even if it's already open, which just focuses the existing "
+            "instance) and is far more reliable than simulating clicks through a launcher UI."
         ),
     },
     "actions": {
@@ -70,7 +75,8 @@ _PROPERTIES: Dict[str, Any] = {
             "Optional. Limit capture/action to one app (name e.g. 'Safari', or bundle ID). Omitted "
             "= frontmost window. app='screen' = composited full-screen grab (image only, no "
             "clickable elements); app='desktop' = the OS desktop/shell surface (wallpaper, icons, "
-            "taskbar) with its elements."
+            "taskbar) with its elements. For action='launch_app', this is the app name to start "
+            "(e.g. 'Notion') -- required for that action."
         ),
     },
     "pid": {

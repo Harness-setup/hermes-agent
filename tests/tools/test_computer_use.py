@@ -1716,6 +1716,71 @@ class TestCaptureAppFilterNoMatch:
         assert backend._last_target is None
         assert backend._snapshot_tokens == {}
 
+class TestLaunchApp:
+    """Bug fixed 2026-09-22 (Tony: "not good at opening apps, example Notion"):
+    the backend has always had a real, idempotent launch_app(name=...) that
+    starts an app whether or not it's already running, but it was never
+    exposed as a callable action -- the model could only reach focus_app,
+    which fails outright ("No on-screen window found") when the app isn't
+    already open, forcing unreliable click-simulation on a taskbar/Start
+    icon instead. These lock in the new dispatch wiring at the tool layer.
+    """
+
+    def test_launch_app_requires_app_arg(self):
+        from tools.computer_use import tool as cu_tool
+
+        class StubBackend:
+            def start(self): pass
+            def stop(self): pass
+            def is_available(self): return True
+            def launch_app(self, *, name): raise AssertionError("must not be called without app")
+
+        cu_tool.reset_backend_for_tests()
+        cu_tool._backend = StubBackend()
+        result = json.loads(cu_tool.handle_computer_use({"action": "launch_app"}))
+        assert "error" in result
+        assert "app" in result["error"]
+
+    def test_launch_app_calls_backend_with_name_and_returns_result(self):
+        from tools.computer_use import tool as cu_tool
+
+        calls = []
+
+        class LaunchingBackend:
+            def start(self): pass
+            def stop(self): pass
+            def is_available(self): return True
+
+            def launch_app(self, *, name):
+                calls.append(name)
+                return {"pid": 4242, "name": name, "windows": []}
+
+        cu_tool.reset_backend_for_tests()
+        cu_tool._backend = LaunchingBackend()
+        result = json.loads(cu_tool.handle_computer_use({"action": "launch_app", "app": "Notion"}))
+
+        assert calls == ["Notion"]
+        assert result["pid"] == 4242
+        assert result["name"] == "Notion"
+
+    def test_launch_app_unsupported_backend_returns_clear_error_not_a_crash(self):
+        """A backend with no launch_app method must fail with a readable
+        error, not AttributeError -- getattr-guard regression lock."""
+        from tools.computer_use import tool as cu_tool
+
+        class NoLaunchBackend:
+            def start(self): pass
+            def stop(self): pass
+            def is_available(self): return True
+            # deliberately no launch_app method
+
+        cu_tool.reset_backend_for_tests()
+        cu_tool._backend = NoLaunchBackend()
+        result = json.loads(cu_tool.handle_computer_use({"action": "launch_app", "app": "Notion"}))
+        assert "error" in result
+        assert "not supported" in result["error"]
+
+
 class TestFocusAppFilterNoMatch:
     """focus_app(app=X) must return ok=False when X matches nothing —
     not silently target the frontmost window and report ok=True with a
