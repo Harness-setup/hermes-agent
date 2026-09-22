@@ -422,6 +422,16 @@ DANGEROUS_PATTERNS = [
     (_CMDPOS + r'yarn\s+' + _PKG_OPTS + r'(?:global\s+)?(?:uninstall|remove)\b', "package manager uninstall"),
     (_CMDPOS + r'pip(?:3)?\s+' + _PKG_OPTS + r'uninstall\b', "package manager uninstall"),
     (_CMDPOS + r'brew\s+' + _PKG_OPTS + r'(?:uninstall|remove|rm)\b', "package manager uninstall"),
+    # Google Workspace skill CLI (google_api.py / gws): the skill's own SKILL.md rule ("never
+    # send/create/delete/share without confirming with the user first") is prose the model can
+    # ignore, and in cron/unattended context there's no user to confirm with at all. Gate the
+    # write-capable subcommands here so `check_execute_code_guard`'s sibling unattended-deny path
+    # (`_unattended_deny` -> `detect_dangerous_command`) blocks them outright when no approver is
+    # present, instead of relying on the model reading the skill's instructions correctly.
+    (r'\b(?:google_api\.py|gws)\b[^;|&\n]*\bgmail\s+(?:send|reply)\b', "send email via Google Workspace CLI"),
+    (r'\b(?:google_api\.py|gws)\b[^;|&\n]*\bcalendar\s+(?:create|delete)\b', "mutate Google Calendar via Google Workspace CLI"),
+    (r'\b(?:google_api\.py|gws)\b[^;|&\n]*\bdrive\s+(?:delete|share|upload|create-folder)\b', "mutate Google Drive via Google Workspace CLI"),
+    (r'\b(?:google_api\.py|gws)\b[^;|&\n]*\b(?:sheets|docs)\s+(?:create|update|append)\b', "mutate Google Sheets/Docs via Google Workspace CLI"),
 ]
 
 
