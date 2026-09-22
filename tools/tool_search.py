@@ -142,13 +142,27 @@ _DEFAULT_DEFERRED_TOOLS = frozenset({
 def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) -> bool:
     """True if a tool is *eligible* for deferral: named in ``defer_tools`` (curated set or
     user override), OR an MCP tool, OR neither core nor a session-gated GUI surface (i.e. a
-    plugin tool). Bridge names never defer."""
+    plugin tool). Bridge names never defer.
+
+    Bug fixed 2026-09-22 (Tony: "it is taking too much time for prompt processing"):
+    MCP-server-sourced tools (name prefix ``mcp__``, e.g. ``mcp__todoist__add_tasks``) are
+    registered through the live MCP connection, not the static ``tools.registry`` the
+    ``mcp-`` toolset-prefix branch below assumes -- ``_registry_toolset()`` returns None
+    for them, and the old code treated that as "unregistered/malformed, never defer,"
+    silently keeping ALL MCP tools permanently eager despite this docstring's own claim
+    that MCP tools defer. Confirmed live: a todoist connection alone registers 47 tools;
+    two MCP servers together were 107 -- all fully eager, correlating directly with
+    25,000-53,000 input tokens on a turn's first API call. The mcp__ prefix is a stable,
+    already-used-elsewhere convention (see tool_search_catalog.py's own _entry_search_text)
+    for recognizing these before ever reaching the registry lookup."""
     if name in BRIDGE_TOOL_NAMES:
         return False
     if defer_tools is not None and name in defer_tools:
         return True
     if name in _core_tool_names():
         return False
+    if name.startswith("mcp__"):
+        return True
     toolset = _registry_toolset(name)  # None (unregistered/malformed) never defers
     return toolset is not None and (
         toolset.startswith("mcp-") or toolset not in _DIRECT_SURFACE_TOOLSETS)

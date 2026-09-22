@@ -208,6 +208,22 @@ class TestClassification:
         from tools.tool_search import is_deferrable_tool_name
         assert not is_deferrable_tool_name("xx_definitely_not_a_tool_xx")
 
+    def test_mcp_tool_is_deferrable_even_though_unregistered(self):
+        """Bug fixed 2026-09-22 (Tony: "it is taking too much time for prompt
+        processing"): MCP-server-sourced tools (mcp__ prefix) are registered
+        through the live MCP connection, not the static tools.registry --
+        _registry_toolset() returns None for them, and the old code treated
+        that identically to test_unknown_tool_not_deferrable's genuinely
+        unresolvable case, silently keeping every MCP tool permanently
+        eager despite this module's own docstring claiming MCP tools defer.
+        Confirmed live: a single todoist connection alone registers 47
+        tools, contributing directly to a measured 25k-53k input tokens on
+        a turn's first API call. This must stay True without needing a
+        registry entry -- that's the whole point of the fix."""
+        from tools.tool_search import is_deferrable_tool_name
+        assert is_deferrable_tool_name("mcp__todoist__add_tasks")
+        assert is_deferrable_tool_name("mcp__some_other_server__some_tool")
+
     def test_classify_keeps_unknown_in_visible(self):
         """A tool we can't classify stays visible — never silently dropped.
 
