@@ -432,6 +432,10 @@ DANGEROUS_PATTERNS = [
     (r'\b(?:google_api\.py|gws)\b[^;|&\n]*\bcalendar\s+(?:create|delete)\b', "mutate Google Calendar via Google Workspace CLI"),
     (r'\b(?:google_api\.py|gws)\b[^;|&\n]*\bdrive\s+(?:delete|share|upload|create-folder)\b', "mutate Google Drive via Google Workspace CLI"),
     (r'\b(?:google_api\.py|gws)\b[^;|&\n]*\b(?:sheets|docs)\s+(?:create|update|append)\b', "mutate Google Sheets/Docs via Google Workspace CLI"),
+    # Microsoft Outlook skill CLI (outlook_api.py): same rationale as the Google Workspace
+    # entries above -- the skill's "confirm with the user first" rule is prose-only.
+    (r'\boutlook_api\.py\b[^;|&\n]*\bmail\s+(?:send|reply)\b', "send email via Microsoft Outlook CLI"),
+    (r'\boutlook_api\.py\b[^;|&\n]*\bcalendar\s+(?:create|delete)\b', "mutate Outlook Calendar via Microsoft Outlook CLI"),
 ]
 
 
