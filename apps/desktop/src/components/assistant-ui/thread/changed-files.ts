@@ -11,6 +11,10 @@ import {
 } from '@/components/assistant-ui/tool/fallback-model'
 import { type ToolResultMetadata, toolResultRecord } from '@/lib/tool-result-metadata'
 
+import { toolResultRecord, type ToolResultMetadata } from '@/lib/tool-result-metadata'
+
+import { toolResultRecord, type ToolResultMetadata } from '@/lib/tool-result-metadata'
+
 export interface ChangedFile {
   added: number
   /** Basename, for the row label. */
