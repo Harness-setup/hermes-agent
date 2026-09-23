@@ -46,6 +46,25 @@ class TestConfigParsing:
         assert cfg.enabled == "auto"
         assert cfg.threshold_pct == 5.0
 
+    def test_defer_default_is_the_registered_list_and_a_user_list_replaces_it(self, caplog):
+        """#116404: the curated deferral set lives in DEFAULT_CONFIG (so ``hermes config set``
+        recognizes the key); a user list replaces it wholesale, [] keeps every tool eager, and a
+        scalar is warned about (naming the expected shape) before falling back to the default."""
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+        from tools.tool_search import ToolSearchConfig, _DEFAULT_DEFERRED_TOOLS
+
+        configured = frozenset(DEFAULT_CONFIG["tools"]["tool_search"]["defer"])
+        assert isinstance(DEFAULT_CONFIG["tools"]["tool_search"]["defer"], list) and configured
+        assert _DEFAULT_DEFERRED_TOOLS == configured
+        assert ToolSearchConfig.from_raw(None).effective_defer_tools == configured
+        assert ToolSearchConfig.from_raw({"defer": ["terminal"]}).effective_defer_tools == {"terminal"}
+        assert ToolSearchConfig.from_raw({"defer": []}).effective_defer_tools == set()
+
+        with caplog.at_level("WARNING", logger="tools.tool_search"):
+            assert ToolSearchConfig.from_raw({"defer": "todo_list"}).effective_defer_tools == configured
+        assert any("tools.tool_search.defer" in r.getMessage() and "expected a YAML list" in r.getMessage()
+                   for r in caplog.records)
+
     def test_bool_true_maps_to_auto(self):
         from tools.tool_search import ToolSearchConfig
         cfg = ToolSearchConfig.from_raw(True)
@@ -207,6 +226,22 @@ class TestClassification:
         cron regression where unresolved tools were silently dropped."""
         from tools.tool_search import is_deferrable_tool_name
         assert not is_deferrable_tool_name("xx_definitely_not_a_tool_xx")
+
+    def test_mcp_tool_is_deferrable_even_though_unregistered(self):
+        """Bug fixed 2026-09-22 (Tony: "it is taking too much time for prompt
+        processing"): MCP-server-sourced tools (mcp__ prefix) are registered
+        through the live MCP connection, not the static tools.registry --
+        _registry_toolset() returns None for them, and the old code treated
+        that identically to test_unknown_tool_not_deferrable's genuinely
+        unresolvable case, silently keeping every MCP tool permanently
+        eager despite this module's own docstring claiming MCP tools defer.
+        Confirmed live: a single todoist connection alone registers 47
+        tools, contributing directly to a measured 25k-53k input tokens on
+        a turn's first API call. This must stay True without needing a
+        registry entry -- that's the whole point of the fix."""
+        from tools.tool_search import is_deferrable_tool_name
+        assert is_deferrable_tool_name("mcp__todoist__add_tasks")
+        assert is_deferrable_tool_name("mcp__some_other_server__some_tool")
 
     def test_classify_keeps_unknown_in_visible(self):
         """A tool we can't classify stays visible — never silently dropped.
@@ -471,6 +506,17 @@ class TestBridgeDispatch:
         assert err is not None
         assert "bridge tool" in err.lower()
 
+    @pytest.mark.parametrize("raw_args", ["", "  \n", None])
+    def test_resolve_underlying_call_treats_blank_arguments_as_no_arguments(self, raw_args):
+        """An OpenAI-compatible gateway emitting ``arguments: ""`` for a parameterless deferred tool
+        must execute with {} instead of looping on a JSON parse error (#83937); malformed
+        non-blank arguments still fail closed."""
+        from tools.tool_search import resolve_underlying_call
+        name, args, err = resolve_underlying_call({"calls": [{"name": "todo_list", "arguments": raw_args}]})
+        assert (name, args, err) == ("todo_list", {}, None)
+        _, _, err = resolve_underlying_call({"calls": [{"name": "todo_list", "arguments": '{"todos": ['}]})
+        assert err and "not valid JSON" in err
+
 
 # ---------------------------------------------------------------------------
 # End-to-end via the real handle_function_call (smoke test).
@@ -581,7 +627,7 @@ class TestRegression_OpenClawCron84141:
             "arguments": {"command": "echo hi"},
         })
         assert err is not None
-        assert "not a deferrable" in err
+        assert "directly-listed tool" in err and "call it directly" in err.lower()
 
 
 class TestRegression_ToolsetScoping:

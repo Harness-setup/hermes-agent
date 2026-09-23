@@ -447,3 +447,81 @@ def test_delivery_only_reasoning_excerpt_does_not_fill_blank_assistant(monkeypat
         for m in result["messages"]
     )
 
+
+def test_transform_llm_output_swap_is_persisted_durably(monkeypatch):
+    """A transform_llm_output plugin swap (e.g. refusal->uncensored reroute,
+    or this repo's own kanban dispatch relay) must reach the durable
+    transcript, not just the returned result dict.
+
+    Regression: transform_llm_output runs BEFORE _persist_session within
+    finalize_turn (apply_llm_output_transform, called from _persist_step).
+    _session_db.append_message is a pure insert with no update path, so a
+    swap applied after the turn's one-and-only persist call cannot be
+    written back into the same row without creating a duplicate -- the
+    swapped text must already be in `messages[-1]` by the time
+    _persist_session runs. See _close_transcript_tail's
+    `_response_transformed` branch.
+    """
+    def fake_invoke_hook(hook_name, **_kwargs):
+        if hook_name == "transform_llm_output":
+            return ["[via uncensored]\n\nswapped answer"]
+        return []
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", fake_invoke_hook)
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "how do I do X"},
+        {"role": "assistant", "content": "I cannot provide that."},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="I cannot provide that.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="how do I do X",
+        original_user_message="how do I do X",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == "[via uncensored]\n\nswapped answer"
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["content"] == "[via uncensored]\n\nswapped answer"
+
+
+def _finalize(agent, *, exit_reason, final_response, failed=False, api_calls=3):
+    return finalize_turn(
+        agent, final_response=final_response, api_call_count=api_calls, interrupted=False, failed=failed,
+        messages=[{"role": "user", "content": "q"}, {"role": "assistant", "content": final_response or ""}],
+        conversation_history=[], effective_task_id="task", turn_id="turn", user_message="q",
+        original_user_message="q", _should_review_memory=False, _turn_exit_reason=exit_reason,
+    )
+
+
+def test_advisory_exit_reasons_keep_failed_false_but_carry_a_failure_code(monkeypatch):
+    """empty_response_exhausted / local_processing_error: Desktop and TUI get a specific code, yet
+    ``failed`` stays False so cron silence, the kanban breaker and gateway transcript persistence
+    behave exactly as before the code was added."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent_max = FakeAgent().max_iterations
+    for exit_reason, code in (("empty_response_exhausted", "empty_response"),
+                              ("local_processing_error(TypeError: x)", "loop_error")):
+        result = _finalize(FakeAgent(), exit_reason=exit_reason, final_response="the model's last thoughts")
+        assert result["failed"] is False, exit_reason
+        # ``completed`` follows the ordinary rule for a non-failed turn (not forced False here).
+        assert result["completed"] == (result["final_response"] is not None and 3 < agent_max), exit_reason
+        assert result["failure_reason"] == code and isinstance(result["failure_retryable"], bool)
+        assert "error" not in result  # not a failed turn: no error text for the gateway to append a notice to
+
+
+def test_hard_failure_exit_reasons_still_fail_the_turn(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    result = _finalize(FakeAgent(), exit_reason="repeated_outer_errors(RuntimeError)", final_response="stopped")
+    assert result["failed"] is True and result["completed"] is False
+    assert result["failure_reason"] == "loop_error" and result["error"] == "stopped"

@@ -34,9 +34,10 @@ _TTS_MODEL_CACHE_MAX = 3
 _piper_voice_cache: Dict[str, Any] = {}
 _kittentts_model_cache: Dict[str, Any] = {}
 _neutts_model_cache: Dict[str, Any] = {}
+_pocket_tts_model_cache: Dict[str, Any] = {}
 _LOCAL_TTS_MODEL_CACHES: Dict[str, Dict[str, Any]] = {
     "piper": _piper_voice_cache, "kittentts": _kittentts_model_cache,
-    "neutts": _neutts_model_cache}
+    "neutts": _neutts_model_cache, "pocket_tts": _pocket_tts_model_cache}
 
 
 def _tts_cache_get_or_load(cache: Dict[str, Any], key: str, load: Callable[[], Any]) -> Any:
@@ -116,6 +117,92 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
     wav_path = _wav_sidecar_path(output_path)
     import soundfile as sf
     sf.write(wav_path, wav, 24000)
+    return _finalize_wav_output(wav_path, output_path)
+
+
+# --- Pocket TTS (Kyutai, 100M params, CPU-first, in-process warm/release lease same as
+# NeuTTS/Chatterbox) --- Tony, 2026-09-16: found via a ChatGPT conversation about live-voice
+# architectures; measured live on this machine at ~1.2s model load + ~1.1s/sentence steady-state
+# on CPU alone -- 5-6x faster than NeuTTS/Chatterbox's 5-7s, no GPU needed at all. Voice cloning
+# needs kyutai/pocket-tts's gated HF weights (terms not yet accepted as of 2026-09-16 -- catalog
+# voices work today, cloning raises a clear ValueError pointing at the HF model page until then).
+# get_state_for_audio_prompt is genuinely the two-phase "clone once (slower), reuse cheaply"
+# design Tony originally asked for: exporting to .safetensors once and loading THAT on later
+# calls skips the raw-audio processing entirely (the library's own documented pattern), unlike
+# Chatterbox/NeuTTS which redo full reference conditioning on every single call.
+_POCKET_TTS_VOICE_CACHE_DIR_NAME = "pocket-tts-voices"
+
+
+def _get_pocket_tts_voice_cache_dir() -> Path:
+    from hermes_constants import get_hermes_dir
+    root = Path(get_hermes_dir(f"cache/{_POCKET_TTS_VOICE_CACHE_DIR_NAME}", "pocket_tts_voices_cache"))
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _load_pocket_tts_model_for_config(tts_config: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Load (or fetch from cache) the Pocket TTS model -> ``({"model": TTSModel, "voice_states": {}},
+    pocket_tts_config)``. ``voice_states`` mirrors NeuTTS's own encoded-reference cache."""
+    pt_config = _section(tts_config, "pocket_tts")
+    device = pt_config.get("device", "cpu")
+    cache_key = f"pocket-tts::{device}"
+
+    def _load_pocket_tts():
+        from pocket_tts import TTSModel
+        logger.info("[PocketTTS] Loading model (device=%s)", device)
+        model = TTSModel.load_model()
+        if device != "cpu":
+            model.to(device)
+        logger.info("[PocketTTS] Model loaded")
+        return {"model": model, "voice_states": {}}
+
+    return _tts_cache_get_or_load(_pocket_tts_model_cache, cache_key, _load_pocket_tts), pt_config
+
+
+def _pocket_tts_voice_state(entry: Dict[str, Any], pt_config: Dict[str, Any]) -> Any:
+    """Resolve this config's voice to a loaded voice state, auto-exporting a ref_audio clone to a
+    cached .safetensors file the first time so every later call (including a later process, not
+    just this cache entry) skips straight to the fast path."""
+    model = entry["model"]
+    states = entry["voice_states"]
+    voice_name = pt_config.get("voice")
+    ref_audio = pt_config.get("ref_audio")
+    if voice_name:
+        key = f"catalog::{voice_name}"
+        if key not in states:
+            states[key] = model.get_state_for_audio_prompt(voice_name)
+        return states[key]
+    ref_audio = str(Path(ref_audio or (_NEUTTS_SAMPLES / "jo.wav")).expanduser())
+    key = f"clone::{ref_audio}"
+    if key in states:
+        return states[key]
+    from pocket_tts import export_model_state
+    import hashlib
+    cache_path = _get_pocket_tts_voice_cache_dir() / f"{hashlib.sha256(ref_audio.encode()).hexdigest()[:16]}.safetensors"
+    if cache_path.exists():
+        logger.info("[PocketTTS] Loading cached voice embedding: %s", cache_path)
+        states[key] = model.get_state_for_audio_prompt(str(cache_path))
+    else:
+        logger.info("[PocketTTS] Cloning reference voice (one-time cost): %s", ref_audio)
+        voice_state = model.get_state_for_audio_prompt(ref_audio)
+        export_model_state(voice_state, str(cache_path))
+        states[key] = voice_state
+    while len(states) > _TTS_MODEL_CACHE_MAX:
+        states.pop(next(iter(states)), None)
+    return states[key]
+
+
+def _generate_pocket_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    entry, pt_config = _load_pocket_tts_model_for_config(tts_config)
+    voice_state = _pocket_tts_voice_state(entry, pt_config)
+    audio = entry["model"].generate_audio(voice_state, text)
+    wav_path = _wav_sidecar_path(output_path)
+    import scipy.io.wavfile
+    # .detach().cpu() is a safe no-op on an already-detached CPU tensor, and required for a
+    # CUDA tensor -- always doing both, rather than branching on hasattr("detach") (every
+    # torch tensor has that method regardless of device, so that check never distinguished
+    # anything), handles both devices with one code path.
+    scipy.io.wavfile.write(wav_path, entry["model"].sample_rate, audio.detach().cpu().numpy())
     return _finalize_wav_output(wav_path, output_path)
 
 

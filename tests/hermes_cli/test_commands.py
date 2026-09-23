@@ -361,6 +361,97 @@ class TestSlashCommandCompleter:
         texts = {item.text for item in completions}
         assert "help" in texts
 
+    def test_plugin_command_subcommands_completed(self, monkeypatch):
+        from hermes_cli import plugins as _plugins_mod
+        monkeypatch.setattr(
+            _plugins_mod, "get_plugin_commands",
+            lambda: {
+                "mode": {
+                    "handler": lambda a: a,
+                    "description": "Switch model mode",
+                    "plugin": "mode",
+                    "args_hint": "",
+                    "subcommands": ("cloud", "local", "uncensored", "status"),
+                },
+            },
+        )
+        completer = SlashCommandCompleter()
+
+        completions = _completions(completer, "/mode ")
+
+        texts = {c.text for c in completions}
+        assert texts == {"cloud", "local", "uncensored", "status"}
+
+    def test_plugin_command_subcommands_filtered_by_prefix(self, monkeypatch):
+        from hermes_cli import plugins as _plugins_mod
+        monkeypatch.setattr(
+            _plugins_mod, "get_plugin_commands",
+            lambda: {
+                "mode": {
+                    "handler": lambda a: a,
+                    "description": "Switch model mode",
+                    "plugin": "mode",
+                    "args_hint": "",
+                    "subcommands": ("cloud", "local", "uncensored", "status"),
+                },
+            },
+        )
+        completer = SlashCommandCompleter()
+
+        completions = _completions(completer, "/mode cl")
+
+        texts = {c.text for c in completions}
+        assert texts == {"cloud"}
+
+    def test_plugin_command_without_subcommands_yields_no_completions(self, monkeypatch):
+        """A plugin command that never set subcommands= (the default ()) must
+        fall through cleanly -- no completions, no exception -- matching
+        every plugin command's behavior before this feature existed."""
+        from hermes_cli import plugins as _plugins_mod
+        monkeypatch.setattr(
+            _plugins_mod, "get_plugin_commands",
+            lambda: {
+                "gizmo": {
+                    "handler": lambda a: a,
+                    "description": "Gizmo",
+                    "plugin": "gizmo-plugin",
+                    "args_hint": "",
+                    "subcommands": (),
+                },
+            },
+        )
+        completer = SlashCommandCompleter()
+
+        completions = _completions(completer, "/gizmo ")
+
+        assert completions == []
+
+    def test_builtin_subcommands_unaffected_by_plugin_extension(self):
+        """Regression: the built-in SUBCOMMANDS path (/skills, etc.) must
+        keep working exactly as before -- this extension adds a plugin
+        fallback, it must not replace or shadow the built-in branch."""
+        completer = SlashCommandCompleter()
+
+        completions = _completions(completer, "/skills ")
+
+        texts = {c.text for c in completions}
+        assert "install" in texts
+
+    def test_plugin_command_lookup_exception_is_swallowed(self, monkeypatch):
+        """A broken get_plugin_commands() must not crash completion -- matches
+        the exception-safety pattern already used for the skill-provider path
+        (test_skill_provider_exception_is_swallowed) and the plugin-name
+        completion branch (commands.py ~2149-2161)."""
+        from hermes_cli import plugins as _plugins_mod
+        def _boom():
+            raise RuntimeError("plugin system down")
+        monkeypatch.setattr(_plugins_mod, "get_plugin_commands", _boom)
+        completer = SlashCommandCompleter()
+
+        completions = _completions(completer, "/mode ")
+
+        assert completions == []
+
 
 # ── Stacked slash-skill completion ──────────────────────────────────────
 

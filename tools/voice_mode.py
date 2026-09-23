@@ -23,8 +23,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-from tools.voice_mode_transcript import _voice_config, is_voice_stop_phrase, is_whisper_hallucination
 from hermes_constants import is_termux as _is_termux_environment
+from hermes_platform.host.runtime import is_wsl
+from tools.voice_mode_transcript import _voice_config, is_voice_stop_phrase, is_whisper_hallucination
 
 # ── Recording parameters ──
 SAMPLE_RATE = 16000  # Whisper native rate
@@ -112,6 +113,24 @@ def _default_input_samplerate(sd) -> int:
 
 
 # ── Environment detection ──
+def vad_speech_probability(model, chunk_int16):
+    """Thin proxy to tools.vad_lite.speech_probability, importing lazily so
+    tools.vad_lite's numpy import never runs at tools.voice_mode import
+    time (this module is documented above as never importing audio libs at
+    module scope, to avoid crashing headless environments). Kept as a
+    module-level name -- not inlined at each call site -- so tests can
+    still `patch("tools.voice_mode.vad_speech_probability", ...)`."""
+    from tools.vad_lite import speech_probability
+    return speech_probability(model, chunk_int16)
+
+
+def smart_turn_complete_probability(session, audio_int16):
+    """Thin proxy to tools.smart_turn.turn_complete_probability, same reasoning and same
+    module-level-name-for-patchability convention as vad_speech_probability above."""
+    from tools.smart_turn import turn_complete_probability
+    return turn_complete_probability(session, audio_int16)
+
+
 def _voice_capture_install_hint() -> str:
     # sounddevice imports but PortAudio's shared library is missing — a pip install can't fix that; point at
     # the system package instead of misreporting missing Python packages (#18432).
@@ -310,7 +329,7 @@ def detect_audio_environment() -> dict:
     # WSL: the PowerShell/Media.SoundPlayer fallback only covers OUTPUT, so when
     # it is all that's available downgrade to a notice (recording guidance stays
     # visible, TTS-only usage isn't blocked).
-    if _is_wsl2_env():
+    if is_wsl():
         if has_forwarded_audio:
             notices.append("Running in WSL with a reachable PulseAudio/PipeWire sound server")
         elif _wsl_powershell_tts_available():
@@ -320,13 +339,13 @@ def detect_audio_environment() -> dict:
                 "Voice INPUT (recording) still requires a PulseAudio bridge:\n"
                 "  1. Set PULSE_SERVER=unix:/mnt/wslg/PulseServer\n"
                 "  2. Create ~/.asoundrc pointing ALSA at PulseAudio\n"
-                "  3. Verify with: arecord -d 3 /tmp/test.wav && aplay /tmp/test.wav")
+                "  3. Verify with: arecord -d 3 test.wav && aplay test.wav")
         else:
             warnings.append(
                 "Running in WSL -- audio requires a forwarded sound server.\n"
                 "  PulseAudio: export PULSE_SERVER=unix:/mnt/wslg/PulseServer\n"
                 "  PipeWire:   export PIPEWIRE_REMOTE=$XDG_RUNTIME_DIR/pipewire-0\n"
-                "  Then verify: arecord -d 3 /tmp/test.wav && aplay /tmp/test.wav")
+                "  Then verify: arecord -d 3 test.wav && aplay test.wav")
 
     _probe_audio_libraries(warnings, notices, has_forwarded_audio=has_forwarded_audio,
                            termux_mic_cmd=termux_mic_cmd, termux_app_installed=termux_app_installed)
@@ -618,6 +637,29 @@ class AudioRecorder(_RecorderBase):
         self._min_speech_duration: float = 0.3  # seconds above threshold to confirm speech
         self._max_dip_tolerance: float = 0.3  # max dip before resetting a speech attempt
         self._max_wait: float = 15.0  # seconds to wait for speech before auto-stop
+        # VAD fast-path silence detection (tools/vad_lite.py). Disabled by
+        # default until config wiring (tui_gateway/server.py) turns it on;
+        # _vad_model is lazily loaded on first real use, never at __init__.
+        self._vad_enabled: bool = False
+        self._vad_confidence_threshold: float = 0.15
+        self._vad_fast_silence_duration: float = 0.6
+        self._vad_model = None
+        # Latches True after a failed model load so subsequent chunks don't
+        # retry the ~60ms load on every callback for the rest of the
+        # recording (see _vad_probability_for_chunk).
+        self._vad_load_failed: bool = False
+        # Smart Turn v3.1 semantic turn-completion classifier (tools/smart_turn.py).
+        # Disabled by default until config wiring turns it on; layered ON TOP of the
+        # VAD fast-path above, not a replacement -- VAD is the acoustic gate (is this
+        # silence at all), Smart Turn is the semantic gate (does the content sound
+        # finished), consulted only when the acoustic layer already wants to stop.
+        self._smart_turn_enabled: bool = False
+        self._smart_turn_confidence_threshold: float = 0.5
+        self._smart_turn_extend_seconds: float = 2.0
+        self._smart_turn_max_extensions: int = 2
+        self._smart_turn_model = None
+        self._smart_turn_load_failed: bool = False
+        self._smart_turn_extension_count: int = 0
         # Hard cap, wired from voice.max_recording_seconds by the CLI before each recording; 0 = none.
         self._max_recording_seconds: float = 0.0
         self._peak_rms: int = 0  # for the speech-presence check in stop()
@@ -628,13 +670,106 @@ class AudioRecorder(_RecorderBase):
         # speech attempt / its dip / silence run / sustained resume after silence / resume dip
         self._speech_start = self._dip_start = self._silence_start = 0.0
         self._resume_start = self._resume_dip_start = 0.0
+        self._smart_turn_extension_count = 0
 
     def _max_duration_reached(self, elapsed: float) -> bool:
         """``voice.max_recording_seconds`` cap elapsed (<= 0 / unset disables it)."""
         cap = self._max_recording_seconds
         return bool(cap and cap > 0 and elapsed >= cap)
 
-    def _track_speech(self, rms: int, now: float) -> None:
+    def _vad_probability_for_chunk(self, chunk) -> float:
+        """Lazily loads the VAD model on first real use (never at __init__,
+        so recorders created with vad_enabled=False -- the default until
+        this feature is wired up config-side -- pay zero import/model-load
+        cost), always at tools.vad_lite.VAD_SAMPLE_RATE regardless of
+        self._sample_rate -- silero-vad-lite only supports 8000/16000 and
+        AudioRecorder records at the input device's native rate (commonly
+        44100, not 16000), so chunks are resampled to match before being
+        scored. A load failure (e.g. missing ONNX runtime, or an unusable
+        rate) fails open to probability=1.0 ("assume speech"), matching
+        speech_probability's own fail-open contract for per-chunk errors --
+        otherwise it would raise uncaught inside the sounddevice audio
+        callback thread. The failure latches (_vad_load_failed) so a
+        recording that can't load VAD doesn't retry the ~60ms load on every
+        subsequent chunk."""
+        if self._vad_load_failed:
+            return 1.0
+        from tools.vad_lite import VAD_SAMPLE_RATE
+        if self._vad_model is None:
+            try:
+                from tools.vad_lite import load_vad_model
+                self._vad_model = load_vad_model(VAD_SAMPLE_RATE)
+            except Exception:
+                self._vad_load_failed = True
+                logger.warning(
+                    "VAD model failed to load; disabling VAD fast-path for "
+                    "this recording (falling back to RMS-only silence detection)",
+                    exc_info=True,
+                )
+                return 1.0
+        from tools.vad_lite import resample_for_vad
+        resampled = resample_for_vad(chunk.flatten(), self._sample_rate, VAD_SAMPLE_RATE)
+        return vad_speech_probability(self._vad_model, resampled)
+
+    def _smart_turn_probability_for_buffer(self) -> float:
+        """Lazily loads the Smart Turn model on first real use (never at __init__, so
+        recorders with smart_turn_enabled=False -- the default -- pay zero cost), scoring
+        the WHOLE in-progress recording buffer (self._frames, already accumulated for the
+        entire utterance -- see tools.smart_turn's module docstring) rather than one chunk.
+        Resampled to tools.smart_turn.SMART_TURN_SAMPLE_RATE via the same
+        tools.vad_lite.resample_for_vad helper the VAD fast-path already uses (same target
+        rate, reused rather than reimplemented). A load or inference failure fails open to
+        probability=1.0 ("assume complete") -- the OPPOSITE bias from VAD's own
+        fail-open-to-speech convention, because a broken semantic layer must never cause
+        dead air to hang forever; letting the turn end is the safe direction here. Latches
+        (_smart_turn_load_failed) so a failed load doesn't retry the download/build-session
+        cost on every subsequent callback for the rest of the recording."""
+        if self._smart_turn_load_failed:
+            return 1.0
+        from tools.smart_turn import SMART_TURN_SAMPLE_RATE
+        if self._smart_turn_model is None:
+            try:
+                from tools.smart_turn import load_smart_turn_model
+                self._smart_turn_model = load_smart_turn_model()
+            except Exception:
+                self._smart_turn_load_failed = True
+                logger.warning(
+                    "Smart Turn model failed to load; disabling semantic turn detection "
+                    "for this recording (falling back to acoustic-only silence detection)",
+                    exc_info=True,
+                )
+                return 1.0
+        try:
+            import numpy as np
+            from tools.vad_lite import resample_for_vad
+            buffer = (
+                np.concatenate(self._frames, axis=0).flatten() if self._frames
+                else np.zeros(0, dtype=np.int16)
+            )
+            resampled = resample_for_vad(buffer, self._sample_rate, SMART_TURN_SAMPLE_RATE)
+            return smart_turn_complete_probability(self._smart_turn_model, resampled)
+        except Exception:
+            logger.warning("Smart Turn inference failed; treating turn as complete", exc_info=True)
+            return 1.0
+
+    def _resume_speech_confirmed(self, chunk) -> bool:
+        """Decides whether a sustained (>= min_speech_duration) stretch of
+        audio above self._silence_threshold, after self._has_spoken, is
+        genuinely resumed speech that should reset the silence timer -- or
+        sustained non-speech noise (music, TV, a piano) that should not.
+
+        Pure RMS + duration cannot tell "the user kept talking" apart from
+        "something loud that isn't speech kept happening" -- both look
+        identical to an RMS meter once they last longer than the brief-blip
+        tolerance. VAD can. Disabled (or uncertain) fails toward True
+        ("assume speech"), matching this module's fail-open convention
+        elsewhere -- ambiguous audio must never get a real conversation cut
+        off early."""
+        if not self._vad_enabled:
+            return True
+        return self._vad_probability_for_chunk(chunk) >= self._vad_confidence_threshold
+
+    def _track_speech(self, rms: int, now: float, chunk=None) -> None:
         """Advance the speech/dip trackers for one block. Speech is confirmed after
         ``_min_speech_duration`` above threshold, tolerating dips < ``_max_dip_tolerance``
         (micro-pauses); afterwards only SUSTAINED resumed speech resets the silence timer."""
@@ -653,7 +788,8 @@ class AudioRecorder(_RecorderBase):
                 if self._resume_start == 0.0:
                     self._resume_start = now
                 elif now - self._resume_start >= self._min_speech_duration:
-                    self._silence_start = 0.0
+                    if self._resume_speech_confirmed(chunk):
+                        self._silence_start = 0.0
                     self._resume_start = 0.0
         elif self._has_spoken:
             if self._resume_start > 0:  # dip-tolerant resume reset
@@ -671,15 +807,66 @@ class AudioRecorder(_RecorderBase):
                 self._speech_start = 0.0
                 self._dip_start = 0.0
 
-    def _should_auto_stop(self, rms: int, now: float) -> bool:
-        """Spoke then silent for ``_silence_duration``; no speech for ``_max_wait``;
-        or the hard cap elapsed (independent of speech)."""
+    def _silence_callback_check(self, chunk, now: float) -> bool:
+        """Decides whether a silence-triggered stop should fire, given the caller has already
+        confirmed rms <= self._silence_threshold and self._has_spoken is True. Returns True
+        exactly when should_fire.
+
+        VAD fast path: when vad_enabled and the model is confident this chunk is silence
+        (probability below vad_confidence_threshold), a SHORTER window
+        (vad_fast_silence_duration) applies instead of the full silence_duration. When VAD is
+        uncertain, disabled, or fails (fails open to probability=1.0 -- "assume speech"),
+        silence_duration applies unchanged -- the fast path can only make this fire SOONER
+        than before, never later.
+
+        Smart Turn semantic gate: layered on TOP of the acoustic decision above, not a
+        replacement for it. Once the acoustic layer already wants to fire, and
+        smart_turn_enabled, and the per-turn extension budget (smart_turn_max_extensions)
+        isn't exhausted: consult Smart Turn on the WHOLE buffered utterance so far. If it
+        reads the content as unfinished (probability below smart_turn_confidence_threshold),
+        grant smart_turn_extend_seconds of extra runway instead of firing -- so this can only
+        make the turn end LATER than the acoustic decision alone, never sooner. Uncertain,
+        disabled, extension budget exhausted, or a failed load/inference (fails open to
+        probability=1.0 -- "assume complete", the opposite bias from VAD's own fail-open,
+        since a broken semantic layer must never hang the recorder forever) all fall through
+        to firing on the acoustic layer's own schedule unchanged."""
+        if self._silence_start == 0.0:
+            self._silence_start = now
+            return False
+
+        required_duration = self._silence_duration
+        if self._vad_enabled:
+            probability = self._vad_probability_for_chunk(chunk)
+            if probability < self._vad_confidence_threshold:
+                required_duration = min(required_duration, self._vad_fast_silence_duration)
+
+        if now - self._silence_start >= required_duration:
+            if (
+                self._smart_turn_enabled
+                and self._smart_turn_extension_count < self._smart_turn_max_extensions
+            ):
+                turn_probability = self._smart_turn_probability_for_buffer()
+                if turn_probability < self._smart_turn_confidence_threshold:
+                    self._smart_turn_extension_count += 1
+                    self._silence_start = now - required_duration + self._smart_turn_extend_seconds
+                    logger.info(
+                        "Smart Turn reads utterance as unfinished (p=%.2f), extending "
+                        "silence window by %.1fs (extension %d/%d)",
+                        turn_probability, self._smart_turn_extend_seconds,
+                        self._smart_turn_extension_count, self._smart_turn_max_extensions,
+                    )
+                    return False
+            logger.info("Silence detected (%.2fs), auto-stopping", required_duration)
+            return True
+        return False
+
+    def _should_auto_stop(self, rms: int, now: float, chunk=None) -> bool:
+        """Spoke then silent for ``_silence_duration`` (or the shorter VAD fast-path window, see
+        ``_silence_callback_check``); no speech for ``_max_wait``; or the hard cap elapsed
+        (independent of speech)."""
         elapsed = now - self._start_time
         if self._has_spoken and rms <= self._silence_threshold:
-            if self._silence_start == 0.0:
-                self._silence_start = now
-            elif now - self._silence_start >= self._silence_duration:
-                logger.info("Silence detected (%.1fs), auto-stopping", self._silence_duration)
+            if self._silence_callback_check(chunk, now):
                 return True
         elif not self._has_spoken and elapsed >= self._max_wait:
             logger.info("No speech within %.0fs, auto-stopping", self._max_wait)
@@ -711,8 +898,8 @@ class AudioRecorder(_RecorderBase):
         if self._on_silence_stop is None:
             return
         now = time.monotonic()
-        self._track_speech(rms, now)
-        if self._should_auto_stop(rms, now):
+        self._track_speech(rms, now, indata)
+        if self._should_auto_stop(rms, now, indata):
             self._fire_silence_callback()
 
     def _ensure_stream(self) -> None:
@@ -961,20 +1148,10 @@ def stop_playback() -> None:
         sd.stop()
 
 
-def _is_wsl2_env() -> bool:
-    """True inside WSL (Microsoft kernel signature in /proc/version); False on any error.
-    Module-level so tests can patch it instead of ``builtins.open``."""
-    try:
-        with open("/proc/version", encoding="utf-8", errors="replace") as _fv:
-            return "microsoft" in _fv.read().lower()
-    except OSError:
-        return False
-
-
 def _wsl_powershell_tts_available() -> bool:
     """WSL2 PowerShell TTS fallback usable. OUTPUT only (Media.SoundPlayer on the host) —
     recording still needs a PulseAudio bridge, so callers keep surfacing that guidance."""
-    return bool(_is_wsl2_env() and shutil.which("powershell.exe") and shutil.which("ffmpeg"))
+    return bool(is_wsl() and shutil.which("powershell.exe") and shutil.which("ffmpeg"))
 
 
 def play_audio_file(file_path: str) -> bool:
@@ -1000,7 +1177,7 @@ def _play_wav_via_sounddevice(file_path: str) -> bool:
         # ~100 ms to stabilise and the small default blocksize worsens
         # clock-adjustment jitter (microsoft/wslg#1257).
         blocksize = 0  # default (auto)
-        if _is_wsl2_env():
+        if is_wsl():
             fade_samples = int(0.1 * sample_rate)
             audio_float = audio_data.astype(np.float64)
             audio_float[:fade_samples] *= np.linspace(0.0, 1.0, fade_samples, dtype=np.float64)
@@ -1023,7 +1200,7 @@ def _wsl_powershell_player_cmd(file_path: str) -> Optional[List[str]]:
     ffplay/aplay have no device, but Media.SoundPlayer on the host does: convert to a
     uniquely-named WAV in Windows %TEMP% (concurrent TTS must not collide), play, always
     delete, and re-raise the ORIGINAL exit status past the cleanup (rm -f exits 0)."""
-    if not (shutil.which("powershell.exe") and shutil.which("ffmpeg") and _is_wsl2_env()):
+    if not (shutil.which("powershell.exe") and shutil.which("ffmpeg") and is_wsl()):
         return None
     try:
         import uuid

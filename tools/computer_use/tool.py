@@ -283,8 +283,12 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
     type_text, key, set_value = _noop_stub("type", "text"), _noop_stub("key", "keys"), _noop_stub("set_value", "value", "element")
     list_apps, list_windows = _noop_stub("list_apps", result=[]), _noop_stub("list_windows", result=[])
     focus_app = _noop_stub("focus_app", "app", "raise_window")
+    launch_app = _noop_stub("launch_app", "app")
 
 # ── Dispatch ────────────────────────────────────────────────────────────────
+_MAX_BATCH_SIZE = 20
+
+
 def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     """Main entry point (tools.registry): a JSON string (text-only) or a dict marked `_multimodal`. Order: hard
     blocks (_reject_unsafe) -> approval scopes (destructive action, then 'bring_to_front' — persistent focus is a
@@ -292,6 +296,8 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     action = (args.get("action") or "").strip().lower()
     if not action:
         return json.dumps({"error": "missing `action`"})
+    if action == "batch":
+        return _handle_batch(args, kwargs)
     session_id = str(kwargs.get("session_id") or "")  # approval-state / daemon-mode isolation key
     if (err := _reject_unsafe(action, args)) is not None:
         return err
@@ -314,6 +320,103 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     except Exception as e:
         logger.exception("computer_use %s failed", action)
         return json.dumps({"error": f"{action} failed: {e}"})
+
+def _summarize_step_result(result: Any) -> Tuple[bool, Optional[str]]:
+    """(ok, error) for one batch step's raw handle_computer_use() return.
+
+    Two distinct failure shapes exist in this module: pre-dispatch
+    validation/approval failures are ``{"error": "..."}`` (no "ok" key at
+    all), while a dispatched action's own failure is
+    ``{"ok": False, "action": ..., "message": "..."}`` from _action_payload
+    (no "error" key). Both must be treated as failure. A multimodal dict is
+    only ever produced by a capture that already succeeded (see this
+    module's own "Return contract" docstring), so its mere presence is
+    success.
+    """
+    if isinstance(result, dict) and result.get("_multimodal"):
+        return True, None
+    try:
+        parsed = json.loads(result)
+    except Exception:
+        return False, "unparseable result"
+    if not isinstance(parsed, dict):
+        return True, None
+    if "error" in parsed:
+        return False, str(parsed["error"])
+    if parsed.get("ok") is False:
+        return False, str(parsed.get("message") or "action failed")
+    return True, None
+
+
+def _format_batch_summary(steps: list, requested: int) -> str:
+    lines = [f"batch: {len(steps)}/{requested} step(s) run"]
+    for s in steps:
+        marker = "ok" if s["ok"] else "FAILED"
+        detail = f" — {s['error']}" if s.get("error") else ""
+        lines.append(f"  [{s['index']}] {s.get('action', '?')}: {marker}{detail}")
+    return "\n".join(lines)
+
+
+def _handle_batch(args: Dict[str, Any], kwargs: Dict[str, Any]) -> Any:
+    """Run a sequence of ordinary computer_use actions in one tool call.
+
+    Each entry goes through the FULL handle_computer_use() pipeline
+    (validation, per-action approval gating, dispatch) exactly as if it had
+    been called on its own — batching only removes the round-trip between
+    steps, it does not change or widen what gets auto-approved. Stops at the
+    first failing step so a bad click can't cascade into worse actions
+    against a UI state the caller no longer understands.
+    """
+    sub_actions = args.get("actions")
+    if not isinstance(sub_actions, list) or not sub_actions:
+        return json.dumps({"error": "batch requires a non-empty 'actions' list"})
+    if len(sub_actions) > _MAX_BATCH_SIZE:
+        return json.dumps({
+            "error": f"batch too large: {len(sub_actions)} entries, max {_MAX_BATCH_SIZE}",
+        })
+
+    steps: list = []
+    last_result: Any = None
+    for i, sub in enumerate(sub_actions):
+        sub_action = (sub.get("action") or "").strip().lower() if isinstance(sub, dict) else ""
+        if not sub_action:
+            steps.append({"index": i, "ok": False, "error": "each batch entry needs an 'action'"})
+            last_result = None
+            break
+        if sub_action == "batch":
+            steps.append({"index": i, "ok": False, "error": "batch cannot contain a nested batch"})
+            last_result = None
+            break
+        last_result = handle_computer_use(sub, **kwargs)
+        ok, err = _summarize_step_result(last_result)
+        step = {"index": i, "action": sub_action, "ok": ok}
+        if err:
+            step["error"] = err
+        steps.append(step)
+        if not ok:
+            break
+
+    summary_text = _format_batch_summary(steps, requested=len(sub_actions))
+
+    if isinstance(last_result, dict) and last_result.get("_multimodal"):
+        merged = dict(last_result)
+        merged["text_summary"] = summary_text
+        content = list(merged.get("content") or [])
+        if content and content[0].get("type") == "text":
+            content[0] = {"type": "text", "text": summary_text}
+        else:
+            content.insert(0, {"type": "text", "text": summary_text})
+        merged["content"] = content
+        return merged
+
+    return json.dumps({
+        "batch": True,
+        "steps": steps,
+        "completed": len(steps),
+        "requested": len(sub_actions),
+        "summary": summary_text,
+    })
+
 
 def _request_approval(action: str, args: Dict[str, Any]) -> Optional[str]:
     """None if approved, else a JSON error string. The decision (yolo bypass, session/permanent grants, CLI prompt,
@@ -414,6 +517,18 @@ _ACTIONS: Dict[str, _ActionSpec] = {
         json.dumps({"error": "focus_app requires `app`"}) if not args.get("app")
         else backend.focus_app(args["app"], raise_window=bool(args.get("raise_window")))), destructive=True,
         summarize=lambda a, args, fg: f"focus {args.get('app', '')!r}" + (" (raise)" if args.get("raise_window") else "")),
+    # Tony, 2026-09-22: "not good at opening apps, example Notion." Root cause: the backend has a
+    # real, idempotent launch_app(name=...) (cua_backend.py) that starts an app whether or not it's
+    # already running -- it was just never exposed as a callable action here, forcing the model to
+    # improvise via generic click-simulation on a taskbar/Start-menu icon, which is exactly the
+    # unreliable path this replaces. Mirrors focus_app's dispatch shape; falls back to a clear error
+    # (not an AttributeError crash) on any backend that doesn't implement it.
+    "launch_app": _ActionSpec(lambda backend, action, args, **_: (
+        json.dumps({"error": "launch_app requires `app`"}) if not args.get("app")
+        else json.dumps({"error": "launch_app is not supported by this backend"})
+        if not hasattr(backend, "launch_app")
+        else json.dumps(backend.launch_app(name=args["app"]))), destructive=True,
+        summarize=lambda a, args, fg: f"launch {args.get('app', '')!r}"),
     "capture": _ActionSpec(_do_capture),
     "wait": _ActionSpec(lambda backend, action, args, **_: _text_response(backend.wait(float(args.get("seconds", 1.0))))),
     "list_apps": _ActionSpec(partial(_do_listing, key="apps")),
@@ -551,8 +666,12 @@ def _capture_view(cap: CaptureResult, max_elements: int) -> SimpleNamespace:
     lost_detail = len(cap.elements) > len(visible) or any(len(e.label) > _MAX_ELEMENT_LABEL_CHARS for e in visible)
     too_small = bool(dims) and min(dims) < _MIN_PROVIDER_IMAGE_DIMENSION
     has_image = bool(cap.png_b64) and cap.mode != "ax" and not too_small
+    # The driver's own AX walk may have stopped at the ``max_elements`` the backend sent: then the spill file is
+    # NOT the full tree, and the hint must not promise one.
+    ax_capped = len(cap.elements) >= cap.ax_max_elements > 0
     return SimpleNamespace(cap=cap, visible=visible, total=len(cap.elements), width=width, height=height,
                            truncated=len(cap.elements) - len(visible), bounds_scale=scale, bounds_note=note,
+                           ax_capped=cap.ax_max_elements if ax_capped else 0,
                            elements_file=_spill_elements_to_file(cap) if lost_detail else None,
                            screenshot_path=_persist_capture_image(cap) if has_image else None,
                            dims_omitted=dims if too_small else None, has_image=has_image)
@@ -565,8 +684,10 @@ def _capture_summary_lines(v: SimpleNamespace) -> List[str]:
                                            f"{v.bounds_scale} ≈ native coordinate)" if v.bounds_scale else ""),
         v.screenshot_path and f"shareable screenshot saved to {v.screenshot_path}",
         v.cap.note,
-        v.elements_file and (f"full element tree with untruncated labels saved to {v.elements_file} — "
-                             "read_file/search_files it if you need dropped label text or elements beyond the cap"),
+        v.elements_file and (f"{'' if v.ax_capped else 'full '}element tree with untruncated labels "
+                             f"saved to {v.elements_file} — read_file/search_files it if you need dropped label "
+                             "text or elements beyond the cap"),
+        v.ax_capped and (f"accessibility walk capped at {v.ax_capped} elements; pass app= to narrow"),
     )
     return [
         f"capture mode={v.cap.mode} {v.width}x{v.height}"

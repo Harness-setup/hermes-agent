@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Dict, Optional
 
 from tools.registry import registry, tool_error
@@ -19,6 +20,54 @@ from tools.browser_extension_router import routed_browser_handler
 logger = logging.getLogger(__name__)
 
 CDP_DOCS_URL = "https://chromedevtools.github.io/devtools-protocol/"
+
+# Windows Family Safety's web-content filter intercepts a blocked navigation at the
+# network level and silently redirects to this Microsoft restriction page instead of
+# returning a normal 4xx/5xx -- confirmed live 2026-09-15 (example.com actually landed
+# on sdx.microsoft.com/family/restricted-web?...). Detected here, at the tool-result
+# level, rather than left to the agent noticing on its own: a skill doc alone is a
+# judgment call the model can forget to apply on any given turn, but a URL substring
+# match on the tool's own CDP result is a guarantee. See
+# .hermes/skills/browser-native/SKILL.md's "Windows Family Safety blocks" section for
+# the required response once this fires.
+_FAMILY_SAFETY_BLOCK_RE = re.compile(
+    r"sdx\.microsoft\.com/family/restricted-web|familysafety\.microsoft\.com", re.IGNORECASE
+)
+
+_FAMILY_SAFETY_NOTICE = (
+    "This request appears to have been intercepted and redirected by Windows Family "
+    "Safety's web-content filter (a restricted-web/familysafety URL was seen in this "
+    "CDP result), not a normal page load or error. Tell Tony plainly that the site was "
+    "blocked by his Family Safety settings and ask whether he wants a same-day access "
+    "request sent -- never attempt to bypass the block."
+)
+
+
+def _contains_family_safety_redirect(value: Any) -> bool:
+    """Recursively scan a CDP result for the Family Safety redirect signature, in any
+    string field at any depth (target URLs, navigated-frame URLs, evaluated
+    location.href, ...) -- no per-CDP-method field list to keep in sync."""
+    if isinstance(value, str):
+        return bool(_FAMILY_SAFETY_BLOCK_RE.search(value))
+    if isinstance(value, dict):
+        return any(_contains_family_safety_redirect(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_family_safety_redirect(v) for v in value)
+    return False
+
+
+def _annotate_family_safety_block(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Add a hard-to-miss notice field when this tool result's own data carries the
+    Family Safety redirect signature, wherever it appears in the payload (browser_cdp's
+    nested "result", browser_navigate's top-level "url"/"title", ...). Never raises --
+    a scan failure must not break a normal browser call."""
+    try:
+        if _contains_family_safety_redirect(payload):
+            payload["family_safety_block_detected"] = True
+            payload["notice"] = _FAMILY_SAFETY_NOTICE
+    except Exception:
+        logger.debug("Family Safety scan failed", exc_info=True)
+    return payload
 
 # Browser/target inspection that never reads page body/cookies/DOM/storage — stays
 # usable so the model can list tabs or navigate away from a blocked page.
@@ -96,8 +145,9 @@ def _run_async(coro):
         loop = None
     if loop and loop.is_running():
         import concurrent.futures
+        import contextvars
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(asyncio.run, coro).result()
+            return pool.submit(contextvars.copy_context().run, asyncio.run, coro).result()
     return asyncio.run(coro)
 
 
@@ -169,10 +219,11 @@ async def _cdp_call(ws_url: str, method: str, params: Dict[str, Any], target_id:
     """Make a single CDP call. With ``target_id``, ``Target.attachToTarget(flatten=True)`` multiplexes a
     page-level session over the browser-level WebSocket; without it ``method`` runs at browser level."""
     assert websockets is not None  # guarded by _WS_AVAILABLE at call-site
+    from agent.proxy_bypass import loopback_connect_kwargs
     # max_size=None: CDP responses (e.g. DOM.getDocument) can be large; ping_interval=None: CDP
     # servers don't expect pings.
     async with websockets.connect(ws_url, max_size=None, open_timeout=timeout, close_timeout=5,
-                                  ping_interval=None) as ws:
+                                  ping_interval=None, **loopback_connect_kwargs(ws_url)) as ws:
         next_id = 1
 
         async def _send(req: Dict[str, Any], what: str) -> Dict[str, Any]:
@@ -251,8 +302,9 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
     except Exception as exc:
         return tool_error(f"CDP call via supervisor failed: {type(exc).__name__}: {exc}", cdp_docs=CDP_DOCS_URL)
 
-    return json.dumps({"success": True, "method": method, "frame_id": frame_id, "session_id": child_sid,
-                       "result": result_msg.get("result", {})}, ensure_ascii=False)
+    payload = _annotate_family_safety_block({"success": True, "method": method, "frame_id": frame_id,
+                                             "session_id": child_sid, "result": result_msg.get("result", {})})
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def browser_cdp(method: str, params: Optional[Dict[str, Any]] = None, target_id: Optional[str] = None,
@@ -316,6 +368,7 @@ def browser_cdp(method: str, params: Optional[Dict[str, Any]] = None, target_id:
         flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()))}
     if target_id:
         payload["target_id"] = target_id
+    payload = _annotate_family_safety_block(payload)
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -329,8 +382,9 @@ BROWSER_CDP_SCHEMA: Dict[str, Any] = {
         "config.yaml. Not currently wired up for cloud backends (Browserbase, Browser Use, Firecrawl) — "
         "those expose CDP per session but live-session routing is a follow-up. Camofox is REST-only and "
         "will never support CDP. If the tool is in your toolset at all, a CDP endpoint is already reachable.\n\n"
-        f"**CDP method reference:** {CDP_DOCS_URL} — use web_extract on a method's URL "
-        "(e.g. '/tot/Page/#method-handleJavaScriptDialog') to look up parameters and return shape.\n\n"
+        f"**CDP method reference:** {CDP_DOCS_URL} — use an available documentation lookup or extraction "
+        "tool on a method's URL (e.g. '/tot/Page/#method-handleJavaScriptDialog') to look up parameters and "
+        "return shape.\n\n"
         "**Common patterns:**\n"
         "- List tabs: method='Target.getTargets', params={}\n"
         "- Handle a native JS dialog: method='Page.handleJavaScriptDialog', "

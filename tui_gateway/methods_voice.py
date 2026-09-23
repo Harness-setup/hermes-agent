@@ -111,6 +111,7 @@ def _tts_stream_begin() -> Optional[queue.Queue]:
     with _tts_stream_lock:
         _tts_stream_state = {"stop": stop, "done": done}
     _arm_barge_listener_if_enabled()
+    _emit_voice_state_hook("speaking")
     return text_queue
 
 
@@ -132,6 +133,10 @@ def _tts_stream_stop(user_barge: bool = True) -> None:
     with contextlib.suppress(Exception):
         from tools.voice_mode import stop_playback
         stop_playback()
+    # Only reached when a real active stream was stopped (the `if state is
+    # None: return` above already handled the no-op case) -- so this never
+    # fires a spurious "idle" when nothing was speaking to begin with.
+    _emit_voice_state_hook("idle")
 
 
 # ── Full-duplex agent-turn listener: arms at utterance-submit, spans generation AND playback
@@ -426,6 +431,7 @@ def _wake_detect_handler(transport, sid: str, phrase: str, new_session: bool):
             _emit("wake.detected", sid, {
                 "phrase": matched_phrase or phrase, "profile": matched_profile or None,
                 "start_new_session": new_session})
+            _emit_voice_state_hook("listening")
         finally:
             reset_transport(token)
     return _on_detect
@@ -437,6 +443,17 @@ def _(rid, params: dict) -> dict:
     module, never config: a believed-but-absent capability is worse."""
     from hermes_cli.active_sessions import PER_SESSION_EXCLUSIVE_SUBMIT
     return _ok(rid, {"per_session_exclusive_submit": bool(PER_SESSION_EXCLUSIVE_SUBMIT)})
+
+
+@method("client.capabilities")
+def _(rid, params: dict) -> dict:
+    """What the calling client handles. ``server_requests: true`` marks this connection as one that answers
+    server→client requests; a WebSocket client that never sends it gets every such request failed fast
+    instead of stalling the agent for the deadline (#112548)."""
+    from tui_gateway import server_requests
+    from tui_gateway.contracts import registry as contracts
+    server_requests.advertise(_caller_transport(), bool(params.get("server_requests")))
+    return _ok(rid, {"server_requests": sorted(contracts.SERVER_REQUESTS)})
 
 
 @method("ping")
@@ -696,6 +713,11 @@ def _vr_on_stop_phrase(t):
 
 def _vr_on_status(state):
     _voice_emit("voice.status", {"state": state})
+    # "transcribing" is a brief in-between STT step; folded into "listening"
+    # rather than introducing a new visual state -- jarvis-voice's own state
+    # machine doesn't distinguish it either (see docs/superpowers/specs/
+    # 2026-08-04-hermes-native-voice-pebble-bridge-design.md).
+    _emit_voice_state_hook("listening" if state == "transcribing" else state)
     if state == "idle":
         _resume_voice_wake()
 
@@ -737,6 +759,59 @@ def _(rid, params: dict) -> dict:
         # instead of falling back to the documented 200 / 3.0 defaults (Copilot round-12 on #19835).
         voice_cfg = _voice_cfg_dict()
         max_rec = _voice_cfg_number(voice_cfg.get("max_recording_seconds"), 120.0)
+        # voice.no_speech_limit -- consecutive silent cycles before the whole conversation gives
+        # up (not the same as silence_duration, which only ends ONE recording's silence window).
+        # Hardcoded default (3) rather than imported from hermes_cli.voice, since tests substitute
+        # a bare fake hermes_cli.voice module lacking that attribute.
+        no_speech_limit = voice_cfg.get("no_speech_limit")
+        safe_no_speech_limit = (
+            no_speech_limit
+            if isinstance(no_speech_limit, int) and not isinstance(no_speech_limit, bool) and no_speech_limit > 0
+            else 3
+        )
+        # voice.vad_enabled / vad_confidence_threshold / vad_fast_silence_duration -- fast-path
+        # silence detection (tools/vad_lite.py). Fallbacks match AudioRecorder's own __init__
+        # defaults, so an unconfigured voice_cfg behaves identically to before this feature existed.
+        vad_enabled = voice_cfg.get("vad_enabled")
+        safe_vad_enabled = bool(vad_enabled) if isinstance(vad_enabled, bool) else False
+        vad_conf = voice_cfg.get("vad_confidence_threshold")
+        safe_vad_conf = (
+            vad_conf
+            if isinstance(vad_conf, (int, float)) and not isinstance(vad_conf, bool) and 0.0 <= vad_conf <= 1.0
+            else 0.15
+        )
+        vad_fast = voice_cfg.get("vad_fast_silence_duration")
+        safe_vad_fast = (
+            vad_fast
+            if isinstance(vad_fast, (int, float)) and not isinstance(vad_fast, bool) and vad_fast > 0
+            else 0.6
+        )
+        # voice.smart_turn_enabled / smart_turn_confidence_threshold / smart_turn_extend_seconds /
+        # smart_turn_max_extensions -- semantic turn-completion classifier (tools/smart_turn.py),
+        # layered on top of the VAD fast-path above. Same guard shape as the vad_* reads above.
+        smart_turn_enabled = voice_cfg.get("smart_turn_enabled")
+        safe_smart_turn_enabled = bool(smart_turn_enabled) if isinstance(smart_turn_enabled, bool) else False
+        smart_turn_conf = voice_cfg.get("smart_turn_confidence_threshold")
+        safe_smart_turn_conf = (
+            smart_turn_conf
+            if isinstance(smart_turn_conf, (int, float)) and not isinstance(smart_turn_conf, bool)
+            and 0.0 <= smart_turn_conf <= 1.0
+            else 0.5
+        )
+        smart_turn_extend = voice_cfg.get("smart_turn_extend_seconds")
+        safe_smart_turn_extend = (
+            smart_turn_extend
+            if isinstance(smart_turn_extend, (int, float)) and not isinstance(smart_turn_extend, bool)
+            and smart_turn_extend > 0
+            else 2.0
+        )
+        smart_turn_max_ext = voice_cfg.get("smart_turn_max_extensions")
+        safe_smart_turn_max_ext = (
+            smart_turn_max_ext
+            if isinstance(smart_turn_max_ext, int) and not isinstance(smart_turn_max_ext, bool)
+            and smart_turn_max_ext >= 0
+            else 2
+        )
         # Hand the mic to STT if the wake detector holds it; a terminal capture event resumes it.
         with contextlib.suppress(Exception):
             from tools.wake_word import pause_listening
@@ -750,7 +825,13 @@ def _(rid, params: dict) -> dict:
             silence_threshold=_voice_cfg_number(voice_cfg.get("silence_threshold"), 200),
             silence_duration=_voice_cfg_number(voice_cfg.get("silence_duration"), 3.0),
             auto_restart=False, max_recording_seconds=max_rec if max_rec > 0 else 0.0,
-            on_stop_phrase=_vr_on_stop_phrase)
+            on_stop_phrase=_vr_on_stop_phrase,
+            no_speech_limit=safe_no_speech_limit, vad_enabled=safe_vad_enabled,
+            vad_confidence_threshold=safe_vad_conf, vad_fast_silence_duration=safe_vad_fast,
+            smart_turn_enabled=safe_smart_turn_enabled,
+            smart_turn_confidence_threshold=safe_smart_turn_conf,
+            smart_turn_extend_seconds=safe_smart_turn_extend,
+            smart_turn_max_extensions=safe_smart_turn_max_ext)
         if started is False:
             _resume_voice_wake()
         return _ok(rid, {"status": "busy" if started is False else "recording"})

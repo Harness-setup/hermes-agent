@@ -35,8 +35,55 @@ class StreamDeliveryMixin:
         results = [self._call_quietly(cb, text) for cb in (self.stream_delta_callback, self._stream_callback)]
         return any(results)
 
+    def _prime_stream_hooks_suppressed_cache(self) -> None:
+        """Populate _stream_hooks_suppressed_cache with a real DB read -- called once from
+        _emit_stream_start (fires once per LLM-call ITERATION, well before any delta), never
+        from the hot per-delta path itself. A first version of this check ran lazily inside
+        _stream_hooks_suppressed() instead, cached or not -- but a test exercising
+        _fire_stream_delta() in isolation caught the real problem directly: the FIRST delta of
+        any turn would still pay for a synchronous SQLite read on the exact path this project's
+        own stream-consumer contract requires stays sub-50ms (the on-token display/TTS path).
+        Fails toward NOT suppressed (leave the cache unset) on any error -- a missed suppression
+        just means one session's content is visible when it should have been hidden, far better
+        than adding real latency to every user-facing token."""
+        if getattr(self, "_stream_hooks_suppressed_cache", None) is not None:
+            return
+        try:
+            if self.session_id:
+                from hermes_state import SessionDB
+                row = SessionDB().get_session(self.session_id)
+                self._stream_hooks_suppressed_cache = bool(row and row.get("hidden"))
+        except Exception:
+            pass
+
+    def _stream_hooks_suppressed(self) -> bool:
+        """True when this turn's plugin stream hooks must not fire -- either the existing
+        _persist_disabled case (background skill/memory review fork) or a session explicitly
+        marked hidden. Pure attribute reads only -- see _prime_stream_hooks_suppressed_cache for
+        where the one real DB read actually happens.
+
+        Tony's mega-message, 2026-08: "I see this random ai saying stuff that I did not ask
+        about... I see this again after sleep or hibernation but then it disappears after a few
+        seconds." Root-caused: voice-bridge's validate_alive() resume-check (server.py's
+        _resume_watcher, every ~30s after a detected sleep/wake gap) sends a real prompt ("Reply
+        with exactly: ok") through its own dedicated hermes-agent ACP subprocess -- spawned with
+        the DEFAULT profile's config (HERMES_ACP_CMD has no -p flag), the exact same one
+        pebble-signal loads in. This is a perfectly ordinary turn (not persist_disabled -- it
+        isn't a background-review fork), so the existing gate never caught it: its stream hooks
+        fired normally and pebble-signal forwarded them to pebble-app's Live Response box, exactly
+        matching what Tony described. voice-bridge already marks this session hidden in state.db
+        (acp_client.py's _hide_standalone_session, added for the SEPARATE-but-related "I still see
+        the session in my session list" fix) specifically so it stays out of user-visible surfaces
+        -- reusing that same signal here for the SAME reason covers this leak too, without needing
+        a second, parallel suppression mechanism."""
+        if getattr(self, "_persist_disabled", False):
+            return True
+        return bool(getattr(self, "_stream_hooks_suppressed_cache", False))
+
     def _enqueue_stream_hook(self, event: str, *, label: str | None = None, **fields: Any) -> None:
         """Best-effort plugin stream hook enqueue; never raises into the stream path."""
+        if self._stream_hooks_suppressed():
+            return
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -52,6 +99,8 @@ class StreamDeliveryMixin:
         """
         think_scrubber = getattr(self, "_stream_think_scrubber", None)
         ctx_scrubber = getattr(self, "_stream_context_scrubber", None)
+        # Next stream re-reads plugins.stream_reasoning_deltas (config edits land per request).
+        self._stream_reasoning_hooks_enabled = None
 
         def deliver(tail: str) -> None:
             if tail:
@@ -277,6 +326,7 @@ class StreamDeliveryMixin:
         }
 
     def _emit_stream_start(self) -> None:
+        self._prime_stream_hooks_suppressed_cache()
         self._enqueue_stream_hook("on_stream_start")
 
     def _emit_stream_end(self, *, final_text: str, finished: bool, error: str | None) -> None:
@@ -323,13 +373,18 @@ class StreamDeliveryMixin:
             self._note_dropped_stream_writer("_fire_reasoning_delta")
             return
         self._call_quietly(self.reasoning_callback, text)
-        try:
-            from agent.plugin_stream_hooks import stream_reasoning_deltas_enabled
+        # Resolve the opt-in once per stream, not per token: each lookup took _CONFIG_LOCK and
+        # serialized every streaming thread in the process behind a config cache hit.
+        enabled = getattr(self, "_stream_reasoning_hooks_enabled", None)
+        if enabled is None:
+            try:
+                from agent.plugin_stream_hooks import stream_reasoning_deltas_enabled
 
-            enabled = stream_reasoning_deltas_enabled()
-        except Exception:
-            logger.debug("reasoning on_stream_delta plugin hook enqueue failed", exc_info=True)
-            return
+                enabled = stream_reasoning_deltas_enabled()
+            except Exception:
+                logger.debug("reasoning on_stream_delta plugin hook enqueue failed", exc_info=True)
+                return
+            self._stream_reasoning_hooks_enabled = enabled
         if enabled:
             self._enqueue_stream_hook("on_stream_delta", label="reasoning on_stream_delta", delta=text, kind="reasoning")
 

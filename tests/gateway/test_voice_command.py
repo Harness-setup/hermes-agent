@@ -570,8 +570,14 @@ class TestVoiceChannelCommands:
         assert "joined" in result.lower()
         assert "General" in result
         assert runner._voice_mode["discord:123"] == "all"
-        assert mock_adapter._voice_sources[111]["chat_id"] == "123"
-        assert mock_adapter._voice_sources[111]["chat_type"] == "group"
+        # join_voice_channel_core passes text_channel_id/source as kwargs now (atomic join,
+        # shared with voice-channel auto-join) instead of setting adapter._voice_sources as a
+        # separate step after the call -- assert the call, not a side effect the real (now
+        # mocked-away) join_voice_channel would have produced.
+        _, kwargs = mock_adapter.join_voice_channel.call_args
+        assert kwargs["text_channel_id"] == 123
+        assert kwargs["source"]["chat_id"] == "123"
+        assert kwargs["source"]["chat_type"] == "group"
 
 
     @pytest.mark.asyncio
@@ -631,6 +637,44 @@ class TestVoiceChannelCommands:
         assert event.message_type == MessageType.VOICE
         assert event.source.chat_id == "123"
         assert event.source.chat_type == "channel"
+
+    @pytest.mark.asyncio
+    async def test_input_reroutes_speaker_without_changing_transport_owner(self, runner, monkeypatch):
+        from gateway.config import Platform
+        from gateway.profile_routing import parse_profile_routes
+
+        runner.config = SimpleNamespace(
+            multiplex_profiles=True,
+            profile_routes=parse_profile_routes([
+                {"name": "second", "platform": "discord", "bot_profile": "team-bot",
+                 "user_id": "222", "profile": "second"},
+            ]),
+        )
+        monkeypatch.setattr(
+            "gateway.run._multiplex_profile_homes",
+            lambda _config: [("team-bot", None), ("first", None), ("second", None)],
+        )
+        mock_adapter = AsyncMock()
+        mock_adapter._owner_profile = "team-bot"
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {111: SessionSource(
+            platform=Platform.DISCORD, chat_id="123", chat_type="channel",
+            user_id="111", profile="first",
+        ).to_dict()}
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters = {}
+        runner._profile_adapters = {
+            "team-bot": {Platform.DISCORD: mock_adapter},
+            "second": {},
+        }
+
+        await runner._handle_voice_channel_input(111, 222, "Hello from VC", adapter=mock_adapter)
+
+        source = mock_adapter.handle_message.call_args[0][0].source
+        assert (source.user_id, source.profile) == ("222", "second")
+        assert runner._transport_owner(source) == (mock_adapter, "team-bot")
 
     @pytest.mark.asyncio
     async def test_input_resolves_channel_prompt(self, runner):

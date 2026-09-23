@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import time
+import weakref
 from contextlib import suppress
 from difflib import SequenceMatcher
 from types import SimpleNamespace
@@ -135,19 +136,21 @@ class GatewayVoiceMixin:
             return int(raw.guild_id)
         return raw.guild.id if getattr(raw, "guild", None) else None  # regular message
 
-    async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
-        adapter = self._adapter_for_source(event.source)
+    async def _join_voice_channel_core(
+        self, adapter, voice_channel, *, text_channel_id: int, voice_profile: Optional[str],
+        source_dict: Optional[dict] = None,
+    ) -> Optional[str]:
+        """Shared join+wiring logic behind both /voice join and voice-channel auto-join
+        (discord.auto_join_voice). Returns an error message on failure, None on success.
+
+        text_channel_id/voice_profile are plain values, not derived from a MessageEvent --
+        auto-join has no originating slash command, so there's no event.source to read them
+        from. Callers construct these however fits their trigger (see _handle_voice_channel_join
+        and _handle_voice_auto_join)."""
         if not hasattr(adapter, "join_voice_channel"):
             return "Voice channels are not supported on this platform."
-        guild_id = self._get_guild_id(event)
-        if not guild_id:
-            return "This command only works in a Discord server."
-        voice_channel = await adapter.get_user_voice_channel(guild_id, event.source.user_id)
-        if not voice_channel:
-            return "You need to be in a voice channel first."
         # Wire callbacks BEFORE join so voice input arriving right after connection is not lost.
         self._bind_voice_input_callback(adapter)
-        voice_profile = self._adapter_profile_for_source(event.source)
         if hasattr(adapter, "_on_voice_disconnect"):
             adapter._on_voice_disconnect = functools.partial(
                 self._handle_voice_timeout_cleanup, adapter=adapter)
@@ -157,7 +160,9 @@ class GatewayVoiceMixin:
             adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
                 self._voice_key(Platform.DISCORD, str(chat_id), profile=voice_profile), "off")
         try:
-            success = await adapter.join_voice_channel(voice_channel)
+            success = await adapter.join_voice_channel(
+                voice_channel, text_channel_id=text_channel_id, source=source_dict,
+            )
         except Exception as e:
             logger.warning("Failed to join voice channel: %s", e)
             adapter._voice_input_callback = None
@@ -168,16 +173,61 @@ class GatewayVoiceMixin:
         if not success:
             adapter._voice_input_callback = None
             return "Failed to join voice channel. Check bot permissions (Connect + Speak)."
-        adapter._voice_text_channels[guild_id] = int(event.source.chat_id)
-        if hasattr(adapter, "_voice_sources"):
-            adapter._voice_sources[guild_id] = event.source.to_dict()
-        self._apply_voice_mode(adapter, self._voice_key_for_source(event.source),
-                               event.source.chat_id, "all")
+        self._apply_voice_mode(
+            adapter, self._voice_key(Platform.DISCORD, str(text_channel_id), profile=voice_profile),
+            str(text_channel_id), "all",
+        )
+        return None
+
+    async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
+        adapter = self._delivery_adapter_for(event.source)
+        if not hasattr(adapter, "join_voice_channel"):
+            return "Voice channels are not supported on this platform."
+        guild_id = self._get_guild_id(event)
+        if not guild_id:
+            return "This command only works in a Discord server."
+        voice_channel = await adapter.get_user_voice_channel(guild_id, event.source.user_id)
+        if not voice_channel:
+            return "You need to be in a voice channel first."
+        error = await self._join_voice_channel_core(
+            adapter, voice_channel, text_channel_id=int(event.source.chat_id),
+            voice_profile=self._adapter_profile_for_source(event.source),
+            source_dict=event.source.to_dict(),
+        )
+        if error:
+            return error
         return (f"Joined voice channel **{voice_channel.name}**.\n"
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect.")
 
+    async def _handle_voice_auto_join(self, adapter, member, channel) -> None:
+        """Fires when a real human enters a voice channel the bot isn't already in
+        (discord.auto_join_voice) -- no slash command, so there's no originating text channel;
+        binds to the configured discord.auto_join_voice_text_channel instead."""
+        try:
+            from hermes_cli.config import load_config
+            discord_cfg = (load_config() or {}).get("platforms", {}).get("discord") or {}
+        except Exception as exc:
+            logger.debug("auto_join_voice: config read failed: %s", exc)
+            return
+        text_channel_id = discord_cfg.get("auto_join_voice_text_channel")
+        if not text_channel_id:
+            logger.warning(
+                "discord.auto_join_voice is on but auto_join_voice_text_channel is not "
+                "configured -- skipping auto-join for %s", getattr(member, "display_name", member),
+            )
+            return
+        error = await self._join_voice_channel_core(
+            adapter, channel, text_channel_id=int(text_channel_id),
+            voice_profile=getattr(adapter, "_owner_profile", None),
+        )
+        if error:
+            logger.warning(
+                "Voice auto-join failed for %s in %s: %s",
+                getattr(member, "display_name", member), getattr(channel, "name", channel), error,
+            )
+
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
-        adapter = self._adapter_for_source(event.source)
+        adapter = self._delivery_adapter_for(event.source)
         guild_id = self._get_guild_id(event)
         if not (guild_id and hasattr(adapter, "leave_voice_channel")
                 and hasattr(adapter, "is_in_voice_channel")
@@ -228,11 +278,14 @@ class GatewayVoiceMixin:
         if source_data := getattr(adapter, "_voice_sources", {}).get(guild_id):
             source = SessionSource.from_dict(source_data)
             source.user_id = source.user_name = str(user_id)
-            return source
-        return SessionSource(
-            platform=Platform.DISCORD, chat_id=str(text_ch_id), user_id=str(user_id),
-            user_name=str(user_id), chat_type="channel",
-            profile=getattr(adapter, "_owner_profile", None))
+        else:
+            source = SessionSource(
+                platform=Platform.DISCORD, chat_id=str(text_ch_id), user_id=str(user_id),
+                user_name=str(user_id), chat_type="channel",
+                profile=getattr(adapter, "_owner_profile", None))
+        # Serialization drops transport provenance; auth must still follow the receiving bot.
+        source._transport_adapter_ref = weakref.ref(adapter)
+        return source
 
     async def _handle_voice_channel_input(
         self, guild_id: int, user_id: int, transcript: str, *, adapter=None
@@ -245,6 +298,13 @@ class GatewayVoiceMixin:
         if not text_ch_id:
             return
         source = self._voice_input_source(adapter, guild_id, user_id, text_ch_id)
+        # The cached source still carries the previous speaker's identity (per-sender routes,
+        # #106019): drop the pin so the seam re-resolves for THIS speaker.
+        from gateway.session_identity import clear_identity
+        clear_identity(source)
+        if self._canonicalize(source, transport_profile=getattr(adapter, "_owner_profile", None)) is None:
+            logger.warning("Dropping voice input: its profile route targets an unserved profile")
+            return
         # Validate the session owner against the current allowlist before auto-resuming. A session created
         # before TELEGRAM_ALLOWED_USERS (or equivalent) was configured, or before the owner was removed from
         # it, must not silently receive a full agent response on gateway restart just because it has a
@@ -288,7 +348,7 @@ class GatewayVoiceMixin:
         chat_id = event.source.chat_id
         voice_mode = self._voice_mode.get(self._voice_key_for_source(event.source))
         is_voice_input = event.message_type == MessageType.VOICE
-        adapter = self._adapter_for_source(event.source)
+        adapter = self._delivery_adapter_for(event.source)
         adapter_auto_tts = False
         with suppress(Exception):  # adapters without the probe read as False
             adapter_auto_tts = bool(adapter._should_auto_tts_for_chat(chat_id))
@@ -352,7 +412,7 @@ class GatewayVoiceMixin:
 
     async def _deliver_voice_reply(self, event: MessageEvent, audio_paths: List[str]) -> None:
         """Play the files in the connected voice channel, else send them as voice messages."""
-        adapter = self._adapter_for_source(event.source)
+        adapter = self._delivery_adapter_for(event.source)
         guild_id = self._get_guild_id(event)
         play = getattr(adapter, "play_in_voice_channel", None)
         is_in_vc = getattr(adapter, "is_in_voice_channel", None)

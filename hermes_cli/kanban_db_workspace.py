@@ -11,15 +11,32 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import time
+import unicodedata
 from pathlib import Path
 from typing import Optional
 from typing import TYPE_CHECKING
 import contextlib
 
+from hermes_cli.worktree_ops import release_lsp_clients
+
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
 
 _REMOVABLE_KINDS = ("scratch", "worktree")
+
+
+def _path_key(path: Path | str | None) -> str:
+    """Unicode-form-insensitive identity for a filesystem path.
+
+    macOS hands back DECOMPOSED path strings (NFD: ``o`` + U+0308) for names the
+    user typed in composed form (NFC: ``ö``) — a OneDrive/FileProvider path like
+    ``OneDrive-Persönlich`` round-trips through ``git rev-parse --show-toplevel``
+    as NFD while the DB row holds NFC. Raw ``Path`` equality then reports a real
+    repo root as "not a repo" purely on Unicode form, so every path identity
+    check here goes through this key.
+    """
+    return unicodedata.normalize("NFC", str(path)) if path is not None else ""
 
 # Statuses after which a child no longer needs its parent's workspace artifacts.
 _ACTIVE_CHILDREN_SQL = (
@@ -110,12 +127,34 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
-def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+def _cleanup_workspace(
+    conn: sqlite3.Connection, task_id: str, *, declared_artifact_count: int = 0,
+) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
     so cleanup never blocks completion. ``scratch`` is removed; ``worktree``
     only when provably free of work (clean tree, every commit reachable from a
-    remote-tracking ref); ``dir`` is intentionally preserved."""
+    remote-tracking ref); ``dir`` is intentionally preserved.
+
+    ``declared_artifact_count``: how many paths the completing worker declared
+    via ``kanban_complete``'s ``artifacts`` param. When > 0, this is a promise
+    that at least that many files should now exist as durable
+    ``task_attachments`` rows (copied there by
+    :func:`_persist_scratch_completion_artifacts`, which runs earlier in the
+    same :func:`complete_task` call, before the transaction this function's
+    caller commits after). Real live incident (task t_826b6b4b, 2026-08-03):
+    a worker declared a real deliverable, `complete_task` reported success
+    with no error, yet the file was gone the instant the worker read it back
+    and no attachment row was ever created -- a race that a clean, isolated
+    `complete_task` call could not reproduce (see
+    `test_complete_task_persists_scratch_artifacts_before_cleanup`, which
+    proves the preservation path itself is correct in isolation). Rather than
+    chase the exact live-only mechanism further, this checks the actual
+    attachment count against the promise before doing anything destructive to
+    the SCRATCH path specifically: if fewer attachments exist than were
+    declared, deleting the workspace would destroy real, undelivered work, so
+    cleanup is skipped (not silently proceeded) and a warning is logged
+    instead."""
     try:
         row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
         if not row:
@@ -144,6 +183,21 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             _cleanup_worktree_workspace(task_id, path, row["branch_name"])
             _try_cleanup_parent_workspaces(conn, task_id)
             return
+        if declared_artifact_count > 0:
+            (attachment_count,) = conn.execute(
+                "SELECT COUNT(*) FROM task_attachments WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if attachment_count < declared_artifact_count:
+                _kb._log.warning(
+                    "Refusing to remove scratch workspace for task %s: "
+                    "%d artifact(s) were declared on completion but only "
+                    "%d attachment(s) are durably recorded — deleting the "
+                    "workspace now could destroy undelivered work. "
+                    "Workspace left in place at %s for manual recovery.",
+                    task_id, declared_artifact_count, attachment_count, path,
+                )
+                return
         wp = Path(path)
         if wp.is_dir():
             # Containment guard: a board's ``default_workdir`` can pair
@@ -151,6 +205,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # source tree; without this, completion would rmtree the user's data.
             # See #28818.
             if _is_managed_scratch_path(wp):
+                release_lsp_clients(str(wp))
                 shutil.rmtree(wp, ignore_errors=True)
                 _kb._log.debug("Removed scratch workspace: %s", wp)
             else:
@@ -191,7 +246,7 @@ def _cleanup_worktree_workspace(
         if common is None or common.name != ".git":
             return  # not a linked worktree of a normal repo — never guess
         repo_root = common.parent
-        if wp.resolve(strict=False) == repo_root.resolve(strict=False):
+        if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
             return  # never remove the main checkout
         if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
             _kb._log.info(
@@ -199,9 +254,36 @@ def _cleanup_worktree_workspace(
                 task_id, wp,
             )
             return
+        # Windows cannot delete a directory while this process has its current
+        # directory inside it. Completed workers normally run from their own
+        # linked worktree, so move this process back to the main checkout
+        # before asking Git to remove the worktree.
+        worktree_path = wp.resolve(strict=False)
+        try:
+            cwd = Path.cwd().resolve(strict=False)
+        except OSError:
+            # cwd was already deleted (a scratch-kind child's own workspace is
+            # rmtree'd before this deferred parent cleanup runs, #33774). A
+            # dead cwd cannot hold the worktree open, so leaving it is safe.
+            cwd = None
+        if cwd is None or cwd == worktree_path or cwd.is_relative_to(worktree_path):
+            try:
+                os.chdir(repo_root)
+            except OSError as exc:
+                _kb._log.warning(
+                    "Preserving worktree for task %s: cannot leave %s for %s: %s",
+                    task_id, cwd or "<deleted cwd>", repo_root, exc,
+                )
+                return
         # No --force: git's own dirty guard re-verifies at removal time, so if
         # the tree became dirty since our check (TOCTOU) removal fails safe.
+        release_lsp_clients(str(worktree_path))
         result = _git(repo_root, "worktree", "remove", str(wp), timeout=60)
+        if result.returncode != 0:
+            # Windows can retain a directory handle briefly after cwd changes.
+            # Retry once without --force; Git still enforces its dirty guard.
+            time.sleep(0.1)
+            result = _git(repo_root, "worktree", "remove", str(wp), timeout=60)
         if result.returncode != 0:
             _kb._log.warning(
                 "git worktree remove failed for task %s at %s: %s",
@@ -242,6 +324,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 continue
             wp = Path(row["workspace_path"])
             if wp.is_dir() and _is_managed_scratch_path(wp):
+                release_lsp_clients(str(wp))
                 shutil.rmtree(wp, ignore_errors=True)
                 _kb._log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
@@ -396,7 +479,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
-    if target.exists() and repo_common is not None and _git_common_dir(target) == repo_common:
+    if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
@@ -469,7 +552,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         fallback_root = _repo_root_for_worktree_target(requested.parent)
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
-            if fallback.resolve(strict=False) != requested_resolved:
+            if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this task's
@@ -477,7 +560,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
-    if repo_root is not None and requested_resolved == repo_root:
+    if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
         return _anchored_worktree(repo_root, task.id, branch_name)
 
     repo_root = _repo_root_for_worktree_target(requested.parent)

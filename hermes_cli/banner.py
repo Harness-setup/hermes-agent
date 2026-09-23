@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -222,6 +223,45 @@ def _is_full_sha(value: Optional[str]) -> bool:
 
 _compare_payload_cache: Dict[tuple, dict] = {}
 
+# Memoized per process -- a token doesn't change mid-run, and a missing/expired
+# one shouldn't be re-probed (subprocess spawn) on every single API call.
+_github_token_cache: Dict[str, Optional[str]] = {}
+
+
+def _github_token() -> Optional[str]:
+    """A GitHub token to raise these calls from the anonymous 60/hour-per-IP
+    limit to the authenticated 5000/hour one, or None to stay anonymous.
+
+    Tony/backend hit "GitHub time limit" errors 2026-09-17 from fully
+    unauthenticated api.github.com calls (confirmed live: no Authorization
+    header anywhere in this module). Optional, never required -- a missing
+    token just means these calls stay anonymous, same as before. Priority:
+    GITHUB_TOKEN/GH_TOKEN env (explicit, works anywhere including the
+    Windows desktop build) -- then `gh auth token` (convenient default on a
+    dev machine that already has `gh` authenticated, but never required)."""
+    if "token" in _github_token_cache:
+        return _github_token_cache["token"]
+    token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip() or None
+    if not token and shutil.which("gh"):
+        try:
+            result = subprocess.run(
+                ["gh", "auth", "token"], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0 and result.stdout.strip():
+                token = result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    _github_token_cache["token"] = token
+    return token
+
+
+def _github_api_headers(accept: str) -> Dict[str, str]:
+    """Common headers for an api.github.com request, with auth when available."""
+    headers = {"Accept": accept, "User-Agent": "hermes-cli-update-check"}
+    token = _github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
 
 def _github_compare(current_rev: str, target_rev: str) -> Optional[dict]:
     """Compare payload for ``current...target`` from the GitHub API; memoized per process.
@@ -240,8 +280,7 @@ def _github_compare(current_rev: str, target_rev: str) -> Optional[dict]:
     def _fetch():
         import urllib.request
         # api.github.com 403s requests without a User-Agent.
-        req = urllib.request.Request(
-            url, headers={"Accept": "application/vnd.github+json", "User-Agent": "hermes-cli-update-check"})
+        req = urllib.request.Request(url, headers=_github_api_headers("application/vnd.github+json"))
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
     payload = _quiet(_fetch)
@@ -293,8 +332,13 @@ def _tips_behind(head_rev: Optional[str], target_rev: Optional[str], repo_dir: O
 
     With ``repo_dir``, a target that is already an ancestor of HEAD (local-ahead checkout) is 0 too.
     ``ahead_by == 0`` with differing tips means the remote tip is reachable from our HEAD — NOT
-    behind. A local-only HEAD 404s on the API, which degrades to ``UPDATE_AVAILABLE_NO_COUNT`` —
-    never a fabricated 1.
+    behind. A local-only HEAD (e.g. a merge commit on a parked branch like local-fixes, never
+    pushed to the origin repo itself -- only to a personal fork/backup) 404s on the compare API,
+    since GitHub can only compare SHAs it actually has in THIS repo. Falls back to a local
+    git count in that case (Tony, 2026-09-22: "commits behind" showing nothing/wrong on both
+    client and backend -- traced to exactly this 404, confirmed live) -- one bounded, targeted
+    fetch of just the target SHA, not a policy change for the common case (normal installs on
+    origin/main never hit this path at all, since the compare API just works for them).
     """
     if not head_rev or not target_rev:
         return None
@@ -302,19 +346,35 @@ def _tips_behind(head_rev: Optional[str], target_rev: Optional[str], repo_dir: O
             ["merge-base", "--is-ancestor", target_rev, "HEAD"], cwd=repo_dir)):
         return 0
     counted = _github_compare_behind(head_rev, target_rev)
-    return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
+    if counted is not None:
+        return counted
+    if repo_dir is not None:
+        local_count = _local_tips_behind(head_rev, target_rev, repo_dir)
+        if local_count is not None:
+            return local_count
+    return UPDATE_AVAILABLE_NO_COUNT
+
+
+def _local_tips_behind(head_rev: str, target_rev: str, repo_dir: Path) -> Optional[int]:
+    """Local-git fallback for _tips_behind when the compare API can't see head_rev (a local-only
+    commit on a checkout parked off origin/main, e.g. local-fixes). Fetches only target_rev --
+    not a full branch/remote fetch -- so this stays a bounded, one-shot cost even though it's a
+    real network op, unlike the passive API-first path this backs up."""
+    if not _git_ok(["cat-file", "-e", f"{target_rev}^{{commit}}"], cwd=repo_dir):
+        if not _git_ok(["fetch", "--depth=1", "origin", target_rev], cwd=repo_dir, network=True, timeout=15):
+            return None
+    return _git_count(["rev-list", "--count", f"{head_rev}..{target_rev}"], cwd=repo_dir)
 
 
 def _github_branch_tip(repo_slug: str, branch: str) -> Optional[str]:
-    """Tip SHA of ``branch`` on GitHub via the REST API (40-byte body, no git, no auth)."""
+    """Tip SHA of ``branch`` on GitHub via the REST API (40-byte body, no git; auth optional)."""
     from urllib.parse import quote
 
     url = f"https://api.github.com/repos/{repo_slug}/commits/{quote(branch, safe='')}"
 
     def _fetch():
         import urllib.request
-        req = urllib.request.Request(
-            url, headers={"Accept": "application/vnd.github.sha", "User-Agent": "hermes-cli-update-check"})
+        req = urllib.request.Request(url, headers=_github_api_headers("application/vnd.github.sha"))
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.read().decode("utf-8").strip()
     sha = _quiet(_fetch)
@@ -751,12 +811,28 @@ def _mcp_server_line(srv: dict, *, dim: str, text: str) -> str:
     name, transport = srv["name"], srv["transport"]
     if srv["connected"]:
         return f"[dim {dim}]{name}[/] [{text}]({transport})[/] [dim {dim}]—[/] [{text}]{srv['tools']} tool(s)[/]"
+    # Needs srv['tools'], so it cannot live in the suffix dict below. A registered but unspawned
+    # server has callable tools; falling through to the red "failed" line misreports a working setup.
+    if srv.get("status") == "lazy":
+        return (f"[dim {dim}]{name}[/] [{text}]({transport})[/] [dim {dim}]—[/] "
+                f"[{text}]{srv['tools']} tool(s)[/] [dim {dim}](lazy, starts on first use)[/]")
     status = "disabled" if srv.get("disabled") else srv.get("status")
     suffix = {"disabled": f"[dim {dim}]— disabled[/]", "connecting": "[yellow]— connecting[/]",
               "configured": f"[dim {dim}]— configured[/]"}.get(status)
     if suffix is not None:
         return f"[dim {dim}]{name}[/] [dim]({transport})[/] {suffix}"
-    return f"[red]{name}[/] [dim]({transport})[/] [red]— failed[/]"
+    return _mcp_failed_line(name, transport, srv.get("error"))
+
+
+def _mcp_failed_line(name: str, transport: str, error: Optional[str]) -> str:
+    """Failed MCP connect: the short reason (already humanised by ``_format_connect_error``) and the
+    exact next command, so 'failed' is never the whole story."""
+    from rich.markup import escape
+    reason = escape(" ".join(str(error or "").split())[:120]) or "no details recorded"
+    next_cmd = (f"hermes mcp login {name}" if re.search(r"\b401\b|unauthori[sz]ed", reason, re.I)
+                else f"hermes mcp test {name}")
+    return (f"[red]{name}[/] [dim]({transport})[/] [red]— could not connect:[/] {reason} "
+            f"[dim]— run `{next_cmd}`[/]")
 
 
 def _truncate_tool_names(tool_names: List[str]) -> List[Optional[str]]:
@@ -843,12 +919,15 @@ def _route_model_for_banner(provider: Any) -> str:
     return GUEST_MODEL if guest_carries_inference() else ""
 
 
-def _banner_left_lines(model: str, cwd: str, session_id, context_length, provider, *, accent: str, dim: str) -> list:
-    """Model / cwd / session lines under the hero art."""
+def _banner_left_lines(model: str, cwd: str, session_id, context_length, provider, *, accent: str, dim: str,
+                       context_pinned: bool = False) -> list:
+    """Model / cwd / session lines under the hero art. ``context_pinned`` marks a
+    ``model.context_length`` pin so the user can tell it apart from provider metadata (#66168)."""
     def _dim_sep(label: str) -> str:
         return f" [dim {dim}]·[/] [dim {dim}]{label}[/]"
     lines = []
-    ctx_str = _dim_sep(f"{_format_context_length(context_length)} context") if context_length else ""
+    pin = " (pinned)" if context_pinned else ""
+    ctx_str = _dim_sep(f"{_format_context_length(context_length)} context{pin}") if context_length else ""
     nous_str = _dim_sep("Nous Research")
     if not (model or "").strip():
         # Credentials resolve lazily on the first message; the banner prints first. Ask the route
@@ -922,6 +1001,7 @@ def build_welcome_banner(
     console: "Console", model: str, cwd: str, tools: List[dict] = None, enabled_toolsets: List[str] = None,
     session_id: str = None, get_toolset_for_tool=None, context_length: int = None, provider: str = None,
     availability: Dict[str, Any] = None, skills_by_category: Dict[str, List[str]] = None,
+    context_pinned: bool = False,
 ):
     """Build and print a welcome banner with caduceus on left and info on right.
 
@@ -945,7 +1025,8 @@ def build_welcome_banner(
     # Use skin's custom caduceus art if provided
     _bskin = _quiet(_active_skin)
     left_lines = ["", getattr(_bskin, "banner_hero", None) or HERMES_CADUCEUS, ""]
-    left_lines += _banner_left_lines(model, cwd, session_id, context_length, provider, accent=accent, dim=dim)
+    left_lines += _banner_left_lines(model, cwd, session_id, context_length, provider, accent=accent, dim=dim,
+                                     context_pinned=context_pinned)
     right_lines = _banner_tool_lines(
         tools, availability.get("unavailable_toolsets", []), get_toolset_for_tool,
         lazy_tools=set(availability.get("lazy_tools", [])), disabled_tools=set(availability.get("disabled_tools", [])),

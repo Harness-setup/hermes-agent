@@ -15,6 +15,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Callable, Dict, Any, List, Optional
@@ -42,7 +43,7 @@ from tools.tts_tool_delivery import (
 from tools.tts_tool_providers import (
     _generate_edge_tts, _generate_elevenlabs, _generate_gemini_tts, _generate_minimax_tts,
     _generate_mistral_tts, _generate_xai_tts, _resolve_minimax_tts_runtime)
-from tools.tts_tool_local import _generate_kittentts, _generate_neutts, _generate_piper_tts
+from tools.tts_tool_local import _generate_kittentts, _generate_neutts, _generate_piper_tts, _generate_pocket_tts
 from tools.tts_tool_plugins import (
     _dispatch_to_plugin_provider, _plugin_provider_is_available,
     _plugin_provider_is_voice_compatible)
@@ -93,6 +94,7 @@ def _package_installed(name: str) -> bool:
 
 def _check_neutts_available() -> bool: return _package_installed("neutts")
 def _check_kittentts_available() -> bool: return _package_installed("kittentts")
+def _check_pocket_tts_available() -> bool: return _package_installed("pocket_tts")
 def _check_piper_available() -> bool: return _package_installed("piper")
 
 
@@ -146,9 +148,18 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
 
 # Platforms whose native voice-bubble delivery requires Ogg/Opus (MP3 renders broken there).
 OPUS_VOICE_PLATFORMS = frozenset({"telegram", "matrix", "feishu", "whatsapp", "signal"})
+
+# MEDIA:<path> is a line-level gateway protocol. A filename containing an anchored media
+# directive forges a second attachment whenever the path is echoed into the tool result
+# (media_tag / file_path fields, error text): the collector scans producer output with a
+# bare MEDIA: matcher and cannot tell a filename from a directive. Mirrors the collector's
+# grammar (gateway.platforms.base.MEDIA_TAG_CLEANUP_RE): an anchored path OR a quoted payload,
+# which the collector accepts with no anchor and no extension.
+_MEDIA_DIRECTIVE_RE = re.compile(r"media:\s*[`'\"*_]*(?:[`'\"]|[a-z]:[/\\]|~?/)", re.IGNORECASE)
+
 # Built-ins that emit Opus natively when asked for .ogg; the rest need ffmpeg for voice bubbles.
 _NATIVE_OPUS_PROVIDERS = frozenset({"openai", "elevenlabs", "mistral", "gemini"})
-_FFMPEG_OPUS_PROVIDERS = frozenset({"edge", "neutts", "minimax", "xai", "kittentts", "piper"})
+_FFMPEG_OPUS_PROVIDERS = frozenset({"edge", "neutts", "minimax", "xai", "kittentts", "piper", "pocket_tts"})
 
 
 # --- Built-in provider dispatch ---
@@ -177,7 +188,10 @@ _BUILTIN_DISPATCH: Dict[str, tuple] = {
     "piper": (lambda: _importable(_import_piper), "Piper (local)", "_generate_piper_tts",
               "Piper provider selected but 'piper-tts' package not installed. "
               "Run 'hermes tools' and select Piper under TTS, or install manually: "
-              "pip install piper-tts")}
+              "pip install piper-tts"),
+    "pocket_tts": (lambda: _check_pocket_tts_available(), "Pocket TTS (local, CPU-first)", "_generate_pocket_tts",
+                   "Pocket TTS provider selected but 'pocket-tts' package not installed. "
+                   "Run: pip install pocket-tts")}
 
 
 def _error_json(message: str) -> str:
@@ -277,7 +291,16 @@ def _resolve_output_base(
     on protected credential/system locations. Default ``<audio cache>/tts_<timestamp>.<ext>``: the
     command format, ``.ogg`` for native-Opus providers on Opus platforms, else ``.mp3``."""
     if output_path:
-        from tools.path_security import has_traversal_component
+        from tools.path_security import has_traversal_component, has_unsafe_path_chars
+        if has_unsafe_path_chars(output_path):
+            return None, _error_json(
+                "output_path contains control characters or line separators; "
+                "use a plain filesystem path")
+        # Must precede the traversal/protected checks: their error text echoes the path,
+        # and a MEDIA: substring in it would forge a delivery tag downstream.
+        if _MEDIA_DIRECTIVE_RE.search(output_path):
+            return None, _error_json(
+                "output_path must not contain a media directive (MEDIA:<path>)")
         if has_traversal_component(output_path):
             return None, _error_json(
                 f"output_path contains '..' traversal component: {output_path}. "
@@ -477,7 +500,10 @@ def _minimax_requirements() -> bool:
 def _xai_requirements() -> bool:
     try:
         from tools.xai_http import resolve_xai_http_credentials
-        return bool(resolve_xai_http_credentials().get("api_key"))
+        # Same ordering as _generate_xai_tts / XAIStreamer: an explicit key wins over the
+        # subscription OAuth bearer (which 403s on metered /v1/tts) — never touch the OAuth
+        # pool for an availability probe when a key is configured. See #87045, #113727.
+        return bool(resolve_xai_http_credentials(prefer_api_key=True).get("api_key"))
     except Exception:
         return False
 
@@ -495,7 +521,8 @@ _BUILTIN_REQUIREMENTS: Dict[str, Callable[[], bool]] = {
     "mistral": lambda: _importable(_import_mistral_client) and bool(_resolve_provider_key("MISTRAL_API_KEY", "mistral")),
     "neutts": lambda: _check_neutts_available(),
     "kittentts": lambda: _check_kittentts_available(),
-    "piper": lambda: _check_piper_available()}
+    "piper": lambda: _check_piper_available(),
+    "pocket_tts": lambda: _check_pocket_tts_available()}
 
 
 def check_tts_requirements() -> bool:

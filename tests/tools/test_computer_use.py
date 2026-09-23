@@ -177,6 +177,147 @@ class TestDispatch:
         assert len(capture_calls) == 0, "capture must not be called after a failed action"
 
 # ---------------------------------------------------------------------------
+# Batch action (one tool call for a sequence of actions)
+# ---------------------------------------------------------------------------
+
+class TestBatchAction:
+
+    def test_runs_each_action_in_order(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch", "actions": [
+            {"action": "click", "element": 1},
+            {"action": "type", "text": "hi"},
+            {"action": "key", "keys": "Return"},
+        ]})
+        parsed = json.loads(out)
+        assert parsed["batch"] is True
+        assert parsed["completed"] == 3
+        assert parsed["requested"] == 3
+        assert [s["ok"] for s in parsed["steps"]] == [True, True, True]
+        assert [c[0] for c in noop_backend.calls] == ["click", "type", "key"]
+
+    def test_stops_at_first_failing_step(self, noop_backend):
+        from unittest.mock import patch
+        from tools.computer_use.backend import ActionResult
+        from tools.computer_use.tool import handle_computer_use
+
+        with patch.object(noop_backend, "click",
+                          return_value=ActionResult(ok=False, action="click",
+                                                    message="element not found")):
+            out = handle_computer_use({"action": "batch", "actions": [
+                {"action": "click", "element": 99},
+                {"action": "type", "text": "should never run"},
+            ]})
+        parsed = json.loads(out)
+        assert parsed["completed"] == 1
+        assert parsed["requested"] == 2
+        assert parsed["steps"][0]["ok"] is False
+        assert parsed["steps"][0]["error"] == "element not found"
+        # the second step must never have been dispatched (patch.object with
+        # return_value= replaces click() wholesale, so it never reaches the
+        # real body that appends to self.calls -- absence of "type" is what
+        # actually proves the batch stopped)
+        assert "type" not in [c[0] for c in noop_backend.calls]
+
+    def test_validation_error_shape_is_also_treated_as_failure(self, noop_backend):
+        """A pre-dispatch validation error is {"error": ...} with no "ok" key
+        at all -- a different shape than a dispatched action's own failure.
+        Both must stop the batch."""
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch", "actions": [
+            {"action": "nope"},
+            {"action": "click", "element": 1},
+        ]})
+        parsed = json.loads(out)
+        assert parsed["steps"][0]["ok"] is False
+        assert "error" in parsed["steps"][0]
+        assert parsed["completed"] == 1
+        assert [c[0] for c in noop_backend.calls] == []
+
+    def test_empty_actions_list_is_rejected(self):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch", "actions": []})
+        parsed = json.loads(out)
+        assert "error" in parsed
+
+    def test_missing_actions_key_is_rejected(self):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch"})
+        parsed = json.loads(out)
+        assert "error" in parsed
+
+    def test_over_max_batch_size_is_rejected(self):
+        from tools.computer_use.tool import handle_computer_use, _MAX_BATCH_SIZE
+        out = handle_computer_use({"action": "batch", "actions": [
+            {"action": "key", "keys": "a"} for _ in range(_MAX_BATCH_SIZE + 1)
+        ]})
+        parsed = json.loads(out)
+        assert "error" in parsed
+
+    def test_nested_batch_is_rejected(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch", "actions": [
+            {"action": "batch", "actions": [{"action": "click", "element": 1}]},
+        ]})
+        parsed = json.loads(out)
+        assert parsed["steps"][0]["ok"] is False
+        assert "nested" in parsed["steps"][0]["error"]
+        assert noop_backend.calls == []
+
+    def test_capture_as_last_step_returns_multimodal_with_batch_summary(self):
+        """The noop backend's capture() has no real image bytes (png_b64=None),
+        so it can never actually produce a multimodal envelope -- swap in a
+        backend that does, same pattern as TestCaptureResponse above."""
+        from tools.computer_use.backend import ActionResult, CaptureResult
+        from tools.computer_use import tool as cu_tool
+
+        fake_png = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAADUlEQVR4nGNgGAUgAAABCAABgukLHQAAAABJRU5ErkJggg=="
+
+        class FakeBackend:
+            def start(self): pass
+            def stop(self): pass
+            def is_available(self): return True
+            def click(self, **kw): return ActionResult(ok=True, action="click")
+            def capture(self, mode="som", app=None, pid=None, window_id=None):
+                return CaptureResult(
+                    mode=mode, width=1024, height=768,
+                    png_b64=fake_png, elements=[],
+                    app="Safari", window_title="example.com",
+                    png_bytes_len=100,
+                )
+
+        cu_tool.reset_backend_for_tests()
+        with patch.object(cu_tool, "_get_backend", return_value=FakeBackend()), \
+             patch.object(cu_tool, "_should_route_through_aux_vision",
+                          return_value=False):
+            out = cu_tool.handle_computer_use({"action": "batch", "actions": [
+                {"action": "click", "element": 1},
+                {"action": "capture", "mode": "vision"},
+            ]})
+        cu_tool.reset_backend_for_tests()
+        assert isinstance(out, dict)
+        assert out.get("_multimodal") is True
+        assert "2/2" in out["text_summary"]
+        assert any(part.get("type") == "image_url" for part in out["content"])
+
+    def test_approval_denial_inside_batch_stops_it(self, noop_backend):
+        """Batching must not widen what gets auto-approved -- each entry still
+        goes through the normal per-action approval gate."""
+        from tools.computer_use.tool import handle_computer_use, set_approval_callback
+        set_approval_callback(lambda action, args, summary: "deny")
+        try:
+            out = handle_computer_use({"action": "batch", "actions": [
+                {"action": "key", "keys": "ctrl+a"},
+                {"action": "type", "text": "should never run"},
+            ]})
+        finally:
+            set_approval_callback(None)
+        parsed = json.loads(out)
+        assert parsed["steps"][0]["ok"] is False
+        assert parsed["completed"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Safety guards (type / key block lists)
 # ---------------------------------------------------------------------------
 
@@ -467,9 +608,13 @@ class TestAnthropicAdapterMultimodal:
                 },
             }
 
-        # Build 5 screenshots interleaved with assistant messages.
+        # Build screenshots interleaved with assistant messages. The eviction frontier
+        # advances in whole batches, so use a count that lands exactly on one advance.
+        from agent.image_eviction_policy import IMAGE_EVICTION_BATCH, OUTBOUND_IMAGE_LIMIT
+
+        total = OUTBOUND_IMAGE_LIMIT + 1
         messages: List[Dict[str, Any]] = [{"role": "user", "content": "start"}]
-        for i in range(5):
+        for i in range(total):
             messages.append({
                 "role": "assistant", "content": "",
                 "tool_calls": [{
@@ -483,8 +628,7 @@ class TestAnthropicAdapterMultimodal:
 
         _, anthropic_msgs = convert_messages_to_anthropic(messages)
 
-        # Walk tool_result blocks in order; the OLDEST (5 - 3) = 2 should be
-        # text-only placeholders, newest 3 should still carry image blocks.
+        # One batch retires; everything newer keeps its image payload.
         tool_results = []
         for m in anthropic_msgs:
             if m["role"] != "user" or not isinstance(m["content"], list):
@@ -493,7 +637,7 @@ class TestAnthropicAdapterMultimodal:
                 if b.get("type") == "tool_result":
                     tool_results.append(b)
 
-        assert len(tool_results) == 5
+        assert len(tool_results) == total
         with_images = [
             b for b in tool_results
             if isinstance(b.get("content"), list)
@@ -508,8 +652,133 @@ class TestAnthropicAdapterMultimodal:
                 for x in b["content"]
             )
         ]
-        assert len(with_images) == 3
-        assert len(placeholders) == 2
+        assert len(placeholders) == IMAGE_EVICTION_BATCH
+        assert len(with_images) == total - IMAGE_EVICTION_BATCH
+
+    def test_parallel_batch_retires_the_oldest_siblings_first(self):
+        """Sibling tool_results in one user message are oldest-first; eviction must not
+        retire the newest of them (#103217)."""
+        from agent.anthropic_message_convert import _evict_old_screenshots
+        from agent.image_eviction_policy import IMAGE_EVICTION_BATCH, OUTBOUND_IMAGE_LIMIT
+
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A"}}
+        n = OUTBOUND_IMAGE_LIMIT + 1
+        result = [{
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": f"t{i}", "content": [dict(img)]}
+                for i in range(n)
+            ],
+        }]
+        _evict_old_screenshots(result)
+        survivors = [
+            b["tool_use_id"] for b in result[0]["content"]
+            if any(x.get("type") == "image" for x in b["content"])
+        ]
+        assert survivors == [f"t{i}" for i in range(IMAGE_EVICTION_BATCH, n)]
+
+    def test_floor_yields_when_one_carrier_breaches_the_block_limit(self):
+        """The keep floor shelters only breaches eviction cannot fix.
+
+        One tool_result carrying more image blocks than the ceiling is a single carrier;
+        a floor of three counted in carriers would retire nothing and ship a request the
+        API rejects. With no reserved uploads the breach is fixable, so it must be fixed.
+        """
+        from agent.anthropic_message_convert import _evict_old_screenshots
+        from agent.image_eviction_policy import OUTBOUND_IMAGE_LIMIT
+
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A"}}
+        result = [{
+            "role": "user",
+            "content": [{
+                "type": "tool_result", "tool_use_id": "t0",
+                "content": [dict(img) for _ in range(OUTBOUND_IMAGE_LIMIT + 5)],
+            }],
+        }]
+        _evict_old_screenshots(result)
+        assert not any(x.get("type") == "image" for x in result[0]["content"][0]["content"])
+
+    def test_a_batch_that_would_blind_the_model_stops_at_the_floor(self):
+        """Fifteen reserved uploads plus six one-frame tool_results: one eight-wide batch would
+        retire every frame although keeping the newest three already clears the ceiling."""
+        from agent.anthropic_message_convert import _evict_old_screenshots
+        from agent.image_eviction_policy import OUTBOUND_IMAGE_LIMIT
+
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A"}}
+        result = [{"role": "user", "content": [dict(img) for _ in range(OUTBOUND_IMAGE_LIMIT - 5)]}]
+        for i in range(6):
+            result.append({"role": "assistant", "content": [{"type": "tool_use", "id": f"t{i}", "name": "s", "input": {}}]})
+            result.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"t{i}", "content": [dict(img)]}]})
+        _evict_old_screenshots(result)
+        kept = [
+            b["tool_use_id"] for m in result for b in m["content"]
+            if b.get("type") == "tool_result" and any(x.get("type") == "image" for x in b["content"])
+        ]
+        assert kept[-3:] == ["t3", "t4", "t5"]
+        assert OUTBOUND_IMAGE_LIMIT - 5 + len(kept) <= OUTBOUND_IMAGE_LIMIT
+
+    def test_eviction_frontier_holds_between_batch_advances(self):
+        """Screenshot eviction must not rewrite a new block on every capture.
+
+        The Anthropic prompt cache keys on an exact byte prefix. A frontier that
+        advances one block per screenshot edits an already-cached block every turn,
+        forcing a full-prefix re-write that costs far more than the image tokens it
+        reclaims.
+        """
+        from agent.anthropic_message_convert import convert_messages_to_anthropic
+        from agent.image_eviction_policy import IMAGE_EVICTION_BATCH, OUTBOUND_IMAGE_LIMIT
+
+        fake_png = "iVBORw0KGgo="
+
+        def placeholder_count(n: int) -> int:
+            messages: List[Dict[str, Any]] = [{"role": "user", "content": "start"}]
+            for i in range(n):
+                messages.append({
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {"name": "computer_use", "arguments": "{}"},
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": f"call_{i}",
+                    "content": {
+                        "_multimodal": True,
+                        "content": [
+                            {"type": "text", "text": f"cap {i}"},
+                            {"type": "image_url",
+                             "image_url": {"url": f"data:image/png;base64,{fake_png}"}},
+                        ],
+                        "text_summary": f"cap {i}",
+                    },
+                })
+            _, out = convert_messages_to_anthropic(messages)
+            return sum(
+                1
+                for m in out
+                if isinstance(m.get("content"), list)
+                for b in m["content"]
+                if b.get("type") == "tool_result"
+                and isinstance(b.get("content"), list)
+                and any(
+                    x.get("type") == "text" and "screenshot removed" in x.get("text", "")
+                    for x in b["content"]
+                )
+            )
+
+        # Span three batch windows. The placeholder count must step once per batch (a
+        # one-step frontier fails the plateau check) AND the surviving image count must
+        # never exceed the limit (a fixed one-batch retire fails that after window one).
+        span = range(OUTBOUND_IMAGE_LIMIT - 2, OUTBOUND_IMAGE_LIMIT + 3 * IMAGE_EVICTION_BATCH)
+        counts = [placeholder_count(n) for n in span]
+        assert all(n - c <= OUTBOUND_IMAGE_LIMIT for n, c in zip(span, counts)), counts
+        steps = sum(a != b for a, b in zip(counts, counts[1:]))
+        assert steps == 3, (
+            f"eviction frontier moved {steps} times over {len(span)} screenshots (counts={counts}); "
+            "each step invalidates the cached prefix"
+        )
 
 # ---------------------------------------------------------------------------
 # Context compressor: screenshot-aware pruning
@@ -1574,6 +1843,71 @@ class TestCaptureAppFilterNoMatch:
         assert backend._active_window_id is None
         assert backend._last_target is None
         assert backend._snapshot_tokens == {}
+
+class TestLaunchApp:
+    """Bug fixed 2026-09-22 (Tony: "not good at opening apps, example Notion"):
+    the backend has always had a real, idempotent launch_app(name=...) that
+    starts an app whether or not it's already running, but it was never
+    exposed as a callable action -- the model could only reach focus_app,
+    which fails outright ("No on-screen window found") when the app isn't
+    already open, forcing unreliable click-simulation on a taskbar/Start
+    icon instead. These lock in the new dispatch wiring at the tool layer.
+    """
+
+    def test_launch_app_requires_app_arg(self):
+        from tools.computer_use import tool as cu_tool
+
+        class StubBackend:
+            def start(self): pass
+            def stop(self): pass
+            def is_available(self): return True
+            def launch_app(self, *, name): raise AssertionError("must not be called without app")
+
+        cu_tool.reset_backend_for_tests()
+        cu_tool._backend = StubBackend()
+        result = json.loads(cu_tool.handle_computer_use({"action": "launch_app"}))
+        assert "error" in result
+        assert "app" in result["error"]
+
+    def test_launch_app_calls_backend_with_name_and_returns_result(self):
+        from tools.computer_use import tool as cu_tool
+
+        calls = []
+
+        class LaunchingBackend:
+            def start(self): pass
+            def stop(self): pass
+            def is_available(self): return True
+
+            def launch_app(self, *, name):
+                calls.append(name)
+                return {"pid": 4242, "name": name, "windows": []}
+
+        cu_tool.reset_backend_for_tests()
+        cu_tool._backend = LaunchingBackend()
+        result = json.loads(cu_tool.handle_computer_use({"action": "launch_app", "app": "Notion"}))
+
+        assert calls == ["Notion"]
+        assert result["pid"] == 4242
+        assert result["name"] == "Notion"
+
+    def test_launch_app_unsupported_backend_returns_clear_error_not_a_crash(self):
+        """A backend with no launch_app method must fail with a readable
+        error, not AttributeError -- getattr-guard regression lock."""
+        from tools.computer_use import tool as cu_tool
+
+        class NoLaunchBackend:
+            def start(self): pass
+            def stop(self): pass
+            def is_available(self): return True
+            # deliberately no launch_app method
+
+        cu_tool.reset_backend_for_tests()
+        cu_tool._backend = NoLaunchBackend()
+        result = json.loads(cu_tool.handle_computer_use({"action": "launch_app", "app": "Notion"}))
+        assert "error" in result
+        assert "not supported" in result["error"]
+
 
 class TestFocusAppFilterNoMatch:
     """focus_app(app=X) must return ok=False when X matches nothing —
