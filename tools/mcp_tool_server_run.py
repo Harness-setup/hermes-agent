@@ -170,7 +170,7 @@ class MCPServerRunMixin:
         self._reconnect_event.clear()
         return "reconnect"
 
-    def _log_park(self, msg: str, *args, is_auth: bool = False) -> None:
+    def _log_park(self, msg: str, *args) -> None:
         """Park chatter control (#115713): re-parking a server that never revived is not a state
         transition — ``hermes mcp list`` already surfaces the parked state, so one identical
         WARNING per self-probe carries no new information. The first park (and the revived line
@@ -179,40 +179,19 @@ class MCPServerRunMixin:
         lines/month). A park for a DIFFERENT reason (auth error after connection refused) is new
         information and warns again.
 
-        ``is_auth``: Tony, 2026-09-23 ("keeps on asking me to reauthenticate for todoist mcp") --
-        this state (parked needing ``hermes mcp login <name>``) was previously WARNING-logged
-        only, so he never found out until he happened to ask for something that server handles
-        and got a vague "tools aren't registered" response, sometimes days later. A genuinely
-        new auth-related park now also tells him directly, once, on his home channel."""
+        Direct Discord notification on a new auth-related park (Tony, 2026-09-23: "keeps on
+        asking me to reauthenticate for todoist mcp") moved out to a standalone script
+        (~/.hermes/scripts/check-mcp-auth-parks.py, run on its own cron schedule) instead of
+        living here -- "turn every local fixes that we have into plugins or scripts since that
+        is more reliable than changing core code when possible." That script does its own live
+        probe (`hermes mcp test <name>`) rather than observing this in-process park state, since
+        a separate process can't reach it anyway."""
         line = msg % args if args else msg
-        is_new_park = not (self._was_parked and line == self._last_park_line)
-        if is_new_park:
+        if self._was_parked and line == self._last_park_line:
+            logger.debug(msg, *args)
+        else:
             self._last_park_line = line
             logger.warning(msg, *args)
-        else:
-            logger.debug(msg, *args)
-        if is_new_park and is_auth:
-            self._notify_home_channel_of_auth_park()
-
-    def _notify_home_channel_of_auth_park(self) -> None:
-        """Best-effort, one-shot notification for a NEW auth-related park; never raises, never
-        blocks the park itself on delivery failure (no configured platform, no home channel,
-        network down, etc. must all degrade to a log line, not an exception here)."""
-        try:
-            from tools.send_message_tool import send_message_tool
-            message = (
-                f"⚠ MCP server '{self.name}' needs reauthorization — I can't use it until you run "
-                f"`hermes mcp login {self.name}` (interactively, in a real terminal). It'll keep "
-                f"failing silently otherwise; this is the only notice you'll get."
-            )
-            result = send_message_tool({"action": "send", "target": "discord", "message": message})
-            import json as _json
-            parsed = _json.loads(result) if isinstance(result, str) else result
-            if not (isinstance(parsed, dict) and parsed.get("success")):
-                logger.debug("MCP server '%s': auth-park notification did not confirm delivery: %s",
-                            self.name, parsed)
-        except Exception:
-            logger.debug("MCP server '%s': auth-park notification failed", self.name, exc_info=True)
 
     async def _park(self, revival_reason: str) -> bool:
         """Drop this server's tools and wait for a reconnect request; True when shutdown came instead.
@@ -498,12 +477,11 @@ class MCPServerRunMixin:
         if failure_class == "permanent":
             # Deterministic failure (bad command, non-MCP URL, 401/403): park at once; auth
             # failures park (not return) so the task can pick up fresh tokens later.
-            _is_auth = _errors._is_auth_error(root)
             detail = (f"authentication, parking until credentials change; re-authenticate with "
-                      f"`hermes mcp login {self.name}`" if _is_auth
+                      f"`hermes mcp login {self.name}`" if _errors._is_auth_error(root)
                       else "connection with a permanent error, parking without retries")
             self._log_park("MCP server '%s' failed initial %s (state: connecting → parked): %s: %s",
-                           self.name, detail, type(root).__name__, root, is_auth=_is_auth)
+                           self.name, detail, type(root).__name__, root)
             return await self._park_initial_failure(exc, "after permanent initial failure", budget)
         budget.initial_retries += 1
         if budget.initial_retries > _core._MAX_INITIAL_CONNECT_RETRIES:
@@ -539,8 +517,7 @@ class MCPServerRunMixin:
         # for a non-auth permanent error -- check the root cause directly rather than assuming.
         self._log_park(
             "MCP server '%s' hit a permanent error, parking without retries; will self-probe every %ds "
-            "(state: connected → parked): %s: %s", self.name, _core._PARKED_RETRY_INTERVAL, type(root).__name__, root,
-            is_auth=_errors._is_auth_error(root))
+            "(state: connected → parked): %s: %s", self.name, _core._PARKED_RETRY_INTERVAL, type(root).__name__, root)
         return await self._park_and_rearm("from parked state (permanent error)", budget)
 
     async def start(self, config: dict):
