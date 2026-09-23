@@ -494,9 +494,6 @@ def test_coding_prompt_orders_shared_context_before_workspace(monkeypatch):
         ),
         patch("agent.file_safety._resolve_active_profile_name", return_value="default"),
         patch("hermes_time.now", return_value=datetime(2026, 1, 2)),
-        # Reads the real ~/.hermes/mode-state.json otherwise -- this test wants a fully
-        # hermetic prompt, independent of whatever mode is active on the machine running it.
-        patch("agent.system_prompt._local_mode_notice_part", return_value=[]),
     ):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 

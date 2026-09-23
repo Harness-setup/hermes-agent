@@ -539,44 +539,6 @@ def _memory_parts(agent: Any) -> List[str]:
     return parts
 
 
-_LOCAL_MODE_NOTICE = (
-    "## Running in local mode\n\n"
-    "When local or uncensored mode is active (check `/mode status` or your own "
-    "current model if unsure — cloud/haiku is your normal resting state, not "
-    "local), say so up front before starting any substantive task, not just "
-    "after the fact: \"I'm running on the local model right now, sir.\" For a "
-    "task that's a stretch for the local model's real capability (complex "
-    "multi-file coding, a demanding cron job, anything requiring careful "
-    "multi-step reasoning) — flag that plainly too, and ask whether Tony wants "
-    "to continue on local anyway or switch to cloud first (`/mode cloud`) "
-    "before you start, rather than quietly attempting it and disclaiming the "
-    "result afterward. For tasks well within the local model's depth, a brief "
-    "mode mention is enough — no need to ask permission for something trivial.\n\n"
-    "If you do proceed on local/uncensored, flag your output as lower-"
-    "confidence: say plainly that this response came from the local model, and "
-    "it's worth double-checking once back on the primary model, rather than "
-    "presenting it with your usual authority."
-)
-
-
-def _local_mode_notice_part() -> List[str]:
-    """Moved out of SOUL.md (2026-09-22): only meaningful while local/uncensored mode is
-    actually active, so it no longer costs prompt size on every cloud-mode turn (the
-    normal resting state) -- see mode-state.json's own docstring for why this file, not
-    the agent object, is the source of truth. Read failure -> omit (fail toward the
-    smaller prompt; this is guidance text, not a security gate, so there's no privacy
-    reason to fail the other way the way memory_guard.py's uncensored check does)."""
-    try:
-        from pathlib import Path as _P
-        import json as _json
-        data = _json.loads((_P.home() / ".hermes" / "mode-state.json").read_text(encoding="utf-8"))
-        if data.get("kind") in ("local", "uncensored"):
-            return [_LOCAL_MODE_NOTICE]
-    except Exception:
-        pass
-    return []
-
-
 def _identity_parts(agent: Any, ctx_len: Optional[int]) -> Tuple[List[str], bool]:
     """SOUL.md (primary identity; cron keeps the persona while skipping cwd
     instructions, scoped to the agent's OWN home) or the default identity.
@@ -743,7 +705,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Volatile tier (most likely to differ on a rebuild; kept last so the stable prefix stays reusable) ──
     # Skills are runtime-mutable, so the index leads the volatile band: on a longest-prefix
     # backend an unchanged index stays inside the reused prefix; a changed one re-prefills from here.
-    volatile_parts: List[str] = [skills_prompt, *_memory_parts(agent), *_local_mode_notice_part()]
+    volatile_parts: List[str] = [skills_prompt, *_memory_parts(agent)]
     # Plugin sections are confined to one coarse anchor in the volatile tail so
     # a resumed process can reconstruct the stable prefix without re-running plugins.
     volatile_parts.extend(_plugin_section_blocks(_frozen_plugin_prompt_sections(agent), "after_memory"))
