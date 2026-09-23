@@ -83,6 +83,7 @@ _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.json"
+_DISCORD_UNCENSORED_STATE_FILENAME = "discord_uncensored_messages.json"
 
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
@@ -503,6 +504,111 @@ class _DiscordNonConversationalMessageTracker:
 
     def __contains__(self, message_id: str) -> bool:
         return str(message_id or "") in self._ids
+
+
+def _current_mode_kind() -> Optional[str]:
+    """Read ``~/.hermes/mode-state.json``'s ``kind`` directly (``"cloud"``/``"local"``/
+    ``"uncensored"``), independent of the ``mode`` Hermes plugin's own package (that plugin
+    lives outside hermes-agent's import path). ``None`` on any read/parse failure — callers
+    decide fail-open vs fail-closed per their own consequence (see _DiscordUncensoredMessageTracker)."""
+    try:
+        path = _Path.home() / ".hermes" / "mode-state.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        kind = data.get("kind")
+        return str(kind) if kind else None
+    except Exception:
+        return None
+
+
+class _DiscordUncensoredMessageTracker:
+    """Tracks (channel_id, message_id) pairs sent/received while mode-state.json's ``kind`` is
+    ``"uncensored"``, and deletes them all once the fleet leaves that mode.
+
+    Tony, 2026-09-22: extends the mode plugin's existing "no trace" guarantee for uncensored mode
+    (see ~/.hermes/plugins/mode/session_summary.py -- that file already refuses to carry ANY
+    context out of an uncensored session into the next one) to Discord message history itself:
+    both his own prompts and the bot's replies sent during an uncensored exchange get deleted once
+    the fleet switches away, not just excluded from later context. Mode is fleet-global (one
+    ~/.hermes/mode-state.json, not per-session/per-channel -- see mode/__init__.py: "Switch the
+    fleet's model mode"), so this tracker is intentionally NOT session-scoped either: it just
+    records every message touched while uncensored, across every channel, and sweeps all of it on
+    the next kind transition away from uncensored, detected by simple edge-detection against the
+    persisted ``last_kind`` (no coupling to the mode plugin's own one-shot session-reset marker,
+    which session_summary.py already consumes for its own purpose).
+
+    Persisted (not just in-memory) so a gateway restart mid-uncensored-session doesn't lose track
+    of messages still pending deletion, and so a kind change that happened while the process was
+    down is still caught the next time this tracker is consulted (on connect, and per message)."""
+
+    def __init__(self) -> None:
+        state = self._load()
+        self._last_kind: Optional[str] = state.get("last_kind")
+        self._messages: list = state.get("messages") or []
+        self._persist_lock = asyncio.Lock()
+
+    def _state_path(self) -> _Path:
+        from hermes_constants import get_hermes_home
+        return (
+            get_hermes_home()
+            / _DISCORD_COMMAND_SYNC_STATE_SUBDIR
+            / _DISCORD_UNCENSORED_STATE_FILENAME
+        )
+
+    def _load(self) -> dict:
+        path = self._state_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            logger.debug("[%s] Failed to load uncensored Discord message tracker state", "Discord")
+        return {}
+
+    def _save(self) -> None:
+        try:
+            atomic_json_write(
+                self._state_path(),
+                {"last_kind": self._last_kind, "messages": self._messages},
+                indent=None,
+            )
+        except Exception:
+            logger.debug("[%s] Failed to save uncensored Discord message tracker state", "Discord", exc_info=True)
+
+    async def _persist(self) -> None:
+        async with self._persist_lock:
+            await asyncio.to_thread(self._save)
+
+    async def maybe_sweep(self) -> "list | None":
+        """Call before tracking/sending any message. Reads the current kind; if it just
+        transitioned AWAY from "uncensored" (persisted last_kind was "uncensored", current is
+        not), returns the messages to delete (and clears/persists state) -- caller does the
+        actual Discord deletes, since this class has no Discord client access. A failed current-
+        kind read is treated as "unknown, no transition" (fail toward NOT deleting -- deletion is
+        irreversible, unlike simply tracking one extra candidate message)."""
+        current = _current_mode_kind()
+        if current is None:
+            return None  # can't confirm a transition happened -- never delete on a guess
+        if self._last_kind == "uncensored" and current != "uncensored" and self._messages:
+            to_delete = self._messages
+            self._messages = []
+            self._last_kind = current
+            await self._persist()
+            return to_delete
+        if current != self._last_kind:
+            self._last_kind = current
+            await self._persist()
+        return None
+
+    async def track(self, channel_id: Any, message_id: Any) -> None:
+        """Record one message as uncensored-mode-authored. Caller already confirmed the current
+        kind is "uncensored" (via maybe_sweep's side-effected self._last_kind, or a fresh check)."""
+        self._messages.append({"channel_id": str(channel_id), "message_id": str(message_id)})
+        await self._persist()
+
+    def is_currently_uncensored(self) -> bool:
+        return self._last_kind == "uncensored"
 
 
 def _discord_snowflake_time(snowflake: int) -> dt.datetime:
@@ -1123,6 +1229,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._last_self_message_id: Dict[str, str] = {}
         # Bot-authored lifecycle/status message IDs that must not bound history after restart.
         self._nonconversational_messages = _DiscordNonConversationalMessageTracker()
+        # No-trace guarantee for uncensored mode (see class docstring): tracks messages sent
+        # while mode-state.json's kind is "uncensored" and deletes them once it leaves that mode.
+        self._uncensored_messages = _DiscordUncensoredMessageTracker()
         # Last truncated mid-stream preview per (chat_id, message_id): past the 2000 cap every edit
         # truncates to the SAME text, and re-sending only burns edit rate limit. Dropped on finalize.
         # Once an oversized streaming edit saturates at the 2000-char preview cap, every subsequent
@@ -1293,6 +1402,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             async def on_ready():
                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
                 await adapter_self._resolve_allowed_usernames()
+                # Catches a mode-kind change that happened while this process was down.
+                await adapter_self._sweep_uncensored_messages_if_needed()
                 adapter_self._ready_event.set()
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
                     adapter_self._post_connect_task.cancel()
@@ -1537,6 +1648,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not admitted:
             return False
         self._record_bot_tag_debounce(message)
+        await self._track_if_uncensored(message.channel.id, message.id)
         return await self._handle_message(message, role_authorized=role_authorized)
 
     # --- gateway_platform_event fire-sites ---
@@ -3083,6 +3195,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     await self._nonconversational_messages.mark_many(message_ids)
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
+                channel_id = getattr(channel, "id", _target_id)
+                for _mid in message_ids:
+                    await self._track_if_uncensored(channel_id, _mid)
             # Connection-shaped failure (WS drop / closed session): use the ledger's runtime-retryable
             # marker so the reconnect sweep can replay this final response instead of stranding it until a
             # process restart (#95382 silent partial loss).
@@ -5213,6 +5328,61 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         except Exception as e:
             logger.warning("[%s] Failed to fetch channel history: %s", self.name, e)
             return ""
+
+    async def _sweep_uncensored_messages_if_needed(self) -> None:
+        """Check for a just-happened "left uncensored mode" transition and delete every message
+        tracked during that session (both Tony's own prompts and the bot's replies -- see
+        _DiscordUncensoredMessageTracker's docstring). Called on connect (catches a kind change
+        that happened while the process was down) and around every message send/receive (catches
+        it live, essentially immediately since the /mode switch itself flows through this same
+        message pipeline). Best-effort: a delete failure for one message must never block the rest."""
+        to_delete = await self._uncensored_messages.maybe_sweep()
+        if not to_delete:
+            return
+        by_channel: Dict[str, list] = {}
+        for entry in to_delete:
+            by_channel.setdefault(entry["channel_id"], []).append(entry["message_id"])
+        deleted = 0
+        for channel_id, message_ids in by_channel.items():
+            try:
+                channel = await self._resolve_channel(channel_id)
+            except Exception as e:
+                logger.warning("[%s] uncensored cleanup: could not resolve channel %s: %s", self.name, channel_id, e)
+                continue
+            if channel is None:
+                continue
+            # Bulk delete only covers messages under 14 days old and needs >=2 ids; fall back to
+            # individual deletes (both for a single id and for anything bulk delete rejects).
+            bulk_eligible = len(message_ids) >= 2
+            bulk_failed_ids = message_ids
+            if bulk_eligible and hasattr(channel, "delete_messages"):
+                try:
+                    from discord import Object as _DiscordObject
+                    await channel.delete_messages([_DiscordObject(id=int(mid)) for mid in message_ids])
+                    deleted += len(message_ids)
+                    bulk_failed_ids = []
+                except Exception as e:
+                    logger.debug("[%s] uncensored cleanup: bulk delete fell back to individual deletes: %s", self.name, e)
+            for mid in bulk_failed_ids:
+                try:
+                    msg = await channel.fetch_message(int(mid))
+                    await msg.delete()
+                    deleted += 1
+                except Exception as e:
+                    logger.debug("[%s] uncensored cleanup: could not delete message %s: %s", self.name, mid, e)
+        if deleted:
+            logger.info("[%s] Uncensored mode ended — deleted %d message(s) (no-trace cleanup)", self.name, deleted)
+
+    async def _track_if_uncensored(self, channel_id: Any, message_id: Any) -> None:
+        """Record *message_id* for later cleanup iff the fleet is currently in uncensored mode.
+        Always calls the sweep check first, so a kind transition is caught before this message
+        (already in the NEW kind) gets mistakenly tracked under the old one."""
+        try:
+            await self._sweep_uncensored_messages_if_needed()
+            if self._uncensored_messages.is_currently_uncensored():
+                await self._uncensored_messages.track(channel_id, message_id)
+        except Exception:
+            logger.debug("[%s] uncensored message tracking failed", self.name, exc_info=True)
 
     async def _resolve_channel(self, channel_id: Any) -> Any:
         """Cached ``get_channel`` first, REST ``fetch_channel`` on miss (raises on API error).

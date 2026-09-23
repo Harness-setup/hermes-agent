@@ -133,6 +133,49 @@ def _maybe_auto_commit_pending_changes(git_cmd: list[str], cwd: Path) -> None:
                         commit.stderr)
 
 
+def _maybe_sync_from_backup_remote(git_cmd: list[str], cwd: Path, branch: str) -> None:
+    """updates.sync_from_backup_remote (default False): fast-forward *branch* from the ``backup``
+    remote before the origin/main compare-and-merge below ever runs.
+
+    Tony, 2026-09-22: he runs hermes-agent from two independent checkouts (WSL + a Windows-native
+    clone) on the same long-lived local-fixes branch. Each one merging origin/main independently
+    means the SAME upstream conflicts get resolved twice, and the two checkouts' own local commits
+    can conflict with EACH OTHER on top of that. The WSL checkout is the one that actually does
+    that resolution work and pushes the result to `backup`; this lets a second checkout (Windows)
+    just fast-forward onto the already-resolved history instead of re-deriving it. Fast-forward
+    only -- if this checkout has commits `backup` doesn't have yet (the ancestor check fails),
+    skip silently and fall through to the normal origin/main flow unchanged: this is a pure
+    speed/conflict-avoidance shortcut, never a substitute for that flow's own safety checks."""
+    try:
+        from hermes_cli.config import load_config
+        _update_cfg = (load_config() or {}).get("updates", {})
+        if not (isinstance(_update_cfg, dict) and bool(_update_cfg.get("sync_from_backup_remote", False))):
+            return
+    except Exception as exc:
+        logger.debug("Could not read updates.sync_from_backup_remote: %s", exc)
+        return
+    from hermes_cli.update_cmd import _git_run
+    if not _git_ok(git_cmd, ["remote", "get-url", "backup"], cwd):
+        return
+    status = _git_run(git_cmd, ["status", "--porcelain"], cwd)
+    if status.returncode != 0 or status.stdout.strip():
+        return  # only act on a clean tree -- same caution as _maybe_auto_commit_pending_changes
+    fetch = _git_run(git_cmd, ["fetch", "backup", branch], cwd)
+    if fetch.returncode != 0:
+        logger.debug("sync_from_backup_remote: fetch failed, skipping: %s", fetch.stderr)
+        return
+    if not _git_ok(git_cmd, ["rev-parse", "--verify", "--quiet", f"backup/{branch}"], cwd):
+        return
+    if not _git_ok(git_cmd, ["merge-base", "--is-ancestor", "HEAD", f"backup/{branch}"], cwd):
+        return  # this checkout has commits backup doesn't have -- nothing safe to fast-forward
+    merge = _git_run(git_cmd, ["merge", "--ff-only", f"backup/{branch}"], cwd)
+    if merge.returncode == 0:
+        print(f"  ✓ Fast-forwarded '{branch}' from the backup remote (already-resolved history) "
+              f"before checking origin.")
+    else:
+        logger.debug("sync_from_backup_remote: ff-only merge failed unexpectedly: %s", merge.stderr)
+
+
 def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: str, target_branch: str) -> tuple[bool, str]:
     """Decide whether a parked feature branch may be auto-switched back to the update target.
 
