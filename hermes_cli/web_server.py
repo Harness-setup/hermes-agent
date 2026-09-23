@@ -1265,16 +1265,34 @@ def _on_server_started(
     # kill-on-close job). Registered AFTER the bind so the entry carries the
     # ACTUAL port — what lets `hermes update` relaunch a manually-started serve
     # on its real endpoint (#63206).
+    #
+    # Tony, 2026-09-22: this silently failing (or silently writing to a path the
+    # updater's scanner resolves differently -- e.g. HERMES_HOME visibility gaps
+    # between a Desktop-spawned child and the scanner, same bug class as #45471)
+    # is exactly what leaves a live Desktop-spawned backend permanently unrecognized
+    # by hermes update's blocker scan (_updater_owned_backend_entry always misses,
+    # "Close other processes to update Hermes" every time, forever). _best_effort's
+    # normal DEBUG-level catch made this invisible; this step gets its own WARNING
+    # so a live failure shows up instead of silently repeating.
     def _register_identity() -> None:
-        from hermes_cli.process_identity import attach_self_to_kill_on_close_job, register_self
+        from hermes_cli.process_identity import _ledger_path, attach_self_to_kill_on_close_job, register_self
 
-        register_self(
+        ok = register_self(
             "serve" if headless else "dashboard",
             detail={"host": host, "port": actual_port, "profile": initial_profile or ""},
         )
+        if not ok:
+            _log.warning(
+                "process-identity registration returned False (ledger path: %s) -- "
+                "hermes update's blocker scan will not recognize this backend as its own",
+                _ledger_path(),
+            )
         attach_self_to_kill_on_close_job()
 
-    _best_effort("process-identity registration", _register_identity)
+    try:
+        _register_identity()
+    except Exception as exc:
+        _log.warning("process-identity registration failed: %s", exc, exc_info=True)
 
     # Host rendezvous (multiplex-only): the host lock + record that let a SECOND `hermes serve`
     # for any profile find this process and attach instead of binding a second port. Published
