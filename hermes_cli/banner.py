@@ -332,8 +332,13 @@ def _tips_behind(head_rev: Optional[str], target_rev: Optional[str], repo_dir: O
 
     With ``repo_dir``, a target that is already an ancestor of HEAD (local-ahead checkout) is 0 too.
     ``ahead_by == 0`` with differing tips means the remote tip is reachable from our HEAD — NOT
-    behind. A local-only HEAD 404s on the API, which degrades to ``UPDATE_AVAILABLE_NO_COUNT`` —
-    never a fabricated 1.
+    behind. A local-only HEAD (e.g. a merge commit on a parked branch like local-fixes, never
+    pushed to the origin repo itself -- only to a personal fork/backup) 404s on the compare API,
+    since GitHub can only compare SHAs it actually has in THIS repo. Falls back to a local
+    git count in that case (Tony, 2026-09-22: "commits behind" showing nothing/wrong on both
+    client and backend -- traced to exactly this 404, confirmed live) -- one bounded, targeted
+    fetch of just the target SHA, not a policy change for the common case (normal installs on
+    origin/main never hit this path at all, since the compare API just works for them).
     """
     if not head_rev or not target_rev:
         return None
@@ -341,7 +346,24 @@ def _tips_behind(head_rev: Optional[str], target_rev: Optional[str], repo_dir: O
             ["merge-base", "--is-ancestor", target_rev, "HEAD"], cwd=repo_dir)):
         return 0
     counted = _github_compare_behind(head_rev, target_rev)
-    return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
+    if counted is not None:
+        return counted
+    if repo_dir is not None:
+        local_count = _local_tips_behind(head_rev, target_rev, repo_dir)
+        if local_count is not None:
+            return local_count
+    return UPDATE_AVAILABLE_NO_COUNT
+
+
+def _local_tips_behind(head_rev: str, target_rev: str, repo_dir: Path) -> Optional[int]:
+    """Local-git fallback for _tips_behind when the compare API can't see head_rev (a local-only
+    commit on a checkout parked off origin/main, e.g. local-fixes). Fetches only target_rev --
+    not a full branch/remote fetch -- so this stays a bounded, one-shot cost even though it's a
+    real network op, unlike the passive API-first path this backs up."""
+    if not _git_ok(["cat-file", "-e", f"{target_rev}^{{commit}}"], cwd=repo_dir):
+        if not _git_ok(["fetch", "--depth=1", "origin", target_rev], cwd=repo_dir, network=True, timeout=15):
+            return None
+    return _git_count(["rev-list", "--count", f"{head_rev}..{target_rev}"], cwd=repo_dir)
 
 
 def _github_branch_tip(repo_slug: str, branch: str) -> Optional[str]:
