@@ -863,6 +863,40 @@ def _attach_to_host_backend(args, headless_backend: bool) -> None:
     url = f"http://{hr.dial_host(record)}:{record.port}/?profile={wanted}"
 
     kind = "backend" if headless_backend else "dashboard"
+    # Tony, 2026-09-22: Pebble's "Restart Everything"/"Unblock Update" call into this exact
+    # attach path -- it used to just print the pid below and exit 0, reporting success while
+    # actually re-attaching to the SAME pre-update process `hermes update` already flagged as
+    # owing a restart (~/.hermes/serve_restart_pending/). Check that flag before accepting the
+    # attach: if this pid IS the one still owing a restart, kill it and fall through to bind a
+    # fresh one instead of quietly reporting the stale instance as healthy.
+    from hermes_cli.update_serve_obligations import clear_manual_restart_obligation, pending_manual_restart_record
+    obligation = pending_manual_restart_record(record.pid)
+    if obligation is not None:
+        import time
+        from gateway.status import terminate_pid
+
+        def _pid_alive(pid: int) -> bool:
+            try:
+                os.kill(pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True  # exists, just not ours to signal further
+
+        print(f"Hermes {kind} PID {record.pid} is running pre-update code (flagged after the last "
+              f"`hermes update`) -- restarting it instead of attaching...")
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            terminate_pid(record.pid, force=False)
+        for _ in range(50):  # ~5s grace before escalating
+            if not _pid_alive(record.pid):
+                break
+            time.sleep(0.1)
+        else:
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                terminate_pid(record.pid, force=True, expected_start_time=obligation.get("create_time"))
+        clear_manual_restart_obligation(obligation)
+        return  # fall through to the normal "no owner answered" bind path below
     print(f"Hermes {kind} already running on this host: PID {record.pid}, port {record.port}.")
     print(f"  Managing profile '{wanted}': {url}")
     if not headless_backend and not args.no_open:

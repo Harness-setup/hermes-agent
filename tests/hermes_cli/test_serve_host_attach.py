@@ -154,3 +154,35 @@ def test_dashboard_is_never_routed_to_a_headless_backend(host_dir, owner, capsys
 
     assert exc.value.code == 1
     assert "no dashboard UI" in capsys.readouterr().out
+
+
+def test_a_pid_flagged_for_restart_is_killed_instead_of_attached(host_dir, owner, monkeypatch, capsys):
+    """Pebble's "Restart Everything"/"Unblock Update" call into this attach path. Before this
+    fix, a pid the update flow had already flagged as owing a restart (~/.hermes/
+    serve_restart_pending/) still answered the handshake and got silently attached to -- exit 0,
+    reporting success while serving pre-update code. It must instead be killed, its obligation
+    cleared, and the launch fall through to bind fresh (returns None, not sys.exit)."""
+    _publish(hr.process_create_time(), port=owner.port)
+    obligation = {"kind": "dashboard", "profile": "default", "pid": os.getpid(),
+                  "create_time": hr.process_create_time(), "_obligation_path": "/fake/path.json"}
+    monkeypatch.setattr(
+        "hermes_cli.update_serve_obligations.pending_manual_restart_record",
+        lambda pid: obligation if pid == os.getpid() else None,
+    )
+    cleared = []
+    monkeypatch.setattr(
+        "hermes_cli.update_serve_obligations.clear_manual_restart_obligation",
+        lambda record: cleared.append(record),
+    )
+    killed = []
+    monkeypatch.setattr("gateway.status.terminate_pid", lambda pid, **kw: killed.append((pid, kw)))
+    # The real pid is genuinely alive (it's this test process) -- fake it as already gone so the
+    # fix's wait loop exits on its first check instead of spinning through real sleeps.
+    monkeypatch.setattr("os.kill", lambda *_a, **_k: (_ for _ in ()).throw(ProcessLookupError()))
+
+    result = _attach_to_host_backend(_args(), headless_backend=True)
+
+    assert result is None  # falls through to bind, never sys.exit(0)
+    assert killed and killed[0][0] == os.getpid()
+    assert cleared == [obligation]
+    assert "restarting it instead of attaching" in capsys.readouterr().out
