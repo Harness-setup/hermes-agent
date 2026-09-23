@@ -479,6 +479,23 @@ class TestSchemaConversion:
         assert schema["description"] == "Read a file"
         assert "properties" in schema["parameters"]
 
+    def test_cua_driver_tools_get_a_prefer_computer_use_warning_in_their_description(self):
+        from tools.mcp_tool_schema import _convert_mcp_schema
+
+        mcp_tool = _make_mcp_tool(name="list_windows", description="List open windows")
+        schema = _convert_mcp_schema("cua-driver", mcp_tool)
+
+        assert schema["description"].startswith("[Prefer the `computer_use` tool")
+        assert "List open windows" in schema["description"]
+
+    def test_other_servers_are_not_given_the_cua_driver_warning(self):
+        from tools.mcp_tool_schema import _convert_mcp_schema
+
+        mcp_tool = _make_mcp_tool(name="read_file", description="Read a file")
+        schema = _convert_mcp_schema("filesystem", mcp_tool)
+
+        assert schema["description"] == "Read a file"
+
     def test_definitions_as_property_name_is_preserved(self):
         """A tool parameter literally named ``definitions`` must not be renamed.
 
