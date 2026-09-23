@@ -1157,6 +1157,9 @@ class GatewayAdapterLifecycleMixin:
             authorization_check or self._make_adapter_auth_check(adapter.platform)
         )
         adapter.set_platform_event_handler(platform_event_handler or self._primary_platform_event_handler())
+        _set_voice_auto_join = getattr(adapter, "set_voice_auto_join_handler", None)
+        if callable(_set_voice_auto_join):
+            _set_voice_auto_join(self._handle_voice_auto_join)
         adapter._busy_text_mode = (self._busy_text_mode if busy_text_mode is None else busy_text_mode)
         timing = busy_text_timing or getattr(self, "_busy_text_timing", None)
         if timing:

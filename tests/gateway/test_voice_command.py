@@ -570,8 +570,14 @@ class TestVoiceChannelCommands:
         assert "joined" in result.lower()
         assert "General" in result
         assert runner._voice_mode["discord:123"] == "all"
-        assert mock_adapter._voice_sources[111]["chat_id"] == "123"
-        assert mock_adapter._voice_sources[111]["chat_type"] == "group"
+        # join_voice_channel_core passes text_channel_id/source as kwargs now (atomic join,
+        # shared with voice-channel auto-join) instead of setting adapter._voice_sources as a
+        # separate step after the call -- assert the call, not a side effect the real (now
+        # mocked-away) join_voice_channel would have produced.
+        _, kwargs = mock_adapter.join_voice_channel.call_args
+        assert kwargs["text_channel_id"] == 123
+        assert kwargs["source"]["chat_id"] == "123"
+        assert kwargs["source"]["chat_type"] == "group"
 
 
     @pytest.mark.asyncio

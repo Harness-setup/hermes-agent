@@ -1067,6 +1067,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # from the reasoning/final-answer main-chat send path. Not persisted: a fresh process
         # just creates a new thread on the next tool call, which is fine (#discord-thread-split).
         self._tool_progress_threads: Dict[str, Any] = {}
+        # Set by the runner via set_voice_auto_join_handler (discord.auto_join_voice) --
+        # async (adapter, member, channel) -> None. None until wired, and always None on
+        # platforms/tests that never call the setter.
+        self._voice_auto_join_handler: Optional[Any] = None
         # Persistent typing loops per channel (DMs don't reliably show bot typing events).
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._bot_task: Optional[asyncio.Task] = None
@@ -1334,7 +1338,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
-                """Track voice channel join/leave events."""
+                """Track voice channel join/leave events; auto-join a real human's channel first
+                when discord.auto_join_voice is on and the bot isn't already connected there."""
+                auto_join_channel = adapter_self._voice_auto_join_target(member, before, after)
+                if auto_join_channel is not None:
+                    try:
+                        await adapter_self._voice_auto_join_handler(adapter_self, member, auto_join_channel)
+                    except Exception as e:
+                        logger.warning("[%s] voice auto-join handler failed: %s", adapter_self.name, e)
                 bot_guild_ids = set(adapter_self._voice_clients.keys())
                 if not bot_guild_ids:
                     return
@@ -5361,6 +5372,38 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         the main channel stays readable while the detail is still one click away. Default off:
         nothing changes for a channel/profile that hasn't opted in."""
         return self._extra_or_env_flag("thread_tool_calls", "DISCORD_THREAD_TOOL_CALLS", "false", truthy=True)
+
+    def _discord_auto_join_voice_enabled(self) -> bool:
+        """Tony, 2026-09-22: "make it so it automatically works when I join the voice channel" --
+        join Jarvis into a real human's voice channel the moment they enter one, no /voice join
+        needed. Default off: a bot silently following every human into voice would be a real
+        surprise for anyone who hasn't opted in."""
+        return self._extra_or_env_flag("auto_join_voice", "DISCORD_AUTO_JOIN_VOICE", "false", truthy=True)
+
+    def set_voice_auto_join_handler(self, handler) -> None:
+        """Wired by the runner (gateway/run_adapters.py) to GatewayRunner._handle_voice_auto_join --
+        async (adapter, member, channel) -> None. Kept as a plain setter (matching
+        set_message_handler et al.) rather than importing gateway.run_voice here, which would be
+        a plugin-layer -> gateway-layer import cycle."""
+        self._voice_auto_join_handler = handler
+
+    def _voice_auto_join_target(self, member, before, after) -> Optional[Any]:
+        """Return the channel to auto-join for this voice-state-update, or None. Split out of
+        on_voice_state_update's closure so the decision itself is unit-testable without a live
+        discord.py client (the closure can only be exercised through a real _connect())."""
+        joined_channel = after.channel if before.channel is None and after.channel is not None else None
+        if joined_channel is None:
+            return None
+        if getattr(member, "bot", False):
+            return None
+        if self._voice_auto_join_handler is None:
+            return None
+        if not self._discord_auto_join_voice_enabled():
+            return None
+        existing = self._voice_clients.get(joined_channel.guild.id)
+        if existing and existing.is_connected():
+            return None
+        return joined_channel
 
     async def _get_or_create_tool_progress_thread(self, chat_id: str, event_message_id: Optional[str]) -> Optional[Any]:
         """Lazily create (once per turn, cached by event_message_id) the thread tool-call progress
