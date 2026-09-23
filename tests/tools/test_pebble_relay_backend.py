@@ -175,3 +175,16 @@ class TestPebbleRelayBackend:
             result = backend.wait(0.01)
         mock_open.assert_not_called()
         assert result.ok is True
+
+
+class TestNewBackendWiring:
+    """HERMES_COMPUTER_USE_BACKEND=pebble must actually select this class (tools/computer_use/
+    tool.py:_new_backend) -- the whole point of the relay is reachability from the live gateway,
+    so a typo'd or dropped wire-up here would silently fall through to the local cua-driver."""
+
+    def test_backend_env_var_pebble_selects_pebble_relay_backend(self, monkeypatch):
+        from tools.computer_use import tool as cu_tool
+
+        monkeypatch.setenv("HERMES_COMPUTER_USE_BACKEND", "pebble")
+        backend = cu_tool._new_backend("standard")
+        assert isinstance(backend, PebbleRelayBackend)

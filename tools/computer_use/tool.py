@@ -161,6 +161,12 @@ def _new_backend(permission_mode: str) -> ComputerUseBackend:
     if backend_name in {"cua", "cua-driver", ""}:
         from tools.computer_use.cua_backend import CuaDriverBackend
         return CuaDriverBackend(permission_mode=permission_mode)
+    if backend_name == "pebble":
+        # Tony, 2026-09-23: WSL gateway -> real Windows desktop bridge, since the local
+        # cua-driver this branch's sibling spawns only ever reaches WSL's own virtual
+        # desktop. See tools/computer_use/pebble_relay_backend.py's own module docstring.
+        from tools.computer_use.pebble_relay_backend import PebbleRelayBackend
+        return PebbleRelayBackend()
     if backend_name != "noop":
         raise RuntimeError(f"Unknown HERMES_COMPUTER_USE_BACKEND={backend_name!r}")
     return _NoopBackend()  # pragma: no cover

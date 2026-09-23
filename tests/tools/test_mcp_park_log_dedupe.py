@@ -12,7 +12,9 @@ outage warns again.
 """
 
 import asyncio
+import json
 import logging
+from unittest.mock import patch
 
 import pytest
 
@@ -154,3 +156,52 @@ def test_park_for_a_different_reason_warns_again(caplog):
         task._log_park("MCP server '%s' parked: %s", "t", "OAuthError: token revoked")
     assert [r.levelno for r in caplog.records] == [
         logging.WARNING, logging.DEBUG, logging.WARNING, logging.DEBUG]
+
+
+class TestAuthParkNotification:
+    """Tony, 2026-09-23: "keeps on asking me to reauthenticate for todoist mcp" — an auth park
+    was previously WARNING-logged only, so he never found out until he happened to hit that
+    server and got a vague failure, sometimes days later. A NEW auth-related park now also
+    sends a one-shot direct notification (``_log_park(..., is_auth=True)``)."""
+
+    def test_new_auth_park_sends_one_notification(self, caplog):
+        task = MCPServerTask("todoist")
+        with patch("tools.send_message_tool.send_message_tool",
+                   return_value=json.dumps({"success": True})) as mock_send:
+            with caplog.at_level(logging.DEBUG, logger="tools.mcp_tool"):
+                task._log_park("MCP server '%s' parked: %s", "todoist", "OAuthError: token revoked",
+                               is_auth=True)
+        mock_send.assert_called_once()
+        sent_args = mock_send.call_args[0][0]
+        assert sent_args["target"] == "discord"
+        assert "todoist" in sent_args["message"]
+        assert "hermes mcp login todoist" in sent_args["message"]
+
+    def test_repeated_identical_auth_park_does_not_renotify(self, caplog):
+        task = MCPServerTask("todoist")
+        with patch("tools.send_message_tool.send_message_tool",
+                   return_value=json.dumps({"success": True})) as mock_send:
+            with caplog.at_level(logging.DEBUG, logger="tools.mcp_tool"):
+                task._log_park("MCP server '%s' parked: %s", "todoist", "OAuthError: token revoked",
+                               is_auth=True)
+                task._was_parked = True  # _park() latches this on the first park
+                task._log_park("MCP server '%s' parked: %s", "todoist", "OAuthError: token revoked",
+                               is_auth=True)
+        mock_send.assert_called_once()
+
+    def test_non_auth_park_never_notifies(self, caplog):
+        task = MCPServerTask("blender")
+        with patch("tools.send_message_tool.send_message_tool") as mock_send:
+            with caplog.at_level(logging.DEBUG, logger="tools.mcp_tool"):
+                task._log_park("MCP server '%s' parked: %s", "blender", "ConnectionError: refused",
+                               is_auth=False)
+        mock_send.assert_not_called()
+
+    def test_notification_failure_does_not_raise_or_block_the_park(self, caplog):
+        task = MCPServerTask("todoist")
+        with patch("tools.send_message_tool.send_message_tool", side_effect=RuntimeError("no channel")):
+            with caplog.at_level(logging.DEBUG, logger="tools.mcp_tool"):
+                task._log_park("MCP server '%s' parked: %s", "todoist", "OAuthError: token revoked",
+                               is_auth=True)
+        parks = [r for r in caplog.records if "parked" in r.getMessage()]
+        assert any(r.levelno >= logging.WARNING for r in parks)
