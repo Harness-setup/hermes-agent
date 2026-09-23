@@ -183,12 +183,36 @@ def mcp_prefixed_tool_name(server_name: str, tool_name: str) -> str:
     return full_name[:_MCP_TOOL_NAME_MAX_LENGTH - len(suffix)] + suffix
 
 
+# The raw cua-driver MCP server (config key ``cua-driver``, see ~/.hermes/config.yaml
+# mcp_servers.cua-driver) always talks to whichever machine the calling agent process itself
+# runs on -- never a remote target computer_use's own backend selection (e.g.
+# HERMES_COMPUTER_USE_BACKEND=pebble) can point elsewhere. SOUL.md already carries this as
+# system-prompt guidance, but that's prose the model has to recall and weigh against every other
+# instruction; confirmed live 2026-09-23 (session 20260923_132308_a03791, qwen/qwen3.5-9b
+# oneshot, local-fallback model after Anthropic credits ran out): asked explicitly for
+# `computer_use list_apps`, it picked `mcp__cua_driver__list_windows` instead and queried WSL's
+# own desktop (0 windows) -- the same tool-confusion SOUL.md was written to prevent, surviving
+# through to a live tool call anyway. Folding the same warning into the description ITSELF is a
+# stronger signal: it rides along on every single request as part of the tool's own schema,
+# right next to the two tools' near-identical names, rather than being one paragraph among many
+# in the system prompt. Purely additive (a longer description), never hides or disables the tool.
+_REMOTE_TARGETED_MCP_SERVERS = {"cua-driver"}
+_REMOTE_TARGETED_MCP_DESCRIPTION_PREFIX = (
+    "[Prefer the `computer_use` tool for screen/app automation instead of this one -- this raw "
+    "driver always controls the LOCAL machine the agent process runs on, while computer_use's own "
+    "backend can be configured to target a different, real machine.] "
+)
+
+
 def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     """Convert an MCP ``Tool`` (``.input_schema``, or ``.inputSchema`` before mcp 2.0) to a
     ``registry.register(schema=...)`` dict."""
+    description = strip_unicode_tags(mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}")
+    if server_name in _REMOTE_TARGETED_MCP_SERVERS:
+        description = _REMOTE_TARGETED_MCP_DESCRIPTION_PREFIX + description
     return {
         "name": mcp_prefixed_tool_name(server_name, mcp_tool.name),
-        "description": strip_unicode_tags(mcp_tool.description or f"MCP tool {mcp_tool.name} from {server_name}"),
+        "description": description,
         "parameters": _normalize_mcp_input_schema(mcp_field(mcp_tool, "input_schema", "inputSchema")),
     }
 
