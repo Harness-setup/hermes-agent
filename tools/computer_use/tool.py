@@ -718,6 +718,19 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
                       session_id: Optional[str] = None) -> Any:
     v = _capture_view(cap, max_elements)
     lines = _capture_summary_lines(v)
+    # Tony, 2026-09-22: the CDP browser tools already detect+annotate a Windows Family Safety
+    # redirect (tools/browser_cdp_tool.py's _contains_family_safety_redirect) but computer_use
+    # drives the OS window via screenshots/AX-tree, not CDP, so it never saw that signature at
+    # all -- if the AX walk captured the address bar (or any visible element) showing the
+    # redirect URL, this surfaces it. Appended to `lines` (not just a local `summary` string)
+    # because the plain-text capture path below rebuilds its own payload straight from `lines`,
+    # not from the `summary` variable the multimodal/aux-vision paths use -- both need it.
+    try:
+        from tools.browser_cdp_tool import _FAMILY_SAFETY_BLOCK_RE, _FAMILY_SAFETY_NOTICE
+        if _FAMILY_SAFETY_BLOCK_RE.search("\n".join(lines)):
+            lines.append(f"\n[FAMILY SAFETY BLOCK DETECTED] {_FAMILY_SAFETY_NOTICE}")
+    except Exception:
+        logger.debug("Family Safety scan failed", exc_info=True)
     summary, extra = "\n".join(lines), None  # multimodal/aux paths use this; text paths append notes and rebuild
     if v.has_image and session_id and _screenshot_dedup_check(
             _scoped_sid(session_id), _capture_digest(cap), (str(cap.app or ""), str(cap.window_title or ""))):
