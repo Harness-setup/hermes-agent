@@ -256,6 +256,27 @@ async def _cdp_call(ws_url: str, method: str, params: Dict[str, Any], target_id:
         return msg.get("result", {})
 
 
+async def _poll_created_target_url(ws_url: str, target_id: str, timeout: float) -> Optional[str]:
+    """Where *target_id* actually landed shortly after ``Target.createTarget``, or None on any failure.
+
+    Tony, 2026-09-23: ``Target.createTarget``'s own response is just ``{"targetId": ...}`` -- the
+    navigation it kicks off is asynchronous, so nothing in that response reflects where the new tab
+    actually ends up. Confirmed live: asked to open a site that Windows Family Safety blocks, the
+    createTarget call itself "succeeded" with no hint of the redirect, and the agent reported the
+    page as loaded -- a false claim, not just a missed detection, since _annotate_family_safety_block
+    only ever sees this call's own immediate result. A brief wait plus one follow-up
+    Target.getTargetInfo call gives the redirect (which happens fast, if it happens at all) time to
+    land before the caller decides what to report. Best-effort: any failure here must never break
+    the createTarget call that already succeeded."""
+    await asyncio.sleep(0.6)
+    try:
+        info = await _cdp_call(ws_url, "Target.getTargetInfo", {"targetId": target_id}, None, timeout)
+        return info.get("targetInfo", {}).get("url")
+    except Exception:
+        logger.debug("browser_cdp: post-createTarget landed-url poll failed", exc_info=True)
+        return None
+
+
 def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params: Optional[Dict[str, Any]],
                                 timeout: float) -> str:
     """Route a CDP call through the live supervisor session for an OOPIF frame."""
@@ -362,6 +383,17 @@ def browser_cdp(method: str, params: Optional[Dict[str, Any]] = None, target_id:
     except Exception as exc:  # pragma: no cover — unexpected
         logger.exception("browser_cdp unexpected error")
         return tool_error(f"Unexpected error: {type(exc).__name__}: {exc}", method=method)
+
+    # Target.createTarget's own response never reflects the async navigation it kicks off (see
+    # _poll_created_target_url's docstring) -- without this, a redirect there is invisible to both
+    # the family-safety scan below and to whatever the caller ends up telling the user.
+    if method == "Target.createTarget" and isinstance(result, dict) and result.get("targetId"):
+        try:
+            landed_url = _run_async(_poll_created_target_url(endpoint, result["targetId"], safe_timeout))
+            if landed_url:
+                result["landed_url"] = landed_url
+        except Exception:
+            logger.debug("browser_cdp: landed-url poll raised", exc_info=True)
 
     payload: Dict[str, Any] = {"success": True, "method": method, "result": _redact_cdp_output(
         result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
