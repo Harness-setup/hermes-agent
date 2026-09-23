@@ -1048,6 +1048,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
         # Threads the bot participated in (no @mention needed there); persisted across restarts.
         self._threads = ThreadParticipationTracker("discord")
+        # Lazily-created per-turn thread that tool-call progress lines get routed into when
+        # discord.thread_tool_calls is on -- keyed by the triggering event_message_id, separate
+        # from the reasoning/final-answer main-chat send path. Not persisted: a fresh process
+        # just creates a new thread on the next tool call, which is fine (#discord-thread-split).
+        self._tool_progress_threads: Dict[str, Any] = {}
         # Persistent typing loops per channel (DMs don't reliably show bot typing events).
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._bot_task: Optional[asyncio.Task] = None
@@ -5091,6 +5096,60 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             self.name, last_direct_error, last_fallback_error,
         )
         return None
+
+    def _discord_thread_tool_calls_enabled(self) -> bool:
+        """Tony, 2026-09-22: split tool-call/reasoning display -- reasoning and the final answer
+        stay in the main channel (unchanged), tool-call progress lines go to a thread instead, so
+        the main channel stays readable while the detail is still one click away. Default off:
+        nothing changes for a channel/profile that hasn't opted in."""
+        return self._extra_or_env_flag("thread_tool_calls", "DISCORD_THREAD_TOOL_CALLS", "false", truthy=True)
+
+    async def _get_or_create_tool_progress_thread(self, chat_id: str, event_message_id: Optional[str]) -> Optional[Any]:
+        """Lazily create (once per turn, cached by event_message_id) the thread tool-call progress
+        lines land in. Mirrors _auto_create_thread's retry/fallback shape, but starts from a fetched
+        message (chat_id + event_message_id) rather than a live gateway event's Message object,
+        since the progress pipeline only carries IDs, not the discord.py object."""
+        if not event_message_id:
+            return None
+        cached = self._tool_progress_threads.get(event_message_id)
+        if cached is not None:
+            return cached
+        try:
+            channel = await self._resolve_channel(chat_id)
+            if channel is None:
+                return None
+            seed_msg = await channel.fetch_message(int(event_message_id))
+        except Exception as e:
+            logger.debug("[%s] tool-progress thread: couldn't fetch seed message %s: %s", self.name, event_message_id, e)
+            return None
+        thread_name = f"\U0001f6e0️ {self._derive_auto_thread_name(seed_msg.content or '')}"
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                thread = await seed_msg.create_thread(name=thread_name, auto_archive_duration=60)
+                self._tool_progress_threads[event_message_id] = thread
+                return thread
+            except Exception as e:
+                last_error = e
+                if attempt == 0:
+                    await asyncio.sleep(0.75)
+        logger.warning("[%s] tool-progress thread creation failed: %s", self.name, last_error)
+        return None
+
+    async def send_tool_progress_line(self, chat_id: str, event_message_id: Optional[str], text: str) -> None:
+        """Send one tool-call progress line into the lazily-created tool-progress thread instead of
+        the main channel. Best-effort/fire-and-forget (called via _schedule from a sync callback,
+        same as play_ack_in_voice) -- a failure here must never break the turn or fall back to
+        posting the line in the main channel, since that would defeat the whole point of the split."""
+        try:
+            thread = await self._get_or_create_tool_progress_thread(chat_id, event_message_id)
+            if thread is None:
+                return
+            formatted = self.format_message(text)
+            for chunk in self._cap_split_chunks(self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)):
+                await thread.send(content=chunk)
+        except Exception as e:
+            logger.debug("[%s] tool-progress thread send failed: %s", self.name, e)
 
     async def rename_thread(
         self, thread_id: str, name: str, *, only_if_current_name: Optional[str] = None,
