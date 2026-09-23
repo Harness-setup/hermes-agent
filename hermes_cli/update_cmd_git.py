@@ -97,6 +97,42 @@ def _branch_head_suffix(git_cmd=None, cwd=None) -> str:
     return f" [{label}]" if label else ""
 
 
+def _maybe_auto_commit_pending_changes(git_cmd: list[str], cwd: Path) -> None:
+    """updates.auto_commit_pending_changes (default False): Tony, 2026-09-22 -- "how can I make
+    it so that when I press the update button it will [auto-commit + reconcile]". The parked-
+    branch guard right below this treats ANY uncommitted change as unsafe-to-touch ("dirty"),
+    by design (see its own docstring) -- correct, since a real crash mid-autostash could lose
+    work. But this checkout is under continuous live development, so the tree is realistically
+    ALWAYS dirty at the moment someone presses Update, which meant the auto-switch-then-
+    reconcile pipeline (reconcile-local-fixes.ps1/.sh, invoked after a successful update) never
+    got a real chance to run -- not broken, just never reached.
+
+    Committing (never stashing) is what makes this safe to automate: a plain commit rides along
+    through the switch/reconcile path exactly like any other local-fixes commit already does --
+    there is nothing special left "in flight" the way an autostash entry would be. Opt-in and
+    off by default: this changes what lands in git history on every update, which is a real
+    enough behavior change that it must be a deliberate choice, not a surprise."""
+    try:
+        from hermes_cli.config import load_config
+        _update_cfg = (load_config() or {}).get("updates", {})
+        if not (isinstance(_update_cfg, dict) and bool(_update_cfg.get("auto_commit_pending_changes", False))):
+            return
+    except Exception as exc:
+        logger.debug("Could not read updates.auto_commit_pending_changes: %s", exc)
+        return
+    from hermes_cli.update_cmd import _git_run
+    status = _git_run(git_cmd, ["status", "--porcelain"], cwd)
+    if status.returncode != 0 or not status.stdout.strip():
+        return  # clean, or unverifiable -- the dirty check right after this call handles either correctly
+    _git_run(git_cmd, ["add", "-A"], cwd)
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    commit = _git_run(git_cmd, ["commit", "-m", f"chore(auto): auto-commit pending changes before update ({ts})"], cwd)
+    if commit.returncode != 0:
+        logger.warning("auto_commit_pending_changes: commit failed, falling through to the normal dirty-tree skip: %s",
+                        commit.stderr)
+
+
 def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: str, target_branch: str) -> tuple[bool, str]:
     """Decide whether a parked feature branch may be auto-switched back to the update target.
 
@@ -115,6 +151,7 @@ def _assess_parked_branch_switch(git_cmd: list[str], cwd: Path, current_branch: 
             return False, "disabled"
     except Exception as exc:
         logger.debug("Could not read updates.auto_switch_parked_branch: %s", exc)
+    _maybe_auto_commit_pending_changes(git_cmd, cwd)
     status = _git_run(git_cmd, ["status", "--porcelain"], cwd)
     if status.returncode != 0:
         return False, "unverifiable"
