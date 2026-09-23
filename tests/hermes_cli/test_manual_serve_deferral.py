@@ -9,7 +9,9 @@ from hermes_cli import process_identity
 from hermes_cli import update_cmd_fleet as fleet
 from hermes_cli import update_receipt
 from hermes_cli.update_inventory import RuntimeRecord, UpdatePlan
-from hermes_cli.update_serve_obligations import defer_manual_serve, retain_receipt_manual_serves, warn_pending_manual_serves
+from hermes_cli.update_serve_obligations import (
+    clear_manual_restart_obligation, defer_manual_serve, pending_manual_restart_record,
+    retain_receipt_manual_serves, warn_pending_manual_serves)
 from hermes_constants import get_hermes_home
 
 
@@ -213,6 +215,54 @@ def test_unreadable_create_time_warning_names_identity_not_storage(monkeypatch, 
     assert "could not read the process creation time" in out
     assert "storage permissions" not in out
     assert "relaunch" in out
+
+
+def test_pending_manual_restart_record_finds_the_matching_pid(monkeypatch):
+    """The lookup the "already running" attach path uses (see main_dashboard.py's
+    _attach_to_host_backend) to decide whether to kill+relaunch instead of quietly attaching."""
+    monkeypatch.setattr(process_identity, "_pid_alive_matches", lambda *a: True)
+    runtime = asdict(RuntimeRecord(
+        kind="dashboard", profile="default", pid=901, supervisor="manual-serve",
+        restart_via="respawn-argv", detail={"create_time": 1234.5}))
+    assert defer_manual_serve(runtime) is True
+
+    record = pending_manual_restart_record(901)
+    assert record is not None
+    assert record["pid"] == 901
+    assert record["kind"] == "dashboard"
+    assert record["_obligation_path"]
+    # A different pid, or one with no obligation at all, must never match.
+    assert pending_manual_restart_record(902) is None
+
+
+def test_pending_manual_restart_record_prunes_a_dead_pid(monkeypatch):
+    """A pid whose obligation is on disk but is now provably dead is pruned on read, same as
+    warn_pending_manual_serves already does when it walks this same directory."""
+    monkeypatch.setattr(process_identity, "_pid_alive_matches", lambda *a: True)
+    runtime = asdict(RuntimeRecord(
+        kind="serve", profile="default", pid=903, supervisor="manual-serve",
+        restart_via="respawn-argv", detail={"create_time": 1234.5}))
+    assert defer_manual_serve(runtime) is True
+    directory = get_hermes_home() / "serve_restart_pending"
+    assert list(directory.glob("*.json"))
+
+    monkeypatch.setattr(process_identity, "_pid_alive_matches", lambda *a: False)
+    assert pending_manual_restart_record(903) is None
+    assert list(directory.glob("*.json")) == []
+
+
+def test_clear_manual_restart_obligation_removes_the_file(monkeypatch):
+    monkeypatch.setattr(process_identity, "_pid_alive_matches", lambda *a: True)
+    runtime = asdict(RuntimeRecord(
+        kind="dashboard", profile="default", pid=904, supervisor="manual-serve",
+        restart_via="respawn-argv", detail={"create_time": 1234.5}))
+    assert defer_manual_serve(runtime) is True
+    record = pending_manual_restart_record(904)
+
+    clear_manual_restart_obligation(record)
+
+    assert list((get_hermes_home() / "serve_restart_pending").glob("*.json")) == []
+    assert pending_manual_restart_record(904) is None
 
 
 def test_launchd_serve_row_never_pessimize_gateway_coverage():
