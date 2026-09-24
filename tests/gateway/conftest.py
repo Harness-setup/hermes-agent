@@ -228,6 +228,16 @@ def _ensure_discord_mock() -> None:
             return self
     discord_mod.Embed = _FakeEmbed
 
+    # Forbidden: a real Exception subclass, not a bare MagicMock attribute -- `except
+    # discord.Forbidden:` in production code raises TypeError ("catching classes that do not
+    # inherit from BaseException") against an unset MagicMock attribute. The real class's
+    # constructor needs a response object with .status/.reason; tests raising/catching this only
+    # need isinstance compatibility, so accept anything.
+    class _FakeForbidden(Exception):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args)
+    discord_mod.Forbidden = _FakeForbidden
+
     # ui.View / ui.Select / ui.Button: real classes (not MagicMock) so
     # tests that subclass ModelPickerView / iterate .children / clear
     # items work.

@@ -146,7 +146,16 @@ class TurnRunner:
         if event_type == "_thinking" or tool_name == "_thinking":
             thinking_text = (preview if tool_name == "_thinking" else tool_name) if ctx._thinking_enabled else None
             if thinking_text:
-                ctx.progress_queue.put(f"💬 {thinking_text}")
+                rendered = f"💬 {thinking_text}"
+                # Tony, 2026-09-23: "it should only show the message in main message in the main
+                # chat and show tool use and reasoning in threads, we have built this but it not
+                # working" -- the ORIGINAL discord.thread_tool_calls design (see
+                # _send_to_tool_thread's own docstring) deliberately kept reasoning in the main
+                # channel and only routed tool-call progress lines to the thread. That's not what
+                # he actually wants: reasoning goes to the SAME thread now, same opt-in flag, main
+                # channel left with only the final answer.
+                if not self._send_to_tool_thread(rendered):
+                    ctx.progress_queue.put(rendered)
             return
         # Native task cards consume the ID-bearing tool_start/tool_complete callbacks instead;
         # name-correlated text events would duplicate cards and mispair concurrent same-tool calls.
@@ -300,12 +309,12 @@ class TurnRunner:
         return f"{emoji} {verb}" if verb_drops_preview(tool_name) else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
 
     def _send_to_tool_thread(self, text: str) -> bool:
-        """Discord's discord.thread_tool_calls opt-in: tool-call progress lines go to a lazily-
-        created thread instead of the shared progress_queue, so the main channel only ever shows
-        reasoning (_thinking, handled earlier in progress_callback -- unaffected by this) and the
-        final answer. Returns True when handled (caller must not also queue/native-render it);
-        False falls through to the existing behavior unchanged (every other platform, or Discord
-        with the flag off, is untouched by this)."""
+        """Discord's discord.thread_tool_calls opt-in: tool-call progress lines AND reasoning
+        (_thinking, routed here too as of 2026-09-23 -- see progress_callback's own comment) go to
+        a lazily-created thread instead of the shared progress_queue, so the main channel only
+        ever shows the final answer. Returns True when handled (caller must not also queue/
+        native-render it); False falls through to the existing behavior unchanged (every other
+        platform, or Discord with the flag off, is untouched by this)."""
         ctx = self._ctx
         if ctx.source.platform != Platform.DISCORD:
             return False

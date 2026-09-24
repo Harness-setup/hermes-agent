@@ -5361,15 +5361,43 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     await channel.delete_messages([_DiscordObject(id=int(mid)) for mid in message_ids])
                     deleted += len(message_ids)
                     bulk_failed_ids = []
+                except discord.Forbidden:
+                    # Caught separately below per-message (bulk Forbidden doesn't tell us WHICH
+                    # id it was for), but this path is common enough (bulk delete needs the same
+                    # Manage Messages permission as an individual delete) to skip the DEBUG-level
+                    # "fell back to individual" noise for the expected-permission-failure case.
+                    pass
                 except Exception as e:
                     logger.debug("[%s] uncensored cleanup: bulk delete fell back to individual deletes: %s", self.name, e)
+            permission_denied = 0
             for mid in bulk_failed_ids:
                 try:
                     msg = await channel.fetch_message(int(mid))
                     await msg.delete()
                     deleted += 1
+                except discord.Forbidden:
+                    # Root-caused live 2026-09-23 (Tony: "discord uncensored mode only gets rid
+                    # of the agent message"): Discord requires the Manage Messages permission to
+                    # delete anyone ELSE's message in a channel -- a bot can always delete its
+                    # OWN messages without it. The Jarvis role had no Manage Messages grant, so
+                    # every attempt to delete TONY's own tracked prompts (never the bot's own
+                    # replies) failed silently at DEBUG level -- exactly the asymmetric "only the
+                    # agent message" symptom, invisible without deliberately checking Discord's
+                    # permission API directly the way this was actually diagnosed. Surfaced at
+                    # WARNING now, once per sweep (not once per message), with the exact fix.
+                    permission_denied += 1
                 except Exception as e:
                     logger.debug("[%s] uncensored cleanup: could not delete message %s: %s", self.name, mid, e)
+            if permission_denied:
+                logger.warning(
+                    "[%s] uncensored cleanup: %d message(s) in channel %s could NOT be deleted -- "
+                    "the bot's Discord role is missing the 'Manage Messages' permission, which is "
+                    "required to delete anyone else's message (it can always delete its own). "
+                    "Grant 'Manage Messages' to the bot's role in Discord server settings to fix "
+                    "this for real; until then, no-trace cleanup only ever removes the bot's own "
+                    "replies, never the prompts that triggered them.",
+                    self.name, permission_denied, channel_id,
+                )
         if deleted:
             logger.info("[%s] Uncensored mode ended — deleted %d message(s) (no-trace cleanup)", self.name, deleted)
 

@@ -231,3 +231,79 @@ class TestSweepAndDelete:
         _set_kind(monkeypatch, "cloud")
         result = await adapter._uncensored_messages.maybe_sweep()
         assert result == [{"channel_id": "111", "message_id": "444"}]
+
+    @pytest.mark.asyncio
+    async def test_permission_denied_delete_is_surfaced_as_a_warning(self, monkeypatch, tmp_path, caplog):
+        """Root-caused live 2026-09-23 (Tony: "discord uncensored mode only gets rid of the
+        agent message"): Discord requires Manage Messages to delete anyone else's message; a bot
+        can always delete its own. Without that permission, every delete of TONY's own tracked
+        prompt failed -- silently, at DEBUG, indistinguishable from any other transient error.
+        This must now surface at WARNING with the actionable fix, not vanish."""
+        import discord as discord_module
+
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        _set_kind(monkeypatch, "uncensored")
+        await adapter._track_if_uncensored("111", "222")
+
+        channel = MagicMock()
+        channel.fetch_message = AsyncMock(return_value=AsyncMock(
+            delete=AsyncMock(side_effect=discord_module.Forbidden(
+                MagicMock(status=403, reason="Forbidden"), "Missing Permissions"
+            ))
+        ))
+        adapter._resolve_channel = AsyncMock(return_value=channel)
+
+        _set_kind(monkeypatch, "cloud")
+        with caplog.at_level("WARNING", logger="hermes_plugins.platforms__discord.adapter"):
+            await adapter._sweep_uncensored_messages_if_needed()
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "Manage Messages" in warnings[0].getMessage()
+        assert "1 message" in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_permission_denied_bulk_delete_falls_back_and_still_warns(self, monkeypatch, tmp_path, caplog):
+        """A Forbidden bulk delete (>=2 messages) must fall back to individual deletes -- which
+        then also fail Forbidden for the same reason -- and still produce exactly one summary
+        warning, not one per message and not silence."""
+        import discord as discord_module
+
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        _set_kind(monkeypatch, "uncensored")
+        await adapter._track_if_uncensored("111", "222")
+        await adapter._track_if_uncensored("111", "223")
+
+        forbidden = discord_module.Forbidden(MagicMock(status=403, reason="Forbidden"), "Missing Permissions")
+        channel = MagicMock()
+        channel.delete_messages = AsyncMock(side_effect=forbidden)
+        channel.fetch_message = AsyncMock(return_value=AsyncMock(delete=AsyncMock(side_effect=forbidden)))
+        adapter._resolve_channel = AsyncMock(return_value=channel)
+
+        _set_kind(monkeypatch, "cloud")
+        with caplog.at_level("WARNING", logger="hermes_plugins.platforms__discord.adapter"):
+            await adapter._sweep_uncensored_messages_if_needed()
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "2 message" in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_non_permission_delete_failure_still_stays_at_debug_no_warning(self, monkeypatch, tmp_path, caplog):
+        """Only a genuine Forbidden (missing permission) escalates to WARNING -- an ordinary
+        transient failure (already deleted, rate limited, etc.) keeps the existing best-effort
+        DEBUG-only handling, unchanged."""
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        _set_kind(monkeypatch, "uncensored")
+        await adapter._track_if_uncensored("111", "222")
+
+        channel = MagicMock()
+        channel.fetch_message = AsyncMock(side_effect=RuntimeError("message already deleted"))
+        adapter._resolve_channel = AsyncMock(return_value=channel)
+
+        _set_kind(monkeypatch, "cloud")
+        with caplog.at_level("WARNING", logger="hermes_plugins.platforms__discord.adapter"):
+            await adapter._sweep_uncensored_messages_if_needed()
+
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert warnings == []
