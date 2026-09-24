@@ -783,6 +783,30 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
         print(
             f"  ⚠ Checkout is on custom branch '{_cur_branch}' — "
             f"merging origin/{branch} instead of resetting so local commits survive...")
+        # A plain `git merge` fails closed with "refusing to merge unrelated histories" when
+        # origin/<branch> shares NO common ancestor with the local checkout -- an upstream
+        # history rewrite (a squash, a repo re-init), not a normal set of new commits to
+        # reconcile. Confirmed live 2026-09-23: this repo's real upstream did exactly that,
+        # and every `hermes update` attempt that night failed identically because nothing about
+        # a plain retry changes an unrelated-histories situation. The OLD code here treated
+        # this the same as an ordinary content conflict and told the user to run `git merge
+        # origin/<branch>` by hand -- which fails the exact same way for them too, so "resolve
+        # manually" was actively misleading. Detect it up front and say what's actually true
+        # instead of attempting a doomed merge and guessing at the reason from a generic abort.
+        if _git_run(git_cmd, ["merge-base", "HEAD", f"origin/{branch}"]).returncode != 0:
+            print(
+                f"✗ origin/{branch} shares no common history with this checkout anymore — "
+                f"the upstream branch was rewritten (a squash or repo re-init), not just "
+                f"advanced with new commits. A normal merge can never succeed here; retrying "
+                f"this update will keep failing identically. Update stopped, nothing was changed."
+            )
+            print(
+                f"  This needs a deliberate decision, not an automatic merge: either adopt "
+                f"origin/{branch}'s new history (discarding the link to your current commit "
+                f"graph) or keep developing on your own fork/backup remote and stop tracking "
+                f"origin/{branch} for updates. Local work is untouched either way."
+            )
+            sys.exit(1)
         # Best-effort safety tag as a recovery anchor.
         _git_run(git_cmd, ["tag", f"pre-update-{_time.strftime('%Y%m%d-%H%M%S')}"])
         if _git_run(git_cmd, ["merge", "--no-edit", f"origin/{branch}"]).returncode != 0:
