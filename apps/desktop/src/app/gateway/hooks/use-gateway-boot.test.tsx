@@ -2326,19 +2326,69 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     render(<Harness />)
     await flushAsync()
 
-    // Exhaust the bounded retry budget (5 attempts, ≤15s jittered delay each).
-    for (let i = 0; i < 7; i += 1) {
-      await advanceBackoff()
-    }
+    // Exhaust the bounded retry budget (9 attempts, ≤60s jittered delay each --
+    // worst-case cumulative sum ~302s; see BOOT_RETRY_MAX_ATTEMPTS's own
+    // comment for the real cold-boot data this budget is sized against).
+    // A single large advance reliably cascades through the whole chain (fake
+    // timers process each newly-scheduled retry timer as it comes due within
+    // the advanced window), same mechanism advanceBackoff() relies on for one
+    // step, just sized to cover all of them at once with margin.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(320_000)
+    })
 
-    // 1 initial + 5 bounded retries; the loop then STOPS retrying and the
+    // 1 initial + 9 bounded retries; the loop then STOPS retrying and the
     // terminal boot error surfaces the real recovery affordance.
-    expect(desktop.getConnection).toHaveBeenCalledTimes(6)
+    expect(desktop.getConnection).toHaveBeenCalledTimes(10)
     expect($desktopBoot.get().error).toBeTruthy()
 
     // No further attempts after the budget is spent — bounded, not infinite.
     await advanceBackoff()
-    expect(desktop.getConnection).toHaveBeenCalledTimes(6)
+    expect(desktop.getConnection).toHaveBeenCalledTimes(10)
+  })
+
+  it('a cold-boot-length outage (more failures than the OLD 5-attempt budget) still self-heals under the new budget', async () => {
+    // Regression for a real cold boot (2026-09-23): WSL/SSH took 163s to
+    // become reachable after Windows login -- the OLD budget (5 attempts,
+    // ~44s worst case) gave up long before that and landed on the
+    // boot-failure overlay even though a plain reopen moments later
+    // connected fine. 6 rejections exceeds the old attempt count; the boot
+    // must still recover under the new one instead of hitting the terminal
+    // failure overlay.
+    const desktop = fakeDesktop()
+    let calls = 0
+    desktop.getConnection = vi.fn(async () => {
+      calls += 1
+      if (calls <= 6) {
+        throw new Error('Could not verify the existing SSH backend.')
+      }
+      return primaryConn
+    })
+    desktop.getBootProgress = vi.fn(async () => ({
+      error: 'Could not verify the existing SSH backend.',
+      fakeMode: false,
+      message: 'Desktop boot failed: Could not verify the existing SSH backend.',
+      phase: 'backend.error',
+      progress: 24,
+      retryable: true,
+      running: false,
+      timestamp: Date.now()
+    }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    // Enough advance to cover 6 attempts' worth of delays (each ≤60s cap)
+    // with margin, well past where the OLD 5-attempt budget would already
+    // have given up (~44s).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200_000)
+    })
+
+    expect(desktop.getConnection).toHaveBeenCalledTimes(7)
+    expect($gatewayState.get()).toBe('open')
+    expect($desktopBoot.get().error).toBeNull()
   })
 
   it('a failed cold boot keeps its recovery surface while main replays cold-boot progress behind it (#112899)', async () => {

@@ -140,10 +140,31 @@ const WAKE_RECONNECT_HOLDOFF_MS = 15_000
 // and end in the real recovery affordance (the boot-failure overlay with
 // Retry / Settings), never an infinite spinner. Local failures and confirmed
 // reauth rejections never enter this loop.
-const BOOT_RETRY_MAX_ATTEMPTS = 5
+//
+// Tony, 2026-09-23: real cold-boot data, not a guess. A machine that just
+// rebooted (Hermes Desktop auto-launching at login, WSL host racing it) took
+// 163s from "launcher started" to "SSH port reachable" (the WSL-side
+// launcher's own log: several other Startup apps competing for disk/CPU at
+// once). The OLD budget here (5 attempts, 2s base, default 15s cap) tops out
+// at ~44s worst case -- nowhere close, so Desktop landed on the boot-failure
+// overlay well before WSL was actually ready, even though the failure was
+// correctly classified as retryable the whole time. Retried with a plain
+// reopen, it connected fine seconds later (WSL was already up by then) --
+// confirming the fault was purely an exhausted retry budget, not a real
+// unreachable host. New budget's worst case (~300s) matches this same file's
+// own RECONNECT_ESCALATE_AFTER_MS precedent (5 minutes, chosen because
+// "brief transport weather... self-heals in 1-3 minutes") applied to a cold
+// boot instead of a mid-session blip.
+const BOOT_RETRY_MAX_ATTEMPTS = 9
 // Base delay for boot retries. Deliberately slower than the socket reconnect
 // loop's 300ms: each attempt may rebuild an SSH master + remote dashboard.
 const BOOT_RETRY_BASE_DELAY_MS = 2_000
+// Ceiling for boot-retry backoff specifically -- higher than
+// reconnect-backoff.ts's own DEFAULT_CAP_MS (15s, tuned for a live socket
+// reconnect) because a cold-boot WSL/SSH host takes real minutes, not
+// seconds, to become reachable; retrying every 15s against a host that's
+// still booting is wasted churn, not faster recovery.
+const BOOT_RETRY_CAP_MS = 60_000
 
 // While any of the RECONNECT_ATTEMPT_TIMEOUT_MS-bounded awaits below is
 // pending, `reconnecting` never clears, so scheduleReconnect()/
@@ -1413,7 +1434,10 @@ export function useGatewayBoot({
           const retryable = canRetry && (stage === 'dialing' || (await bootFailureIsRetryable()))
 
           if (retryable && !cancelled) {
-            const delay = reconnectBackoffDelayMs(bootRetryAttempt, { baseDelayMs: BOOT_RETRY_BASE_DELAY_MS })
+            const delay = reconnectBackoffDelayMs(bootRetryAttempt, {
+              baseDelayMs: BOOT_RETRY_BASE_DELAY_MS,
+              capMs: BOOT_RETRY_CAP_MS
+            })
             bootRetryAttempt += 1
             bootFailed = false
             resumeDesktopBootForRetry(translateNow('boot.steps.retryingRemoteBackend'))
