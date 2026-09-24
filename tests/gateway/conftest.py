@@ -202,6 +202,14 @@ def _ensure_discord_mock() -> None:
     discord_mod.Interaction = object
     discord_mod.Message = type("Message", (), {})
 
+    # Object: accept the kwargs production code uses (id=...) -- a bare MagicMock attribute
+    # returns a MagicMock instance whose .id is ALSO a MagicMock, not the id you constructed it
+    # with, which breaks any test asserting on bulk-delete/fetch id lists built via discord.Object.
+    class _FakeObject:
+        def __init__(self, *, id=None, **_):  # noqa: A002 - matches discord API
+            self.id = id
+    discord_mod.Object = _FakeObject
+
     # Embed: accept the kwargs production code / tests use
     # (title, description, color). MagicMock auto-attributes work too,
     # but some tests construct and inspect .title/.description directly.
