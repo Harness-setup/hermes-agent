@@ -202,8 +202,17 @@ def memory_tool(action: str = None, target: str = "memory", content: str = None,
         if gate_result is not None:
             return gate_result
         return json.dumps(store.apply_batch(target, operations), ensure_ascii=False)
+    if action == "view":
+        # Real live gap, 2026-09-30: no read-only action existed at all, so
+        # a model wanting to see current entries before deciding how to
+        # consolidate (a common need once a store nears its char limit) had
+        # no valid call to make, and repeatedly called memory() with no
+        # action at all -- failing every time with "Unknown action 'None'".
+        return json.dumps({
+            "success": True, "entries": store._entries_for(target), "usage": store._usage(target),
+        }, ensure_ascii=False)
     if action not in _STORE_ACTIONS:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        return tool_error(f"Unknown action '{action}'. Use: view, add, replace, remove", success=False)
     invalid = (_validate_single_op(store, action, target, content, old_text)
                or _background_delete_gate(action, None, target, content, old_text)
                or _apply_write_gate(action, target, content, old_text))
@@ -285,7 +294,8 @@ MEMORY_SCHEMA = {
         "where it loads only when relevant; memory is injected into every turn and must "
         "stay small.\n\n"
         "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
-        "removes or shortens enough stale entries and adds the new one together.\n\n"
+        "removes or shortens enough stale entries and adds the new one together. Use action="
+        "'view' first if you need to see current entries again without attempting a write.\n\n"
         "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
         "notes (environment, conventions, tool quirks, lessons).\n\n"
         "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
@@ -297,8 +307,11 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
-                "description": "The action to perform (single-op shape). Omit when using 'operations'."
+                "enum": ["view", "add", "replace", "remove"],
+                "description": "The action to perform (single-op shape). 'view' is read-only -- "
+                "returns the current entries for 'target' without changing anything; use it "
+                "before consolidating (replace/remove) so old_text can match a real entry. "
+                "Omit when using 'operations'."
             },
             "target": {
                 "type": "string",
