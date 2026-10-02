@@ -100,3 +100,58 @@ async def test_new_command_only_clears_own_session():
     assert other_key in runner._session_reasoning_overrides
     assert session_key not in runner._pending_model_notes
     assert other_key in runner._pending_model_notes
+
+
+@pytest.mark.asyncio
+async def test_new_quiet_does_the_full_reset_but_suppresses_the_notice():
+    """``/new --quiet`` (used by the mode plugin's natural-language switch, which already
+    sent its own plain confirmation sentence) performs the identical reset as bare /new but
+    returns an empty EphemeralReply instead of the verbose header+session-info+tip notice --
+    the send path treats empty/falsy EphemeralReply text as "send nothing" (gateway/
+    platforms/base.py's _unwrap_ephemeral + the "if not text: return" send guards)."""
+    from gateway.platforms.base import EphemeralReply
+
+    runner = _make_runner()
+    session_key = build_session_key(_make_source())
+    runner._session_model_overrides[session_key] = {
+        "model": "gpt-4o", "provider": "openai", "api_key": "sk-test",
+        "base_url": "", "api_mode": "openai",
+    }
+
+    result = await runner._handle_reset_command(_make_event("/new --quiet"))
+
+    assert isinstance(result, EphemeralReply)
+    assert result.text == ""
+    # The reset itself still happened -- only the notice is suppressed.
+    assert session_key not in runner._session_model_overrides
+
+
+@pytest.mark.asyncio
+async def test_new_without_quiet_still_returns_the_verbose_notice():
+    """Bare /new (typed directly, or any other rewrite target) is unaffected by --quiet."""
+    runner = _make_runner()
+    result = await runner._handle_reset_command(_make_event("/new"))
+    assert result.text != ""
+
+
+@pytest.mark.asyncio
+async def test_explicit_quiet_kwarg_works_against_the_original_event_text():
+    """Tony, 2026-09-28: "goto local mode and tell me what this is" -- the mode plugin calls
+    this directly against the user's ORIGINAL event (text is the real message, not "/new
+    --quiet") when combining a mode switch with a real follow-up request. The explicit
+    ``quiet=True`` kwarg must produce the same suppressed notice as the "--quiet" command-arg
+    form, without needing to fake the command text first."""
+    runner = _make_runner()
+    result = await runner._handle_reset_command(
+        _make_event("go local mode and tell me what this is"), quiet=True,
+    )
+    assert result.text == ""
+
+
+@pytest.mark.asyncio
+async def test_explicit_quiet_false_overrides_a_literal_quiet_looking_title():
+    """quiet=False must win even if the command text itself happens to say "--quiet" --
+    an explicit kwarg is authoritative, never guessed from the text when passed."""
+    runner = _make_runner()
+    result = await runner._handle_reset_command(_make_event("/new --quiet"), quiet=False)
+    assert result.text != ""

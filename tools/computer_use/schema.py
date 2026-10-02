@@ -161,6 +161,14 @@ _PROPERTIES: Dict[str, Any] = {
         ),
     },
     "text": {"type": "string", "description": "Text to type (respects the current layout)."},
+    "delay_ms": {
+        "type": "integer",
+        "description": (
+            "For action='type': milliseconds between characters, 0-200 (driver default 30, "
+            "instant-ish). Raise this (e.g. 60-120) for text the user is watching live, so "
+            "typing is actually visible instead of appearing all at once."
+        ),
+    },
     "keys": {
         "type": "string",
         "description": (

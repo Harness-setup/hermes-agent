@@ -116,6 +116,24 @@ class TestMaybeSweep:
         assert tracker.is_currently_uncensored() is True
 
     @pytest.mark.asyncio
+    async def test_track_is_idempotent_for_the_same_message(self, tracker, monkeypatch):
+        """Tony, 2026-09-28: "I also want it to erase the message that I sent to switch to
+        uncensored mode." DiscordAdapter._dispatch_discord_message now calls
+        _track_if_uncensored both before and after the turn's own hooks run, so a message that
+        itself triggers the switch INTO uncensored (kind hasn't flipped yet at the first call)
+        still gets tracked by the second call. For an ordinary message already tracked by the
+        first call (kind unchanged), the second call must not append a duplicate entry."""
+        _set_kind(monkeypatch, "uncensored")
+        await tracker.maybe_sweep()
+        await tracker.track("111", "222")
+        await tracker.track("111", "222")  # same message, tracked again -- must not duplicate
+
+        _set_kind(monkeypatch, "cloud")
+        result = await tracker.maybe_sweep()
+
+        assert result == [{"channel_id": "111", "message_id": "222"}]
+
+    @pytest.mark.asyncio
     async def test_state_survives_a_fresh_instance_reading_the_same_file(self, tracker, monkeypatch, tmp_path):
         _set_kind(monkeypatch, "uncensored")
         await tracker.maybe_sweep()
@@ -212,6 +230,28 @@ class TestSweepAndDelete:
         adapter._resolve_channel.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_trigger_message_that_switches_into_uncensored_is_tracked_by_the_second_check(
+        self, monkeypatch, tmp_path
+    ):
+        """Mirrors _dispatch_discord_message's own shape: a pre-check while kind is still the
+        OLD kind (the switch hasn't happened yet), then a post-check once the turn's hooks have
+        flipped mode-state.json to "uncensored". The message must end up tracked despite the
+        first check seeing the old kind -- this is the fix for "the message I sent to switch to
+        uncensored mode" never being erased."""
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        _set_kind(monkeypatch, "cloud")
+        await adapter._track_if_uncensored("111", "222")  # pre-check: kind still "cloud", not tracked
+
+        _set_kind(monkeypatch, "uncensored")  # the turn's hooks just flipped mode-state.json
+        await adapter._track_if_uncensored("111", "222")  # post-check: catches it retroactively
+
+        adapter._resolve_channel = AsyncMock(return_value=None)
+        _set_kind(monkeypatch, "cloud")
+        result = await adapter._uncensored_messages.maybe_sweep()
+
+        assert result == [{"channel_id": "111", "message_id": "222"}]
+
+    @pytest.mark.asyncio
     async def test_message_sent_after_leaving_uncensored_is_not_tracked(self, monkeypatch, tmp_path):
         """The confirmation reply sent right as the mode switch completes must land in the NEW
         kind, not get folded into the just-swept uncensored batch."""
@@ -287,6 +327,54 @@ class TestSweepAndDelete:
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 1
         assert "2 message" in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_sweep_deletes_the_whole_thread_when_channel_is_a_thread(self, monkeypatch, tmp_path):
+        """Tony, 2026-09-28: "it also does not erase the thread for it ... I think when you
+        erase the message it erases the thread as well." When the tracked channel resolves to a
+        real discord.Thread, the sweep deletes the thread itself instead of walking its messages
+        one by one -- no fetch_message/delete_messages call at all."""
+        import discord as discord_module
+
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        _set_kind(monkeypatch, "uncensored")
+        await adapter._track_if_uncensored("111", "222")
+
+        thread = MagicMock(spec=discord_module.Thread)
+        thread.delete = AsyncMock()
+        adapter._resolve_channel = AsyncMock(return_value=thread)
+
+        _set_kind(monkeypatch, "cloud")
+        await adapter._sweep_uncensored_messages_if_needed()
+
+        thread.delete.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_thread_delete_permission_denied_falls_back_to_per_message_deletes(
+        self, monkeypatch, tmp_path
+    ):
+        """Missing 'Manage Threads' must not lose the cleanup entirely -- fall back to deleting
+        the tracked messages individually, same as a non-thread channel would."""
+        import discord as discord_module
+
+        adapter = _make_adapter(monkeypatch, tmp_path)
+        _set_kind(monkeypatch, "uncensored")
+        await adapter._track_if_uncensored("111", "222")
+
+        thread = MagicMock(spec=discord_module.Thread)
+        thread.delete = AsyncMock(side_effect=discord_module.Forbidden(
+            MagicMock(status=403, reason="Forbidden"), "Missing Permissions"
+        ))
+        msg = AsyncMock()
+        thread.fetch_message = AsyncMock(return_value=msg)
+        adapter._resolve_channel = AsyncMock(return_value=thread)
+
+        _set_kind(monkeypatch, "cloud")
+        await adapter._sweep_uncensored_messages_if_needed()
+
+        thread.delete.assert_awaited_once()
+        thread.fetch_message.assert_awaited_once_with(222)
+        msg.delete.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_non_permission_delete_failure_still_stays_at_debug_no_warning(self, monkeypatch, tmp_path, caplog):

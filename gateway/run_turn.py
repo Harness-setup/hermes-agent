@@ -1576,14 +1576,17 @@ class GatewayTurnMixin:
                 )
         return response, _intentional_silence, agent_messages
 
-    # reasoning_style → (header line, per-line quote prefix for blank / non-blank lines)
-    _REASONING_QUOTE_STYLES = {
-        "subtext": ("-# 💭 Reasoning", "-# ", "-#"), "blockquote": ("> 💭 **Reasoning:**", "> ", ">")
-    }
-
-    def _hmwa_prepend_reasoning(self, agent_result, response, source, _intentional_silence):
+    async def _hmwa_prepend_reasoning(self, agent_result, response, source, _intentional_silence, event=None):
         """Prepend the last reasoning block when show_reasoning is on for this platform. Mattermost
-        requires an explicit per-platform opt-in (scratch text, not final-answer content)."""
+        requires an explicit per-platform opt-in (scratch text, not final-answer content).
+
+        Discord + ``discord.thread_tool_calls``: Tony, 2026-08/2026-09-23 -- "it should only show
+        the message in main message in the main chat and show tool use and reasoning in threads."
+        Mid-turn reasoning already routes to the tool-progress thread (run_turn_runner.py's
+        progress_callback/_send_to_tool_thread); this end-of-turn block is the SAME reasoning
+        feature's other half and must go to the same thread, not get prepended onto the final
+        answer in the main channel -- posting it there instead of prepending keeps the main
+        channel showing only the final answer, matching the mid-turn behavior exactly."""
         from gateway.run import _load_gateway_config, _platform_config_key, _resolve_gateway_display_bool
         try:
             _show_reasoning_effective = _resolve_gateway_display_bool(
@@ -1598,13 +1601,6 @@ class GatewayTurnMixin:
         last_reasoning = agent_result.get("last_reasoning")
         if not (_show_reasoning_effective and response and not _intentional_silence and last_reasoning):
             return response
-        from gateway.stream_consumer_fences import escape_code_fences_for_display
-        # Collapse long reasoning to keep messages readable
-        lines = last_reasoning.strip().splitlines()
-        if len(lines) > 15:
-            display_reasoning = "\n".join(lines[:15]) + f"\n_... ({len(lines) - 15} more lines)_"
-        else:
-            display_reasoning = last_reasoning.strip()
         # Per-platform render style: Discord defaults to "-# " subtext, others keep the code block.
         try:
             from gateway.display_config import resolve_display_setting
@@ -1613,14 +1609,22 @@ class GatewayTurnMixin:
             )
         except Exception:
             _reasoning_style = "code"
-        _quote = self._REASONING_QUOTE_STYLES.get(_reasoning_style)
-        if _quote:
-            header, prefix, empty = _quote
-            _quoted = "\n".join(f"{prefix}{ln}" if ln else empty for ln in display_reasoning.splitlines())
-            return f"{header}\n{_quoted}\n\n{response}"
-        # Escape ``` inside reasoning so inner fences don't break the outer code block.
-        display_reasoning = escape_code_fences_for_display(display_reasoning)
-        return f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
+        from gateway.display_config import format_reasoning_block
+        _rendered = format_reasoning_block(last_reasoning, _reasoning_style)
+        if source.platform == Platform.DISCORD and event is not None:
+            try:
+                adapter = self._delivery_adapter_for(source)
+            except Exception:
+                adapter = None
+            if adapter is not None and hasattr(adapter, "send_tool_progress_line"):
+                try:
+                    if adapter._discord_thread_tool_calls_enabled():
+                        await adapter.send_tool_progress_line(
+                            source.chat_id, getattr(event, "message_id", None), _rendered)
+                        return response
+                except Exception:
+                    logger.debug("Discord end-of-turn reasoning thread routing failed", exc_info=True)
+        return f"{_rendered}\n\n{response}"
 
     def _hmwa_runtime_footer_line(self, agent_result, source, _turn_seconds):
         """Runtime-metadata footer for the FINAL message of the turn; off by default
@@ -2210,7 +2214,7 @@ class GatewayTurnMixin:
                 _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
                 persist_user_display_kind=prepared.persist_user_display_kind,
             )
-            response = self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence)
+            response = await self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence, event=event)
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
             # Streaming already delivered the body: the footer goes out as a trailing send instead.
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:

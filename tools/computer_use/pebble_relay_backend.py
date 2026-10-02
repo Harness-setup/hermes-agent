@@ -134,8 +134,15 @@ class PebbleRelayBackend(ComputerUseBackend):
         if not isinstance(windows, list) or not windows:
             return None
         if app:
+            # Tony, 2026-09-29: app_name alone missed every UWP app -- confirmed live, Clock's
+            # real list_windows entry is {"app_name": "ApplicationFrameHost.exe", "title":
+            # "Clock"}. UWP apps (Store apps: Clock, Calculator, Alarms, Photos, ...) all run
+            # hosted inside ApplicationFrameHost.exe, so their real identifying name only ever
+            # shows up in `title`, never `app_name`. Check both.
             needle = app.strip().lower()
-            candidates = [w for w in windows if isinstance(w, dict) and needle in str(w.get("app_name", "")).lower()]
+            candidates = [w for w in windows if isinstance(w, dict)
+                         and (needle in str(w.get("app_name", "")).lower()
+                              or needle in str(w.get("title", "")).lower())]
             if not candidates:
                 return None  # an app filter that matches nothing is "not found", not "search anything"
         else:
@@ -171,7 +178,7 @@ class PebbleRelayBackend(ComputerUseBackend):
     # ── Real, relayed actions ────────────────────────────────────────────────
     def launch_app(self, name: str) -> ActionResult:
         try:
-            result = relay_call("launch_app", {"app": name})
+            result = relay_call("launch_app", {"name": name})
         except PebbleRelayError as exc:
             return ActionResult(ok=False, action="launch_app", message=str(exc))
         ok = not (isinstance(result, dict) and result.get("isError"))
@@ -180,12 +187,31 @@ class PebbleRelayBackend(ComputerUseBackend):
                             meta={"raw": result})
 
     def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
-        # launch_app is documented+verified idempotent (tools/computer_use/tool.py's own comment,
-        # confirmed live tonight): it starts the app if not running, or is a no-op/focuses it if
-        # already running -- covers the focus case without a separate window-matching relay call.
-        result = self.launch_app(app)
-        result.action = "focus_app"
-        return result
+        # Tony, 2026-09-29: re-calling launch_app alone (the previous body of this method) starts
+        # the app but does NOT set the sticky target (_active_pid/_active_window_id) the way the
+        # local CuaDriverBackend's real focus_app does (cua_backend_capture.py) -- confirmed live:
+        # asked to set a Clock timer right after focus_app("Clock") reported success, capture()'s
+        # own frontmost-window fallback (nothing else told it which window to use) kept landing on
+        # a leftover Chrome window instead, four times in a row, because nothing had ever recorded
+        # Clock as the target. launch_app first (ensures it's running/starts it), THEN resolve its
+        # real window via the same app-name matching capture() uses, and commit it as the sticky
+        # target -- exactly what capture()/click()/type_text() need to act on the right window
+        # without the caller having to keep passing app= on every subsequent call.
+        launch_result = self.launch_app(app)
+        if not launch_result.ok:
+            launch_result.action = "focus_app"
+            return launch_result
+        try:
+            target = self._resolve_capture_target(app, None, None)
+        except PebbleRelayError as exc:
+            return ActionResult(ok=False, action="focus_app",
+                                message=f"{app!r} launched but window lookup failed: {exc}")
+        if target is None:
+            return ActionResult(ok=False, action="focus_app",
+                                message=f"{app!r} launched but no matching on-screen window was found yet.")
+        self._active_pid, self._active_window_id = target["pid"], target["window_id"]
+        return ActionResult(ok=True, action="focus_app",
+                            message=f"Targeted {app!r} (pid {target['pid']}, window {target['window_id']}).")
 
     def list_apps(self) -> List[Dict[str, Any]]:
         try:
@@ -215,13 +241,26 @@ class PebbleRelayBackend(ComputerUseBackend):
                             message=f"no active capture target -- call computer_use capture first so "
                                      f"{action} knows which window to target")
 
-    def type_text(self, text: str, *, delivery_mode: Optional[str] = None,
+    def type_text(self, text: str, *, delay_ms: Optional[int] = None, delivery_mode: Optional[str] = None,
                   bring_to_front: bool = False) -> ActionResult:
+        # Tony, 2026-09-29: delivery_mode was accepted in this signature but never actually
+        # forwarded to the relay call -- every Pebble-relayed type_text silently used the
+        # driver's "background" default no matter what was requested. Confirmed live: four
+        # attempts to type into Edge's address bar (a real browser-chrome control, one of the
+        # driver's own documented "background input silently dropped" targets) all reported
+        # ok:true with zero observable effect. bring_to_front has no driver-side equivalent
+        # here (unlike CuaDriverBackend, which issues a separate bring_to_front call) --
+        # Pebble's relay allowlist doesn't include that tool yet, so it's accepted but still a
+        # no-op; only delivery_mode is real today.
         if (refusal := self._require_active_target("type_text")) is not None:
             return refusal
+        args: Dict[str, Any] = {"text": text, "pid": self._active_pid, "window_id": self._active_window_id}
+        if delay_ms is not None:
+            args["delay_ms"] = delay_ms
+        if delivery_mode is not None:
+            args["delivery_mode"] = delivery_mode
         try:
-            result = relay_call("type_text", {"text": text, "pid": self._active_pid,
-                                              "window_id": self._active_window_id})
+            result = relay_call("type_text", args)
         except PebbleRelayError as exc:
             return ActionResult(ok=False, action="type_text", message=str(exc))
         ok = not (isinstance(result, dict) and result.get("isError"))
@@ -230,9 +269,11 @@ class PebbleRelayBackend(ComputerUseBackend):
     def key(self, keys: str, *, delivery_mode: Optional[str] = None, bring_to_front: bool = False) -> ActionResult:
         if (refusal := self._require_active_target("key")) is not None:
             return refusal
+        args: Dict[str, Any] = {"key": keys, "pid": self._active_pid, "window_id": self._active_window_id}
+        if delivery_mode is not None:
+            args["delivery_mode"] = delivery_mode
         try:
-            result = relay_call("press_key", {"key": keys, "pid": self._active_pid,
-                                              "window_id": self._active_window_id})
+            result = relay_call("press_key", args)
         except PebbleRelayError as exc:
             return ActionResult(ok=False, action="key", message=str(exc))
         ok = not (isinstance(result, dict) and result.get("isError"))
@@ -261,6 +302,8 @@ class PebbleRelayBackend(ComputerUseBackend):
             args["x"], args["y"] = x, y
         else:
             return ActionResult(ok=False, action="click", message="click needs either `element` or both `x` and `y`")
+        if delivery_mode is not None:
+            args["delivery_mode"] = delivery_mode
         tool = "double_click" if click_count == 2 else "click"
         try:
             result = relay_call(tool, args)
@@ -271,6 +314,16 @@ class PebbleRelayBackend(ComputerUseBackend):
 
     def capture(self, mode: str = "som", app: Optional[str] = None, pid: Optional[int] = None,
                 window_id: Optional[int] = None) -> CaptureResult:
+        # A caller that gave nothing to go on gets the STICKY target (set by a prior focus_app/
+        # capture) before falling back to frontmost-window guessing -- confirmed live 2026-09-29:
+        # focus_app("Clock") had already resolved and (post-fix) recorded Clock's real window, but
+        # a bare capture(mode="som") right after it ignored that entirely and re-resolved to
+        # whatever was actually frontmost (a leftover Chrome window), timing out against it four
+        # times in a row. The caller can still target a DIFFERENT window explicitly via app/pid/
+        # window_id -- this only fills in the "caller didn't say" case.
+        if app is None and pid is None and window_id is None \
+                and self._active_pid is not None and self._active_window_id is not None:
+            pid, window_id = self._active_pid, self._active_window_id
         try:
             target = self._resolve_capture_target(app, pid, window_id)
         except PebbleRelayError as exc:

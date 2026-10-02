@@ -512,7 +512,8 @@ _ACTIONS: Dict[str, _ActionSpec] = {
     "drag": _input(_do_drag, summarize=lambda a, args, fg: (f"drag {args.get('from_element') or args.get('from_coordinate')} → "
                                                              f"{args.get('to_element') or args.get('to_coordinate')}{fg}")),
     "scroll": _input(_do_scroll, summarize=lambda a, args, fg: f"scroll {args.get('direction', '?')} x{args.get('amount', 3)}{fg}"),
-    "type": _input(lambda backend, action, args, **delivery: backend.type_text(args.get("text", ""), **delivery),
+    "type": _input(lambda backend, action, args, **delivery: backend.type_text(
+        args.get("text", ""), delay_ms=args.get("delay_ms"), **delivery),
                    summarize=lambda a, args, fg: f"type {args.get('text', '')[:60]!r}" + ("..." if len(args.get("text", "")) > 60 else "") + fg),
     "key": _input(lambda backend, action, args, **delivery: backend.key(args.get("keys", ""), **delivery),
                   summarize=lambda a, args, fg: f"key {args.get('keys', '')!r}{fg}"),
@@ -521,7 +522,7 @@ _ACTIONS: Dict[str, _ActionSpec] = {
         else backend.set_value(value=str(args["value"]), element=args.get("element")))),
     "focus_app": _ActionSpec(lambda backend, action, args, **_: (
         json.dumps({"error": "focus_app requires `app`"}) if not args.get("app")
-        else backend.focus_app(args["app"], raise_window=bool(args.get("raise_window")))), destructive=True,
+        else _launch_response(backend.focus_app(args["app"], raise_window=bool(args.get("raise_window"))))), destructive=True,
         summarize=lambda a, args, fg: f"focus {args.get('app', '')!r}" + (" (raise)" if args.get("raise_window") else "")),
     # Tony, 2026-09-22: "not good at opening apps, example Notion." Root cause: the backend has a
     # real, idempotent launch_app(name=...) (cua_backend.py) that starts an app whether or not it's
@@ -533,7 +534,7 @@ _ACTIONS: Dict[str, _ActionSpec] = {
         json.dumps({"error": "launch_app requires `app`"}) if not args.get("app")
         else json.dumps({"error": "launch_app is not supported by this backend"})
         if not hasattr(backend, "launch_app")
-        else json.dumps(backend.launch_app(name=args["app"]))), destructive=True,
+        else _launch_response(backend.launch_app(name=args["app"]))), destructive=True,
         summarize=lambda a, args, fg: f"launch {args.get('app', '')!r}"),
     "capture": _ActionSpec(_do_capture),
     "wait": _ActionSpec(lambda backend, action, args, **_: _text_response(backend.wait(float(args.get("seconds", 1.0))))),
@@ -600,6 +601,16 @@ def _action_payload(res: ActionResult) -> Dict[str, Any]:
 
 def _text_response(res: ActionResult) -> str:
     return json.dumps(_action_payload(res))
+
+def _launch_response(res: Any) -> str:
+    # Backend-shape split: CuaDriverBackend.launch_app()/focus_app() return a plain
+    # Dict[str, Any] ({pid, bundle_id, name, windows[]}); PebbleRelayBackend's return an
+    # ActionResult dataclass instead. Both were dispatched through a bare json.dumps(),
+    # which only ever worked for the dict shape -- confirmed live 2026-09-29 (real Pebble
+    # relay, "open clock app for me"): "Object of type ActionResult is not JSON
+    # serializable", even though the app had genuinely already launched on the real
+    # desktop by the time the error fired.
+    return _text_response(res) if isinstance(res, ActionResult) else json.dumps(res)
 
 # AX `elements` cap: dense UIs publish 500+ nodes (one capture would exhaust context); the full tree spills to a file.
 _DEFAULT_MAX_ELEMENTS = 100

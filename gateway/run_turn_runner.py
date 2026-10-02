@@ -146,7 +146,16 @@ class TurnRunner:
         if event_type == "_thinking" or tool_name == "_thinking":
             thinking_text = (preview if tool_name == "_thinking" else tool_name) if ctx._thinking_enabled else None
             if thinking_text:
-                rendered = f"💬 {thinking_text}"
+                from gateway.display_config import format_reasoning_block, resolve_display_setting
+                from gateway.run import _load_gateway_config, _platform_config_key
+                try:
+                    _reasoning_style = resolve_display_setting(
+                        _load_gateway_config(), _platform_config_key(ctx.source.platform),
+                        "reasoning_style", "code",
+                    )
+                except Exception:
+                    _reasoning_style = "code"
+                rendered = format_reasoning_block(thinking_text, _reasoning_style)
                 # Tony, 2026-09-23: "it should only show the message in main message in the main
                 # chat and show tool use and reasoning in threads, we have built this but it not
                 # working" -- the ORIGINAL discord.thread_tool_calls design (see
@@ -319,7 +328,7 @@ class TurnRunner:
         if ctx.source.platform != Platform.DISCORD:
             return False
         try:
-            adapter = self._runner._adapter_for_source(ctx.source)
+            adapter = self._runner._delivery_adapter_for(ctx.source)
         except Exception:
             return False
         if adapter is None or not hasattr(adapter, "send_tool_progress_line"):

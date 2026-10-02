@@ -71,9 +71,16 @@ def _annotate_family_safety_block(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 # Browser/target inspection that never reads page body/cookies/DOM/storage — stays
 # usable so the model can list tabs or navigate away from a blocked page.
+# Tony, 2026-09-29: Target.createTarget (open a NEW tab) was missing from this set,
+# so it inherited the "is the CURRENT page private?" guard meant for content-reading
+# methods (Runtime.evaluate, DOM.getDocument, ...) -- confirmed live: opening a new
+# tab to bestbuy.com was blocked with "page URL targets a private or internal
+# address (chrome-extension://...)", the CURRENT tab's URL, which has nothing to do
+# with the brand-new tab being created. Its own destination is guarded separately
+# below (_METHOD_PARAM_GUARDS), the same way Page.navigate's is.
 _CDP_PRIVATE_PAGE_ALLOWED_METHODS = {
     "Browser.getVersion", "Target.getTargets", "Target.attachToTarget", "Target.detachFromTarget",
-    "Page.navigate", "Page.reload", "Page.stopLoading",
+    "Target.createTarget", "Page.navigate", "Page.reload", "Page.stopLoading",
 }
 
 # method → result paths that are ALWAYS opaque base64 (protocol-declared binary).
@@ -171,7 +178,7 @@ def _expression_private_target(expression: str) -> Optional[str]:
 
 
 def _navigate_private_target(bt: Any, params: Dict[str, Any]) -> Optional[str]:
-    """Blocked URL literal for ``Page.navigate`` params, else ``None``."""
+    """Blocked URL literal for ``Page.navigate``/``Target.createTarget`` params, else ``None``."""
     from tools.browser_tool_eval_policy import _url_blocked
     target_url = str(params.get("url") or "").strip()
     return target_url if target_url and _url_blocked(bt, target_url) else None
@@ -181,6 +188,8 @@ def _navigate_private_target(bt: Any, params: Dict[str, Any]) -> Optional[str]:
 _METHOD_PARAM_GUARDS = {
     "Page.navigate": (_navigate_private_target,
                       "Blocked: CDP Page.navigate target is a private or internal address ({})."),
+    "Target.createTarget": (_navigate_private_target,
+                            "Blocked: CDP Target.createTarget target is a private or internal address ({})."),
     "Runtime.evaluate": (lambda bt, params: _expression_private_target(str(params.get("expression") or "")),
                          "Blocked: CDP Runtime.evaluate expression targets a private or internal address ({})."),
 }

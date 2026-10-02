@@ -87,7 +87,12 @@ class TestPebbleRelayBackend:
         assert result.ok is True
         assert result.action == "launch_app"
         sent = json.loads(mock_open.call_args[0][0].data)
-        assert sent == {"tool": "launch_app", "args": {"app": "Notion"}}
+        # Real cua-driver schema uses "name" (confirmed against CuaDriverBackend.launch_app,
+        # tools/computer_use/cua_backend.py) -- "app" was a mismatch that made every real
+        # relayed launch_app fail with "Provide one of: bundle_id, name, aumid, path,
+        # launch_path, or urls", confirmed live 2026-09-28 via a direct call to Pebble's
+        # /computer-use-execute endpoint.
+        assert sent == {"tool": "launch_app", "args": {"name": "Notion"}}
 
     def test_launch_app_relay_failure_is_a_refusal_not_an_exception(self):
         backend = PebbleRelayBackend()
@@ -96,12 +101,43 @@ class TestPebbleRelayBackend:
         assert result.ok is False
         assert "Notion" not in result.message or "reach Pebble" in result.message
 
-    def test_focus_app_delegates_to_launch_app_idempotently(self):
+    def test_focus_app_resolves_and_commits_the_real_window_as_sticky_target(self):
+        # Tony, 2026-09-29: the previous version of focus_app just re-called launch_app and
+        # never set the sticky target at all -- confirmed live, capture() right after a
+        # successful focus_app("Clock") still fell back to a leftover Chrome window instead,
+        # because nothing had ever recorded which window was actually Clock's.
         backend = PebbleRelayBackend()
-        with patch("urllib.request.urlopen", return_value=_fake_response(
-                {"ok": True, "result": {"targetId": "abc"}})):
+        windows = {"windows": [
+            {"pid": 111, "window_id": 222, "app_name": "Notion.exe", "z_index": 1},
+            {"pid": 333, "window_id": 444, "app_name": "msedge.exe", "z_index": 5},
+        ]}
+        with patch("urllib.request.urlopen", side_effect=_fake_responses([
+                {"ok": True, "result": {"targetId": "abc"}},  # launch_app
+                {"ok": True, "result": windows},  # list_windows, inside _resolve_capture_target
+        ])):
             result = backend.focus_app("Notion")
         assert result.ok is True
+        assert result.action == "focus_app"
+        assert backend._active_pid == 111
+        assert backend._active_window_id == 222
+
+    def test_focus_app_reports_failure_when_launched_but_no_window_matches_yet(self):
+        backend = PebbleRelayBackend()
+        with patch("urllib.request.urlopen", side_effect=_fake_responses([
+                {"ok": True, "result": {"targetId": "abc"}},  # launch_app
+                {"ok": True, "result": {"windows": []}},  # list_windows finds nothing
+        ])):
+            result = backend.focus_app("Notion")
+        assert result.ok is False
+        assert result.action == "focus_app"
+        assert backend._active_pid is None
+
+    def test_focus_app_does_not_resolve_a_window_when_launch_itself_failed(self):
+        backend = PebbleRelayBackend()
+        with patch("urllib.request.urlopen", return_value=_fake_response(
+                {"ok": False, "error": "not found"})):
+            result = backend.focus_app("Nonexistent")
+        assert result.ok is False
         assert result.action == "focus_app"
 
     def test_list_apps_returns_the_real_apps_list(self):
@@ -185,6 +221,23 @@ class TestResolveCaptureTarget:
         second_sent = json.loads(mock_open.call_args_list[1][0][0].data)
         assert second_sent["args"]["pid"] == 1
 
+    def test_matches_uwp_apps_by_title_when_app_name_is_the_generic_host(self):
+        # Tony, 2026-09-29: confirmed live -- Clock's real list_windows entry is
+        # {"app_name": "ApplicationFrameHost.exe", "title": "Clock"}. Every UWP/Store app
+        # (Clock, Calculator, Alarms & Clock, Photos, ...) runs hosted the same way, so an
+        # app_name-only match can never find any of them.
+        backend = PebbleRelayBackend()
+        windows = {"windows": [
+            {"pid": 1, "window_id": 1, "app_name": "ApplicationFrameHost.exe", "title": "Clock", "z_index": 0},
+            {"pid": 2, "window_id": 2, "app_name": "msedge.exe", "title": "New Tab", "z_index": 5},
+        ]}
+        gws_result = {"screenshot_width": 10, "screenshot_height": 10}
+        with patch("urllib.request.urlopen", side_effect=_fake_responses(
+                [{"ok": True, "result": windows}, {"ok": True, "result": gws_result}])) as mock_open:
+            backend.capture(app="Clock")
+        second_sent = json.loads(mock_open.call_args_list[1][0][0].data)
+        assert second_sent["args"]["pid"] == 1
+
     def test_picks_frontmost_by_max_z_index_when_no_app_filter(self):
         backend = PebbleRelayBackend()
         windows = {"windows": [
@@ -263,6 +316,38 @@ class TestCapture:
         assert result.elements == []
         assert backend._snapshot_tokens == {}
 
+    def test_bare_capture_prefers_the_sticky_target_over_frontmost(self):
+        # Tony, 2026-09-29: confirmed live -- focus_app("Clock") ran, then a bare
+        # capture(mode="som") with no app/pid/window_id ignored the just-set sticky target
+        # entirely and re-resolved to whatever was actually frontmost (a leftover Chrome
+        # window), timing out against it four times in a row. A caller that gives capture()
+        # nothing to go on must get the sticky target, not a fresh frontmost guess.
+        backend = PebbleRelayBackend()
+        backend._active_pid, backend._active_window_id = 111, 222
+        gws_result = {"screenshot_width": 10, "screenshot_height": 10, "screenshot_png_b64": "x"}
+        with patch("urllib.request.urlopen", return_value=_fake_response(
+                {"ok": True, "result": gws_result})) as mock_open:
+            backend.capture(mode="som")
+        sent = json.loads(mock_open.call_args[0][0].data)
+        # No list_windows round trip either -- the sticky pid/window_id short-circuits
+        # _resolve_capture_target's "pid and window_id already known" branch directly.
+        assert sent["tool"] == "get_window_state"
+        assert sent["args"]["pid"] == 111
+        assert sent["args"]["window_id"] == 222
+
+    def test_capture_with_an_explicit_app_ignores_the_sticky_target(self):
+        backend = PebbleRelayBackend()
+        backend._active_pid, backend._active_window_id = 111, 222
+        windows = {"windows": [{"pid": 999, "window_id": 888, "app_name": "Notion.exe", "z_index": 1}]}
+        with patch("urllib.request.urlopen", side_effect=_fake_responses([
+                {"ok": True, "result": windows},  # list_windows, from the explicit app filter
+                {"ok": True, "result": {"screenshot_width": 10, "screenshot_height": 10,
+                                        "screenshot_png_b64": "x"}},
+        ])):
+            backend.capture(mode="som", app="Notion")
+        assert backend._active_pid == 999
+        assert backend._active_window_id == 888
+
     def test_degrades_gracefully_on_get_window_state_relay_failure(self):
         backend = PebbleRelayBackend()
         with patch("urllib.request.urlopen", side_effect=OSError("refused")):
@@ -329,6 +414,13 @@ class TestClickAfterCapture:
         assert result.ok is False
         assert "element" in result.message and "x" in result.message
 
+    def test_click_forwards_delivery_mode_foreground(self):
+        backend = _captured_backend(pid=65852, window_id=21235952)
+        with patch("urllib.request.urlopen", return_value=_fake_response({"ok": True, "result": {}})) as mock_open:
+            backend.click(x=10, y=20, delivery_mode="foreground")
+        sent = json.loads(mock_open.call_args[0][0].data)
+        assert sent["args"]["delivery_mode"] == "foreground"
+
 
 class TestTypeTextAfterCapture:
     def test_type_text_refuses_without_a_prior_capture(self):
@@ -346,6 +438,17 @@ class TestTypeTextAfterCapture:
         assert sent == {"tool": "type_text",
                         "args": {"text": "hello jarvis", "pid": 65852, "window_id": 21235952}}
 
+    def test_type_text_forwards_delivery_mode_foreground(self):
+        # Tony, 2026-09-29: delivery_mode was accepted in the signature but silently never
+        # sent to the relay -- every call used the driver's "background" default regardless
+        # of what was requested, confirmed live against Edge's address bar (a real
+        # browser-chrome control background input silently can't reach).
+        backend = _captured_backend(pid=65852, window_id=21235952)
+        with patch("urllib.request.urlopen", return_value=_fake_response({"ok": True, "result": {}})) as mock_open:
+            backend.type_text("hello", delivery_mode="foreground")
+        sent = json.loads(mock_open.call_args[0][0].data)
+        assert sent["args"]["delivery_mode"] == "foreground"
+
 
 class TestKeyAfterCapture:
     def test_key_refuses_without_a_prior_capture(self):
@@ -361,6 +464,13 @@ class TestKeyAfterCapture:
         assert result.ok is True
         sent = json.loads(mock_open.call_args[0][0].data)
         assert sent == {"tool": "press_key", "args": {"key": "ctrl+s", "pid": 65852, "window_id": 21235952}}
+
+    def test_key_forwards_delivery_mode_foreground(self):
+        backend = _captured_backend(pid=65852, window_id=21235952)
+        with patch("urllib.request.urlopen", return_value=_fake_response({"ok": True, "result": {}})) as mock_open:
+            backend.key("return", delivery_mode="foreground")
+        sent = json.loads(mock_open.call_args[0][0].data)
+        assert sent["args"]["delivery_mode"] == "foreground"
 
 
 class TestNewBackendWiring:

@@ -110,6 +110,25 @@ class TestDispatch:
         type_kw = next(c[1] for c in noop_backend.calls if c[0] == "type")
         assert type_kw["text"] == "hello"
 
+    def test_type_action_forwards_delay_ms_for_slow_visible_typing(self, noop_backend):
+        # Tony, 2026-09-29: "highlight or slow type" for computer_use too, not just
+        # browser_type_slowly -- cua-driver's real type_text already supports delay_ms
+        # (`cua-driver describe type_text`, 0-200ms, default 30), it just never got
+        # threaded through backend.type_text()/the tool schema until now.
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "type", "text": "hello", "delay_ms": 80})
+        parsed = json.loads(out)
+        assert "error" not in parsed
+        type_kw = next(c[1] for c in noop_backend.calls if c[0] == "type")
+        assert type_kw["delay_ms"] == 80
+
+    def test_type_action_omits_delay_ms_when_not_requested(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "type", "text": "hello"})
+        json.loads(out)
+        type_kw = next(c[1] for c in noop_backend.calls if c[0] == "type")
+        assert type_kw["delay_ms"] is None
+
     def test_drag_action_routes_to_backend_by_element(self, noop_backend):
         """drag action must dispatch to backend.drag with element indices (issue #24170, bug 4)."""
         from tools.computer_use.tool import handle_computer_use

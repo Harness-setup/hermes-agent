@@ -93,6 +93,21 @@ class TestGetOrCreateToolProgressThread:
         seed_msg.create_thread.assert_awaited_once()  # not called again
         channel.fetch_message.assert_awaited_once()  # not re-fetched either
 
+    async def test_channel_already_a_thread_uses_it_directly_no_create_thread_call(self):
+        # Tony, 2026-09-28: "does not even show threads anymore" -- root cause was a real
+        # Discord 400 (error code 50024, "Cannot execute action on this channel type"): he was
+        # chatting INSIDE an existing thread, and Discord has no nested threads, so
+        # seed_msg.create_thread() always failed. When the source channel already IS a thread,
+        # it should be used as-is -- no fetch_message, no create_thread, nothing that can 50024.
+        import discord
+        adapter = _make_adapter()
+        already_a_thread = discord.Thread()
+        adapter._client.get_channel = lambda _id: already_a_thread
+
+        result = await adapter._get_or_create_tool_progress_thread("123", "456")
+
+        assert result is already_a_thread
+
     async def test_channel_not_found_returns_none(self):
         adapter = _make_adapter()
         adapter._client.get_channel = lambda _id: None
@@ -133,7 +148,7 @@ class TestSendToolProgressLine:
 # ── TurnRunner routing layer ─────────────────────────────────────────────────────────────
 
 def _make_runner_and_ctx(*, platform=Platform.DISCORD, adapter=None):
-    runner = SimpleNamespace(_adapter_for_source=lambda source: adapter)
+    runner = SimpleNamespace(_delivery_adapter_for=lambda source: adapter)
     ctx = SimpleNamespace(
         source=SimpleNamespace(platform=platform, chat_id="123"),
         event_message_id="456",
@@ -178,6 +193,35 @@ class TestSendToToolThread:
         result = tr._send_to_tool_thread("🖥️ terminal: ls")
 
         assert result is True
+        adapter.send_tool_progress_line.assert_called_once_with("123", "456", "🖥️ terminal: ls")
+
+    def test_uses_the_real_runners_adapter_resolver_method(self, monkeypatch):
+        """Regression for a silent bug: _send_to_tool_thread once called a nonexistent
+        ``_runner._adapter_for_source`` (a typo for ``_delivery_adapter_for``, the real method
+        every other adapter-resolution call site in this file uses). A bare
+        ``except Exception: return False`` swallowed the resulting AttributeError, so the
+        thread-routing feature silently no-op'd on every real turn while all tests stayed green
+        (their SimpleNamespace runner mock happily answered the wrong name too). A spec'd mock of
+        the real GatewayRunner class -- which raises AttributeError on an unknown attribute,
+        unlike SimpleNamespace -- catches a reintroduced mismatch."""
+        from unittest.mock import create_autospec
+        from gateway.run import GatewayRunner
+
+        adapter = SimpleNamespace(send_tool_progress_line=AsyncMock(), _discord_thread_tool_calls_enabled=lambda: True)
+        real_runner = create_autospec(GatewayRunner, instance=True)
+        real_runner._delivery_adapter_for.return_value = adapter
+        ctx = SimpleNamespace(
+            source=SimpleNamespace(platform=Platform.DISCORD, chat_id="123"),
+            event_message_id="456", last_progress_msg=[None], repeat_count=[0],
+            progress_queue=MagicMock(), stream_consumer_holder=[None],
+        )
+        tr = TurnRunner(real_runner, ctx)
+        monkeypatch.setattr(tr, "_schedule", _closing_schedule)
+
+        result = tr._send_to_tool_thread("🖥️ terminal: ls")
+
+        assert result is True
+        real_runner._delivery_adapter_for.assert_called_once_with(ctx.source)
         adapter.send_tool_progress_line.assert_called_once_with("123", "456", "🖥️ terminal: ls")
 
 
@@ -232,7 +276,7 @@ class TestProgressEmitRouting:
 # these test the extension that routes it into the same thread as tool-call progress instead.
 
 def _make_runner_and_ctx_for_thinking(*, platform=Platform.DISCORD, adapter=None, thinking_enabled=True):
-    runner = SimpleNamespace(_adapter_for_source=lambda source: adapter)
+    runner = SimpleNamespace(_delivery_adapter_for=lambda source: adapter)
     ctx = SimpleNamespace(
         source=SimpleNamespace(platform=platform, chat_id="123"),
         event_message_id="456",
@@ -263,7 +307,12 @@ class TestThinkingRoutedToToolThread:
         tr.progress_callback(event_type="_thinking", tool_name="_thinking", preview="The user is asking about X...")
 
         ctx.progress_queue.put.assert_not_called()
-        adapter.send_tool_progress_line.assert_called_once_with("123", "456", "💬 The user is asking about X...")
+        # Discord's platform-tier default reasoning_style is "subtext" (display_config.py) --
+        # format_reasoning_block renders it as Discord's small muted "-# " text, matching the
+        # end-of-turn reasoning block's own styling (consistency fix, 2026-09-28).
+        adapter.send_tool_progress_line.assert_called_once_with(
+            "123", "456", "-# 💭 Reasoning\n-# The user is asking about X...",
+        )
 
     def test_reasoning_goes_to_queue_unchanged_when_flag_disabled(self):
         adapter = SimpleNamespace(send_tool_progress_line=AsyncMock(), _discord_thread_tool_calls_enabled=lambda: False)
@@ -271,7 +320,7 @@ class TestThinkingRoutedToToolThread:
 
         tr.progress_callback(event_type="_thinking", tool_name="_thinking", preview="The user is asking about X...")
 
-        ctx.progress_queue.put.assert_called_once_with("💬 The user is asking about X...")
+        ctx.progress_queue.put.assert_called_once_with("-# 💭 Reasoning\n-# The user is asking about X...")
         adapter.send_tool_progress_line.assert_not_called()
 
     def test_reasoning_still_suppressed_entirely_when_thinking_disabled(self, monkeypatch):
@@ -292,7 +341,9 @@ class TestThinkingRoutedToToolThread:
 
         tr.progress_callback(event_type="_thinking", tool_name="_thinking", preview="thinking text")
 
-        ctx.progress_queue.put.assert_called_once_with("💬 thinking text")
+        # Slack has no reasoning_style tier override, so it falls through to the "code" global
+        # default (display_config.py) -- a fenced block, unlike Discord's "-# " subtext.
+        ctx.progress_queue.put.assert_called_once_with("💭 **Reasoning:**\n```\nthinking text\n```")
         adapter.send_tool_progress_line.assert_not_called()
 
     def test_reasoning_and_tool_progress_share_the_same_thread(self, monkeypatch):
@@ -310,3 +361,124 @@ class TestThinkingRoutedToToolThread:
         assert calls[0].args[:2] == ("123", "456")
         assert calls[1].args[:2] == ("123", "456")
         ctx.progress_queue.put.assert_not_called()
+
+
+# ── Delete tool-progress thread on turn completion ───────────────────────────────────────
+
+def _fake_thread_member(member_id):
+    return SimpleNamespace(id=member_id)
+
+
+class TestArchiveToolProgressThread:
+    """Tony, 2026-09-28, in order:
+    1. "they clutter my thread list." A tool-progress thread is keyed to (and only ever
+       reused within) the one message that started its turn, so once the turn is fully done
+       nothing will ever post to it again -- archive it immediately instead of waiting for
+       Discord's 60-minute auto-archive timeout.
+    2. "I need to look at the thread in order for it to go away." Archiving alone doesn't
+       clear it: Discord's client keeps listing a thread for as long as the viewing user is
+       still a MEMBER of it (auto-added when the thread was created from their own message),
+       regardless of archived state, until they open it. "No not deleting it archive it even
+       when I don't see it" -- keep the content, remove every non-bot member instead so
+       nothing is tracking it as theirs anymore, then archive."""
+
+    @pytest.mark.asyncio
+    async def test_removes_non_bot_members_then_archives_and_evicts(self):
+        adapter = _make_adapter()
+        adapter._client.user = _fake_thread_member(999)  # the bot itself
+        thread = SimpleNamespace(
+            edit=AsyncMock(),
+            remove_user=AsyncMock(),
+            fetch_members=AsyncMock(return_value=[_fake_thread_member(999), _fake_thread_member(111)]),
+        )
+        adapter._tool_progress_threads["456"] = thread
+
+        await adapter._archive_tool_progress_thread("456")
+
+        thread.remove_user.assert_awaited_once()
+        assert thread.remove_user.call_args.args[0].id == 111  # only the non-bot member
+        thread.edit.assert_awaited_once_with(archived=True)
+        assert "456" not in adapter._tool_progress_threads
+
+    @pytest.mark.asyncio
+    async def test_no_cached_thread_is_a_silent_no_op(self):
+        adapter = _make_adapter()
+        await adapter._archive_tool_progress_thread("456")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_no_message_id_is_a_silent_no_op(self):
+        adapter = _make_adapter()
+        thread = SimpleNamespace(edit=AsyncMock(), remove_user=AsyncMock(), fetch_members=AsyncMock())
+        adapter._tool_progress_threads["456"] = thread
+
+        await adapter._archive_tool_progress_thread(None)
+
+        thread.edit.assert_not_awaited()
+        thread.fetch_members.assert_not_awaited()
+        assert adapter._tool_progress_threads["456"] is thread
+
+    @pytest.mark.asyncio
+    async def test_member_fetch_failure_still_archives(self):
+        adapter = _make_adapter()
+        thread = SimpleNamespace(
+            edit=AsyncMock(), remove_user=AsyncMock(),
+            fetch_members=AsyncMock(side_effect=RuntimeError("boom")),
+        )
+        adapter._tool_progress_threads["456"] = thread
+
+        await adapter._archive_tool_progress_thread("456")  # must not raise
+
+        thread.edit.assert_awaited_once_with(archived=True)
+        assert "456" not in adapter._tool_progress_threads
+
+    @pytest.mark.asyncio
+    async def test_one_member_removal_failure_does_not_block_the_others_or_the_archive(self):
+        adapter = _make_adapter()
+        adapter._client.user = _fake_thread_member(999)
+        thread = SimpleNamespace(
+            edit=AsyncMock(),
+            remove_user=AsyncMock(side_effect=[RuntimeError("boom"), None]),
+            fetch_members=AsyncMock(return_value=[
+                _fake_thread_member(111), _fake_thread_member(222),
+            ]),
+        )
+        adapter._tool_progress_threads["456"] = thread
+
+        await adapter._archive_tool_progress_thread("456")  # must not raise
+
+        assert thread.remove_user.await_count == 2
+        thread.edit.assert_awaited_once_with(archived=True)
+
+    @pytest.mark.asyncio
+    async def test_archive_failure_is_best_effort_no_raise(self):
+        adapter = _make_adapter()
+        thread = SimpleNamespace(
+            edit=AsyncMock(side_effect=RuntimeError("boom")),
+            remove_user=AsyncMock(), fetch_members=AsyncMock(return_value=[]),
+        )
+        adapter._tool_progress_threads["456"] = thread
+
+        await adapter._archive_tool_progress_thread("456")  # must not raise
+        assert "456" not in adapter._tool_progress_threads  # still evicted from cache
+
+    @pytest.mark.asyncio
+    async def test_on_processing_complete_archives_this_turns_thread(self, monkeypatch):
+        from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+        from gateway.session import SessionSource
+        from gateway.config import Platform
+
+        adapter = _make_adapter()
+        adapter._reactions_enabled = lambda: False
+        thread = SimpleNamespace(
+            edit=AsyncMock(), remove_user=AsyncMock(), fetch_members=AsyncMock(return_value=[]),
+        )
+        adapter._tool_progress_threads["456"] = thread
+        monkeypatch.setattr(adapter, "_record_discord_processing_complete", lambda *a, **kw: None)
+
+        source = SessionSource(platform=Platform.DISCORD, user_id="u1", chat_id="123")
+        event = MessageEvent(text="hi", source=source, message_id="456", message_type=MessageType.TEXT)
+
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        thread.edit.assert_awaited_once_with(archived=True)
+        assert "456" not in adapter._tool_progress_threads

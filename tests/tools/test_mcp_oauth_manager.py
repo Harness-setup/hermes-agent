@@ -669,6 +669,13 @@ async def test_refresh_400_still_clears_when_disk_is_same_token(tmp_path, monkey
 
     assert result is False
     assert provider.context.current_tokens is None
+    # Regression: context.clear_tokens() is in-memory only -- the dead refresh token used to
+    # stay on disk forever, getting re-POSTed and re-rejected on every later connection attempt
+    # instead of the failure being recognized at once. The access token is left alone (still
+    # technically usable until it expires on its own).
+    on_disk = json.loads((tmp_path / "mcp-tokens" / "srv.json").read_text(encoding="utf-8"))
+    assert "refresh_token" not in on_disk or on_disk.get("refresh_token") is None
+    assert on_disk.get("access_token") == "A1"
 
 
 @pytest.mark.asyncio
@@ -689,6 +696,11 @@ async def test_refresh_400_does_not_recover_expired_disk_token(tmp_path, monkeyp
 
     assert result is False
     assert provider.context.current_tokens is None
+    # The disk token here is a PEER's distinct (if expired) candidate, not our own dead copy --
+    # _hermes_rotated_candidate() correctly declines to recover it (still ends up cleared), but
+    # strip_refresh_token() must never touch it: only our own proven-dead copy gets stripped.
+    on_disk = json.loads((tmp_path / "mcp-tokens" / "srv.json").read_text(encoding="utf-8"))
+    assert on_disk.get("refresh_token") == "R2"
 
 
 @pytest.mark.asyncio

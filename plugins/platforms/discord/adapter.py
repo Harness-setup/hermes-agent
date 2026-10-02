@@ -268,7 +268,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, unauthorized_action_notice,
     cache_image_from_url, cache_image_from_bytes_async, cache_audio_from_url, cache_audio_from_bytes_async,
     cache_document_from_bytes_async, SUPPORTED_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS,
-    _prefix_within_utf16_limit, utf16_len, validate_inbound_media_size,
+    _prefix_within_utf16_limit, utf16_len, validate_inbound_media_size, _reply_anchor_for_event,
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from tools.url_safety import is_safe_url
@@ -603,8 +603,18 @@ class _DiscordUncensoredMessageTracker:
 
     async def track(self, channel_id: Any, message_id: Any) -> None:
         """Record one message as uncensored-mode-authored. Caller already confirmed the current
-        kind is "uncensored" (via maybe_sweep's side-effected self._last_kind, or a fresh check)."""
-        self._messages.append({"channel_id": str(channel_id), "message_id": str(message_id)})
+        kind is "uncensored" (via maybe_sweep's side-effected self._last_kind, or a fresh check).
+        Idempotent: _dispatch_discord_message calls _track_if_uncensored both before and after
+        the turn's own hooks run (the second call is the only way to catch a message that itself
+        triggers the switch INTO uncensored, since kind hasn't flipped yet at the first call) --
+        for an ordinary in-uncensored message already tracked by the first call, kind is
+        unchanged and the second call would otherwise append a duplicate entry, doubling the
+        sweep's delete list. A plain membership check keeps a real duplicate SEND (rare, but not
+        impossible) tracked once per distinct message id, which is all the sweep needs."""
+        entry = {"channel_id": str(channel_id), "message_id": str(message_id)}
+        if entry in self._messages:
+            return
+        self._messages.append(entry)
         await self._persist()
 
     def is_currently_uncensored(self) -> bool:
@@ -1649,7 +1659,19 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return False
         self._record_bot_tag_debounce(message)
         await self._track_if_uncensored(message.channel.id, message.id)
-        return await self._handle_message(message, role_authorized=role_authorized)
+        result = await self._handle_message(message, role_authorized=role_authorized)
+        # Tony, 2026-09-28: "I also want it to erase the message that I sent to switch to
+        # uncensored mode." The pre-handle track() above runs before _handle_message's own
+        # pre_gateway_dispatch hooks (the mode plugin's deterministic switch included) ever
+        # flip mode-state.json, so a message that ITSELF triggers the switch INTO uncensored
+        # is checked while the OLD kind is still current and never gets tracked -- only
+        # messages sent AFTER the switch were ever caught. A second check here, once the
+        # turn's hooks have run, catches exactly that case: if kind is uncensored now but
+        # wasn't when the pre-check ran, this tracks the trigger message retroactively.
+        # Safe to call unconditionally -- track() is idempotent, so a message already tracked
+        # by the pre-check (kind was already uncensored before the turn) is a cheap no-op here.
+        await self._track_if_uncensored(message.channel.id, message.id)
+        return result
 
     # --- gateway_platform_event fire-sites ---
 
@@ -3073,6 +3095,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for final reaction and durable state."""
         await asyncio.to_thread(self._record_discord_processing_complete, event, outcome)
+        await self._archive_tool_progress_thread(_reply_anchor_for_event(event))
         if not self._reactions_enabled():
             return
         message = event.raw_message
@@ -5351,6 +5374,30 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 continue
             if channel is None:
                 continue
+            # Tony, 2026-09-28: "it also does not erase the thread for it ... I think when you
+            # erase the message it erases the thread as well." When the tracked channel IS a
+            # thread (the whole uncensored exchange happened inside one -- tool-progress threads,
+            # auto-created conversation threads), deleting every message the tracker knew about
+            # still leaves the thread object itself sitting in the channel's thread list, empty
+            # or not. Deleting the thread wholesale is simpler than deleting messages one by one
+            # AND satisfies the "no trace" guarantee for real: no bot-authored/permission-gated
+            # per-message delete race, just gone. Falls through to the ordinary per-message path
+            # below only if the thread delete itself fails (e.g. missing Manage Threads).
+            if isinstance(channel, discord.Thread):
+                try:
+                    await channel.delete()
+                    deleted += len(message_ids)
+                    continue
+                except discord.Forbidden:
+                    logger.warning(
+                        "[%s] uncensored cleanup: could not delete thread %s (missing 'Manage "
+                        "Threads' permission) -- falling back to deleting its tracked messages "
+                        "individually; the thread itself will remain, empty",
+                        self.name, channel_id,
+                    )
+                except Exception as e:
+                    logger.debug("[%s] uncensored cleanup: thread delete failed, falling back to "
+                                 "per-message deletes: %s", self.name, e)
             # Bulk delete only covers messages under 14 days old and needs >=2 ids; fall back to
             # individual deletes (both for a single id and for anything bulk delete rejects).
             bulk_eligible = len(message_ids) >= 2
@@ -5617,6 +5664,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             channel = await self._resolve_channel(chat_id)
             if channel is None:
                 return None
+            # Tony, 2026-09-28: "does not even show threads anymore" -- root cause was a real
+            # Discord 400 (error code 50024, "Cannot execute action on this channel type"): he
+            # was chatting INSIDE an existing thread, and Discord has no nested threads, so
+            # seed_msg.create_thread() always failed. When the source channel already IS a
+            # thread, use it as-is -- no fetch_message, no create_thread, nothing that can 50024.
+            if isinstance(channel, discord.Thread):
+                self._tool_progress_threads[event_message_id] = channel
+                return channel
             seed_msg = await channel.fetch_message(int(event_message_id))
         except Exception as e:
             logger.debug("[%s] tool-progress thread: couldn't fetch seed message %s: %s", self.name, event_message_id, e)
@@ -5634,6 +5689,52 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     await asyncio.sleep(0.75)
         logger.warning("[%s] tool-progress thread creation failed: %s", self.name, last_error)
         return None
+
+    async def _archive_tool_progress_thread(self, event_message_id: Optional[str]) -> None:
+        """Tony, 2026-09-28, in order:
+        1. "they clutter my thread list" -- each tool-progress thread is keyed to (and only
+           ever reused within) the ONE message that started this turn, never a later,
+           different message, so once this turn's processing is fully done nothing will ever
+           post to it again. First fix: archive it right away instead of waiting for
+           Discord's 60-minute auto-archive timeout (the shortest duration its API allows).
+        2. "I need to look at the thread in order for it to go away" -- archiving alone
+           doesn't clear it: Discord's client keeps listing a thread in the channel's thread
+           list for as long as the viewing user is still a MEMBER of it, regardless of
+           archived state, until they open (and thereby read) it. Tony gets auto-added as a
+           member the moment the thread is created FROM his own message (create_thread on a
+           seed message adds that message's author). "No not deleting it archive it even
+           when I don't see it" -- keep the content (never delete), instead remove every
+           non-bot member before archiving, so nothing is tracking it as unread/theirs
+           anymore and it drops out of the list without ever being opened. Best-effort,
+           called from on_processing_complete."""
+        if not event_message_id:
+            return
+        thread = self._tool_progress_threads.pop(str(event_message_id), None)
+        if thread is None:
+            logger.debug("[%s] tool-progress thread archive: no cached thread for message %s",
+                         self.name, event_message_id)
+            return
+        removed = 0
+        try:
+            members = await thread.fetch_members()
+            bot_id = getattr(getattr(self._client, "user", None), "id", None)
+            for member in members:
+                if bot_id is not None and member.id == bot_id:
+                    continue
+                try:
+                    await thread.remove_user(member)
+                    removed += 1
+                except Exception as e:
+                    logger.warning("[%s] tool-progress thread member removal failed for %s: %s",
+                                   self.name, member.id, e)
+        except Exception as e:
+            logger.warning("[%s] tool-progress thread member fetch failed: %s", self.name, e)
+        try:
+            await thread.edit(archived=True)
+            logger.info("[%s] tool-progress thread %s archived (%d member(s) removed)",
+                        self.name, getattr(thread, "id", event_message_id), removed)
+        except Exception as e:
+            logger.warning("[%s] tool-progress thread archive failed: %s", self.name, e)
 
     async def send_tool_progress_line(self, chat_id: str, event_message_id: Optional[str], text: str) -> None:
         """Send one tool-call progress line into the lazily-created tool-progress thread instead of

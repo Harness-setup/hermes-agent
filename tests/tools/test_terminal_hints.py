@@ -52,6 +52,27 @@ class TestCommandNotFound:
         assert "shellcheck" in hint
         assert "which" in hint
 
+    def test_real_tool_name_gets_the_tool_call_hint_not_the_generic_path_hint(self):
+        # Tony, 2026-09-29: confirmed live, repeatedly -- computer_use/desktop_preview get
+        # typed as `toolname(action=..., ...)` into terminal, and the generic "not on PATH"
+        # hint (implying "install it" / "check `which`") doesn't correct the actual mistake
+        # (a tool is not a shell command). Any real registered tool name must get the
+        # specific tool_call correction instead. Import triggers this tool's own
+        # registry.register() call (registration happens at import time, per AGENTS.md) --
+        # each test file runs in its own subprocess, so nothing else guarantees it's
+        # registered here.
+        import tools.computer_use_tool  # noqa: F401
+        out = 'bash: line 5: computer_use: command not found'
+        hint = annotate_failure('computer_use(action="launch_app", app="Notion")', 127, out)
+        assert "not a shell command" in hint
+        assert "tool_call" in hint
+        assert "which computer_use" not in hint
+
+    def test_unregistered_name_still_gets_the_generic_path_hint(self):
+        out = "bash: line 3: shellcheck: command not found"
+        hint = annotate_failure("shellcheck s.sh", 127, out)
+        assert "not a shell command" not in hint
+
 
 class TestModuleNotFound:
     def test_module_named(self):

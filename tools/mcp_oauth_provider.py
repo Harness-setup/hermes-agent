@@ -459,6 +459,15 @@ class HermesProviderMixin:
                     "Recovered a peer-rotated refresh token instead of clearing the session"
                 )
                 return True
+            # Genuinely dead, not a recoverable race: strip the proven-dead refresh token from
+            # disk too, not just from the in-memory context (context.clear_tokens() never touches
+            # storage). Left on disk, the exact same dead token gets re-POSTed and re-rejected on
+            # every later connection attempt -- the next self-probe while parked, the next process
+            # restart -- instead of the failure being recognized immediately. A genuine candidate
+            # a peer left on disk (different from what we just tried) is never touched here: only
+            # strip when nothing distinct from our own dead copy is sitting there.
+            if await self._hermes_rotated_candidate() is None:
+                self.context.storage.strip_refresh_token(reason="rejected (invalid_grant)")
             self.context.clear_tokens()
             return False
         from httpx import HTTPError
