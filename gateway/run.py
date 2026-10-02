@@ -5261,6 +5261,17 @@ def _start_gateway_make_restart_signal_handler(runner):
     return restart_signal_handler
 
 
+def _start_gateway_make_interrupt_signal_handler(runner):
+    """SIGUSR2 (Pebble's Stop All): interrupt every running agent turn; the gateway stays up."""
+    def interrupt_signal_handler():
+        logger.info("SIGUSR2 received (Stop All): interrupting running agents; the gateway keeps running.")
+        try:
+            runner._interrupt_running_agents("user_stop_all")
+        except Exception:
+            logger.warning("SIGUSR2 interrupt failed", exc_info=True)
+    return interrupt_signal_handler
+
+
 def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdown: list):
     """Build the SIGINT/SIGTERM handler; ``_signal_initiated_shutdown[0]`` records an unplanned signal."""
     def shutdown_signal_handler(received_signal=None):
@@ -5828,6 +5839,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         handlers = [(sig, shutdown_signal_handler, (sig,)) for sig in (signal.SIGINT, signal.SIGTERM)]
         if hasattr(signal, "SIGUSR1"):
             handlers.append((signal.SIGUSR1, restart_signal_handler, ()))  # windows-footgun: ok — hasattr-guarded
+        if hasattr(signal, "SIGUSR2"):
+            handlers.append((signal.SIGUSR2, _start_gateway_make_interrupt_signal_handler(runner), ()))  # windows-footgun: ok — hasattr-guarded
         for sig, handler, args in handlers:
             with suppress(NotImplementedError):
                 loop.add_signal_handler(sig, handler, *args)  # windows-footgun: ok — suppress(NotImplementedError)
