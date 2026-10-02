@@ -434,9 +434,21 @@ class SlashCommandCompleter(Completer):
             handler, single_word = _DYNAMIC_COMPLETIONS.get(base_cmd, (None, False))
             if handler is not None and (not single_word or first_arg):
                 yield from handler(sub_text, sub_text.lower())
-            elif first_arg and base_cmd in SUBCOMMANDS and self._command_allowed(base_cmd):
-                yield from _prefix_completions(
-                    ((s, None) for s in SUBCOMMANDS[base_cmd]), sub_text)
+            elif first_arg and self._command_allowed(base_cmd):
+                # Built-ins first (CommandDef.subcommands via the module-level SUBCOMMANDS
+                # dict), then plugin-registered commands (ctx.register_command's subcommands=
+                # param, via get_plugin_commands()).
+                if base_cmd in SUBCOMMANDS:
+                    subs: tuple = tuple(SUBCOMMANDS[base_cmd])
+                else:
+                    try:
+                        from hermes_cli.plugins import get_plugin_commands
+                        _plugin_cmd = get_plugin_commands().get(base_cmd.lstrip("/"))
+                    except Exception:
+                        _plugin_cmd = None
+                    subs = tuple(_plugin_cmd.get("subcommands") or ()) if _plugin_cmd else ()
+                if subs:
+                    yield from _prefix_completions(((s, None) for s in subs), sub_text)
             return
         word = text[1:]
 

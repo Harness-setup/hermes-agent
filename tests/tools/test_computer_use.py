@@ -80,6 +80,25 @@ class TestDispatch:
         type_kw = next(c[1] for c in noop_backend.calls if c[0] == "type")
         assert type_kw["text"] == "hello"
 
+    def test_type_action_forwards_delay_ms_for_slow_visible_typing(self, noop_backend):
+        # Tony, 2026-09-29: "highlight or slow type" for computer_use too, not just
+        # browser_type_slowly -- cua-driver's real type_text already supports delay_ms
+        # (`cua-driver describe type_text`, 0-200ms, default 30), it just never got
+        # threaded through backend.type_text()/the tool schema until now.
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "type", "text": "hello", "delay_ms": 80})
+        parsed = json.loads(out)
+        assert "error" not in parsed
+        type_kw = next(c[1] for c in noop_backend.calls if c[0] == "type")
+        assert type_kw["delay_ms"] == 80
+
+    def test_type_action_omits_delay_ms_when_not_requested(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "type", "text": "hello"})
+        json.loads(out)
+        type_kw = next(c[1] for c in noop_backend.calls if c[0] == "type")
+        assert type_kw["delay_ms"] is None
+
     def test_drag_action_routes_to_backend_by_element(self, noop_backend):
         """drag action must dispatch to backend.drag with element indices (issue #24170, bug 4)."""
         from tools.computer_use.tool import handle_computer_use
@@ -143,6 +162,147 @@ class TestDispatch:
         # No follow-up capture should have been issued.
         capture_calls = [c for c in noop_backend.calls if c[0] == "capture"]
         assert len(capture_calls) == 0, "capture must not be called after a failed action"
+
+# ---------------------------------------------------------------------------
+# Batch action (one tool call for a sequence of actions)
+# ---------------------------------------------------------------------------
+
+class TestBatchAction:
+
+    def test_runs_each_action_in_order(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch", "actions": [
+            {"action": "click", "element": 1},
+            {"action": "type", "text": "hi"},
+            {"action": "key", "keys": "Return"},
+        ]})
+        parsed = json.loads(out)
+        assert parsed["batch"] is True
+        assert parsed["completed"] == 3
+        assert parsed["requested"] == 3
+        assert [s["ok"] for s in parsed["steps"]] == [True, True, True]
+        assert [c[0] for c in noop_backend.calls] == ["click", "type", "key"]
+
+    def test_stops_at_first_failing_step(self, noop_backend):
+        from unittest.mock import patch
+        from tools.computer_use.backend import ActionResult
+        from tools.computer_use.tool import handle_computer_use
+
+        with patch.object(noop_backend, "click",
+                          return_value=ActionResult(ok=False, action="click",
+                                                    message="element not found")):
+            out = handle_computer_use({"action": "batch", "actions": [
+                {"action": "click", "element": 99},
+                {"action": "type", "text": "should never run"},
+            ]})
+        parsed = json.loads(out)
+        assert parsed["completed"] == 1
+        assert parsed["requested"] == 2
+        assert parsed["steps"][0]["ok"] is False
+        assert parsed["steps"][0]["error"] == "element not found"
+        # the second step must never have been dispatched (patch.object with
+        # return_value= replaces click() wholesale, so it never reaches the
+        # real body that appends to self.calls -- absence of "type" is what
+        # actually proves the batch stopped)
+        assert "type" not in [c[0] for c in noop_backend.calls]
+
+    def test_validation_error_shape_is_also_treated_as_failure(self, noop_backend):
+        """A pre-dispatch validation error is {"error": ...} with no "ok" key
+        at all -- a different shape than a dispatched action's own failure.
+        Both must stop the batch."""
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch", "actions": [
+            {"action": "nope"},
+            {"action": "click", "element": 1},
+        ]})
+        parsed = json.loads(out)
+        assert parsed["steps"][0]["ok"] is False
+        assert "error" in parsed["steps"][0]
+        assert parsed["completed"] == 1
+        assert [c[0] for c in noop_backend.calls] == []
+
+    def test_empty_actions_list_is_rejected(self):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch", "actions": []})
+        parsed = json.loads(out)
+        assert "error" in parsed
+
+    def test_missing_actions_key_is_rejected(self):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch"})
+        parsed = json.loads(out)
+        assert "error" in parsed
+
+    def test_over_max_batch_size_is_rejected(self):
+        from tools.computer_use.tool import handle_computer_use, _MAX_BATCH_SIZE
+        out = handle_computer_use({"action": "batch", "actions": [
+            {"action": "key", "keys": "a"} for _ in range(_MAX_BATCH_SIZE + 1)
+        ]})
+        parsed = json.loads(out)
+        assert "error" in parsed
+
+    def test_nested_batch_is_rejected(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "batch", "actions": [
+            {"action": "batch", "actions": [{"action": "click", "element": 1}]},
+        ]})
+        parsed = json.loads(out)
+        assert parsed["steps"][0]["ok"] is False
+        assert "nested" in parsed["steps"][0]["error"]
+        assert noop_backend.calls == []
+
+    def test_capture_as_last_step_returns_multimodal_with_batch_summary(self):
+        """The noop backend's capture() has no real image bytes (png_b64=None),
+        so it can never actually produce a multimodal envelope -- swap in a
+        backend that does, same pattern as TestCaptureResponse above."""
+        from tools.computer_use.backend import ActionResult, CaptureResult
+        from tools.computer_use import tool as cu_tool
+
+        fake_png = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAADUlEQVR4nGNgGAUgAAABCAABgukLHQAAAABJRU5ErkJggg=="
+
+        class FakeBackend:
+            def start(self): pass
+            def stop(self): pass
+            def is_available(self): return True
+            def click(self, **kw): return ActionResult(ok=True, action="click")
+            def capture(self, mode="som", app=None, pid=None, window_id=None):
+                return CaptureResult(
+                    mode=mode, width=1024, height=768,
+                    png_b64=fake_png, elements=[],
+                    app="Safari", window_title="example.com",
+                    png_bytes_len=100,
+                )
+
+        cu_tool.reset_backend_for_tests()
+        with patch.object(cu_tool, "_get_backend", return_value=FakeBackend()), \
+             patch.object(cu_tool, "_should_route_through_aux_vision",
+                          return_value=False):
+            out = cu_tool.handle_computer_use({"action": "batch", "actions": [
+                {"action": "click", "element": 1},
+                {"action": "capture", "mode": "vision"},
+            ]})
+        cu_tool.reset_backend_for_tests()
+        assert isinstance(out, dict)
+        assert out.get("_multimodal") is True
+        assert "2/2" in out["text_summary"]
+        assert any(part.get("type") == "image_url" for part in out["content"])
+
+    def test_approval_denial_inside_batch_stops_it(self, noop_backend):
+        """Batching must not widen what gets auto-approved -- each entry still
+        goes through the normal per-action approval gate."""
+        from tools.computer_use.tool import handle_computer_use, set_approval_callback
+        set_approval_callback(lambda action, args, summary: "deny")
+        try:
+            out = handle_computer_use({"action": "batch", "actions": [
+                {"action": "key", "keys": "ctrl+a"},
+                {"action": "type", "text": "should never run"},
+            ]})
+        finally:
+            set_approval_callback(None)
+        parsed = json.loads(out)
+        assert parsed["steps"][0]["ok"] is False
+        assert parsed["completed"] == 1
+
 
 # ---------------------------------------------------------------------------
 # Safety guards (type / key block lists)
@@ -1367,6 +1527,71 @@ class TestCaptureAppFilterNoMatch:
         assert backend._active_window_id is None
         assert backend._last_target is None
         assert backend._snapshot_tokens == {}
+
+class TestLaunchApp:
+    """Bug fixed 2026-09-22 (Tony: "not good at opening apps, example Notion"):
+    the backend has always had a real, idempotent launch_app(name=...) that
+    starts an app whether or not it's already running, but it was never
+    exposed as a callable action -- the model could only reach focus_app,
+    which fails outright ("No on-screen window found") when the app isn't
+    already open, forcing unreliable click-simulation on a taskbar/Start
+    icon instead. These lock in the new dispatch wiring at the tool layer.
+    """
+
+    def test_launch_app_requires_app_arg(self):
+        from tools.computer_use import tool as cu_tool
+
+        class StubBackend:
+            def start(self): pass
+            def stop(self): pass
+            def is_available(self): return True
+            def launch_app(self, *, name): raise AssertionError("must not be called without app")
+
+        cu_tool.reset_backend_for_tests()
+        cu_tool._backend = StubBackend()
+        result = json.loads(cu_tool.handle_computer_use({"action": "launch_app"}))
+        assert "error" in result
+        assert "app" in result["error"]
+
+    def test_launch_app_calls_backend_with_name_and_returns_result(self):
+        from tools.computer_use import tool as cu_tool
+
+        calls = []
+
+        class LaunchingBackend:
+            def start(self): pass
+            def stop(self): pass
+            def is_available(self): return True
+
+            def launch_app(self, *, name):
+                calls.append(name)
+                return {"pid": 4242, "name": name, "windows": []}
+
+        cu_tool.reset_backend_for_tests()
+        cu_tool._backend = LaunchingBackend()
+        result = json.loads(cu_tool.handle_computer_use({"action": "launch_app", "app": "Notion"}))
+
+        assert calls == ["Notion"]
+        assert result["pid"] == 4242
+        assert result["name"] == "Notion"
+
+    def test_launch_app_unsupported_backend_returns_clear_error_not_a_crash(self):
+        """A backend with no launch_app method must fail with a readable
+        error, not AttributeError -- getattr-guard regression lock."""
+        from tools.computer_use import tool as cu_tool
+
+        class NoLaunchBackend:
+            def start(self): pass
+            def stop(self): pass
+            def is_available(self): return True
+            # deliberately no launch_app method
+
+        cu_tool.reset_backend_for_tests()
+        cu_tool._backend = NoLaunchBackend()
+        result = json.loads(cu_tool.handle_computer_use({"action": "launch_app", "app": "Notion"}))
+        assert "error" in result
+        assert "not supported" in result["error"]
+
 
 class TestFocusAppFilterNoMatch:
     """focus_app(app=X) must return ok=False when X matches nothing —

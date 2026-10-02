@@ -339,6 +339,13 @@ def _behind_count(co: _Checkout, target: str) -> tuple[int, list[dict]]:
         ahead = (payload or {}).get("ahead_by")
         if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0:
             return ahead, (_quiet(lambda: _commits(payload), []) if ahead else [])
+    # A local-only HEAD (a merge commit on a parked branch like local-fixes, never pushed to the
+    # origin repo itself) 404s on the compare API, which only knows SHAs it has. Count locally
+    # when the target is already in our history -- no fetch, this module never writes.
+    if not co.embedded and _git_ok(["cat-file", "-e", f"{target}^{{commit}}"], cwd=co.root, git=co.git):
+        local = _git_count(["rev-list", "--count", f"{co.head}..{target}"], cwd=co.root)
+        if local is not None:
+            return local, []
     return UPDATE_AVAILABLE_NO_COUNT, []
 
 

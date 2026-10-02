@@ -2363,6 +2363,36 @@ class TestPluginCommands:
         assert mgr._plugin_commands["lcm"]["argument_mode"] == "text"
         assert mgr._plugin_commands["ping"]["argument_mode"] is None
 
+    def test_register_command_stores_subcommands_for_completion(self):
+        """subcommands= is stored on the registration entry, tab-completable
+        by CLI/TUI/desktop the same way as CommandDef.subcommands is for
+        built-ins -- see hermes_cli/commands.py's arg-stage completion,
+        which reads this exact field via get_plugin_commands()."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="mode-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+
+        ctx.register_command(
+            "mode",
+            lambda a: a,
+            description="Switch model mode",
+            subcommands=("cloud", "local", "uncensored", "status"),
+        )
+
+        entry = mgr._plugin_commands["mode"]
+        assert entry["subcommands"] == ("cloud", "local", "uncensored", "status")
+
+    def test_register_command_subcommands_defaults_to_empty(self):
+        """A plugin command registered without subcommands= gets no dropdown --
+        matches every plugin command's behavior before this field existed."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+
+        ctx.register_command("lcm", lambda a: a)
+
+        entry = mgr._plugin_commands["lcm"]
+        assert entry["subcommands"] == ()
 
     def test_get_plugin_context_engine_discovers_plugins_lazily(self, tmp_path, monkeypatch):
         """Context engine lookup should work before any explicit discover_plugins() call."""

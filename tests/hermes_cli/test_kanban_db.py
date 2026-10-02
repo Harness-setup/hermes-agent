@@ -811,6 +811,84 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
 
 
 
+def test_cleanup_workspace_refuses_to_delete_when_declared_artifacts_missing(kanban_home):
+    """Cleanup must not destroy a scratch workspace whose declared artifacts
+    never made it into task_attachments.
+
+    Regression for a real live incident (task t_826b6b4b, 2026-08-03): a
+    worker wrote a real deliverable, declared it via kanban_complete's
+    ``artifacts`` param, kanban_complete reported success with no error --
+    yet the file was gone (workspace already empty) the instant the worker
+    tried to read it back, and no corresponding row ever appeared in
+    task_attachments. `test_complete_task_persists_scratch_artifacts_before_cleanup`
+    above proves the preservation path is correct for a single, isolated
+    `complete_task` call; the live failure did not reproduce under that
+    same call sequence, pointing at a live-only race between preservation
+    and cleanup that could not be pinned down further. This is the
+    defense-in-depth mitigation: regardless of the exact cause, cleanup
+    must refuse to run — not silently proceed — whenever declared
+    artifacts aren't verifiably durable yet, since deleting real,
+    undelivered work is the actual harmful outcome to prevent.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="render chart")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        deliverable = ws / "chart.png"
+        deliverable.write_bytes(b"png-bytes")
+
+        # Simulate the observed race directly: artifacts were declared but
+        # never landed in task_attachments (no _insert_completion_attachment
+        # call happened for this task) -- exactly what live logs showed.
+        kb._cleanup_workspace(conn, t, declared_artifact_count=1)
+
+    assert ws.exists(), (
+        "workspace must survive when a declared artifact isn't verified "
+        "as preserved -- deleting it here would destroy undelivered work"
+    )
+    assert deliverable.exists()
+    assert deliverable.read_bytes() == b"png-bytes"
+
+
+def test_cleanup_workspace_still_deletes_when_no_artifacts_were_declared(kanban_home):
+    """The safety check must not block the common case: a scratch task that
+    never declared any artifacts should still get cleaned up normally."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ephemeral scratch work")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        (ws / "scratch.tmp").write_text("throwaway")
+
+        kb._cleanup_workspace(conn, t, declared_artifact_count=0)
+
+    assert not ws.exists(), "no artifacts declared -- cleanup should proceed as before"
+
+
+def test_cleanup_workspace_deletes_when_declared_artifacts_are_verified(kanban_home):
+    """The safety check must not block cleanup once preservation genuinely
+    succeeded -- only an unverified/missing preservation should defer it."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="render chart, verified")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        (ws / "chart.png").write_bytes(b"png-bytes")
+
+        kb._insert_completion_attachment(
+            conn, t, filename="chart.png",
+            stored_path=str(kb.task_attachments_dir(t) / "chart.png"),
+            size=9, created_at=0,
+        )
+        kb._cleanup_workspace(conn, t, declared_artifact_count=1)
+
+    assert not ws.exists(), (
+        "one artifact declared, one attachment row present -- verified, "
+        "cleanup should proceed"
+    )
+
+
 def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     """Completion artifacts from scratch workspaces survive workspace cleanup."""
     with kbc.connect() as conn:

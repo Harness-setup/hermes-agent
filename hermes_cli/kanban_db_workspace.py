@@ -181,12 +181,34 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
-def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+def _cleanup_workspace(
+    conn: sqlite3.Connection, task_id: str, *, declared_artifact_count: int = 0,
+) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
     so cleanup never blocks completion. ``scratch`` is removed; ``worktree``
     only when provably free of work (clean tree, every commit reachable from a
-    remote-tracking ref); ``dir`` is intentionally preserved."""
+    remote-tracking ref); ``dir`` is intentionally preserved.
+
+    ``declared_artifact_count``: how many paths the completing worker declared
+    via ``kanban_complete``'s ``artifacts`` param. When > 0, this is a promise
+    that at least that many files should now exist as durable
+    ``task_attachments`` rows (copied there by
+    :func:`_persist_scratch_completion_artifacts`, which runs earlier in the
+    same :func:`complete_task` call, before the transaction this function's
+    caller commits after). Real live incident (task t_826b6b4b, 2026-08-03):
+    a worker declared a real deliverable, `complete_task` reported success
+    with no error, yet the file was gone the instant the worker read it back
+    and no attachment row was ever created -- a race that a clean, isolated
+    `complete_task` call could not reproduce (see
+    `test_complete_task_persists_scratch_artifacts_before_cleanup`, which
+    proves the preservation path itself is correct in isolation). Rather than
+    chase the exact live-only mechanism further, this checks the actual
+    attachment count against the promise before doing anything destructive to
+    the SCRATCH path specifically: if fewer attachments exist than were
+    declared, deleting the workspace would destroy real, undelivered work, so
+    cleanup is skipped (not silently proceeded) and a warning is logged
+    instead."""
     try:
         row = conn.execute(_WORKSPACE_ROW_SQL, (task_id,)).fetchone()
         if not row:
@@ -215,6 +237,21 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             _cleanup_worktree_workspace(task_id, path, row["branch_name"])
             _try_cleanup_parent_workspaces(conn, task_id)
             return
+        if declared_artifact_count > 0:
+            (attachment_count,) = conn.execute(
+                "SELECT COUNT(*) FROM task_attachments WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if attachment_count < declared_artifact_count:
+                _kb._log.warning(
+                    "Refusing to remove scratch workspace for task %s: "
+                    "%d artifact(s) were declared on completion but only "
+                    "%d attachment(s) are durably recorded — deleting the "
+                    "workspace now could destroy undelivered work. "
+                    "Workspace left in place at %s for manual recovery.",
+                    task_id, declared_artifact_count, attachment_count, path,
+                )
+                return
         wp = Path(path)
         if wp.is_dir():
             # Containment guard: a board's ``default_workdir`` can pair

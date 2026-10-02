@@ -574,3 +574,174 @@ def test_update_on_main_fast_path_unchanged(repo_pair, monkeypatch, capsys):
     head = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
     remote = _git(repo_pair, "rev-parse", "origin/main").stdout.strip()
     assert head == remote
+
+
+# ---------------------------------------------------------------------------
+# updates.auto_commit_pending_changes (off by default) — Tony, 2026-09-22:
+# "how can I make it so that when I press the update button it will [auto-
+# commit + reconcile]". The dirty-tree case above is genuinely correct
+# behavior for uncommitted work in flight; this flag is the opt-in that
+# turns "always dirty because I'm always mid-edit" into "commit it and
+# proceed" instead of skipping every single time.
+# ---------------------------------------------------------------------------
+
+def _with_auto_commit_config(monkeypatch, enabled: bool = True):
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config, "load_config",
+        lambda: {"updates": {"auto_commit_pending_changes": enabled}},
+    )
+
+
+def test_auto_commit_off_by_default_stays_dirty(repo_pair):
+    """No config override (the _no_config autouse fixture) → unchanged behavior: dirty blocks."""
+    (repo_pair / "a.txt").write_text("local edit\n")
+    safe, reason = update_cmd._assess_parked_branch_switch(GIT, repo_pair, "old-feature", "main")
+    assert safe is False
+    assert reason == "dirty"
+    # Nothing was committed on our behalf.
+    assert _git(repo_pair, "status", "--porcelain").stdout.strip() != ""
+
+
+def test_auto_commit_enabled_commits_modified_file_and_proceeds(repo_pair, monkeypatch):
+    """Dirty tree (modified tracked file) + the flag on → auto-committed, tree now clean,
+    and since old-feature is otherwise fully merged into origin/main, the guard reports
+    safe-to-switch exactly like the already-clean case."""
+    _with_auto_commit_config(monkeypatch)
+    (repo_pair / "a.txt").write_text("local edit\n")
+
+    safe, reason = update_cmd._assess_parked_branch_switch(GIT, repo_pair, "old-feature", "main")
+
+    assert safe is True
+    assert reason == "unmerged:1"  # the new auto-commit itself is one commit not yet in origin/main
+    assert _git(repo_pair, "status", "--porcelain").stdout.strip() == ""
+    log = _git(repo_pair, "log", "-1", "--format=%s").stdout.strip()
+    assert "auto-commit pending changes before update" in log
+
+
+def test_auto_commit_enabled_includes_untracked_files(repo_pair, monkeypatch):
+    """git add -A -- untracked files ride along too, same as any other real commit would."""
+    _with_auto_commit_config(monkeypatch)
+    (repo_pair / "scratch.py").write_text("wip\n")
+
+    safe, reason = update_cmd._assess_parked_branch_switch(GIT, repo_pair, "old-feature", "main")
+
+    assert safe is True
+    assert _git(repo_pair, "status", "--porcelain").stdout.strip() == ""
+    committed_files = _git(repo_pair, "show", "--name-only", "--format=", "HEAD").stdout.split()
+    assert "scratch.py" in committed_files
+
+
+def test_auto_commit_explicit_false_still_blocks(repo_pair, monkeypatch):
+    """Config present but set to false behaves identically to no config at all."""
+    _with_auto_commit_config(monkeypatch, enabled=False)
+    (repo_pair / "a.txt").write_text("local edit\n")
+
+    safe, reason = update_cmd._assess_parked_branch_switch(GIT, repo_pair, "old-feature", "main")
+
+    assert safe is False
+    assert reason == "dirty"
+
+
+def test_auto_commit_no_op_on_already_clean_tree(repo_pair, monkeypatch):
+    """Nothing to commit -- must not create an empty commit or otherwise touch history."""
+    _with_auto_commit_config(monkeypatch)
+    before = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+
+    safe, reason = update_cmd._assess_parked_branch_switch(GIT, repo_pair, "old-feature", "main")
+
+    assert safe is True
+    assert reason == ""
+    after = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    assert before == after
+
+
+# ---------------------------------------------------------------------------
+# _maybe_sync_from_backup_remote
+# ---------------------------------------------------------------------------
+# Tony, 2026-09-22: he runs hermes-agent from two independent checkouts (WSL +
+# a Windows-native clone) of the same local-fixes branch. WSL is the one that
+# resolves conflicts against origin/main and pushes the result to a `backup`
+# remote; Windows should just fast-forward onto that already-resolved history
+# on every `hermes update` instead of re-deriving the same conflicts.
+
+
+@pytest.fixture()
+def repo_with_ahead_backup(repo_pair):
+    """``repo_pair`` clone, parked on ``old-feature``, plus a ``backup`` remote that is
+    one commit further ahead on that same branch -- the clean fast-forward case."""
+    clone = repo_pair
+    backup_src = clone.parent / "backup_src"
+    _git(clone.parent, "clone", "-q", "--branch", "old-feature", str(clone), str(backup_src))
+    (backup_src / "c.txt").write_text("backup-only\n")
+    _git(backup_src, "add", "c.txt")
+    _git(backup_src, "commit", "-qm", "backup-ahead-commit")
+    _git(clone, "remote", "add", "backup", str(backup_src))
+    return clone
+
+
+def _with_sync_from_backup_config(monkeypatch, enabled=True):
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config, "load_config",
+        lambda: {"updates": {"sync_from_backup_remote": enabled}},
+    )
+
+
+def test_sync_from_backup_off_by_default(repo_with_ahead_backup):
+    """No config override (the _no_config autouse fixture) -- HEAD stays put even though
+    backup is ahead and would fast-forward cleanly."""
+    before = _git(repo_with_ahead_backup, "rev-parse", "HEAD").stdout.strip()
+    update_cmd._maybe_sync_from_backup_remote(GIT, repo_with_ahead_backup, "old-feature")
+    after = _git(repo_with_ahead_backup, "rev-parse", "HEAD").stdout.strip()
+    assert before == after
+
+
+def test_sync_from_backup_fast_forwards_when_ancestor(repo_with_ahead_backup, monkeypatch):
+    """Config on, clean tree, HEAD is an ancestor of backup/<branch> -- fast-forwards."""
+    _with_sync_from_backup_config(monkeypatch)
+    update_cmd._maybe_sync_from_backup_remote(GIT, repo_with_ahead_backup, "old-feature")
+    head = _git(repo_with_ahead_backup, "rev-parse", "HEAD").stdout.strip()
+    backup_tip = _git(repo_with_ahead_backup, "rev-parse", "backup/old-feature").stdout.strip()
+    assert head == backup_tip
+    log = _git(repo_with_ahead_backup, "log", "-1", "--format=%s").stdout.strip()
+    assert log == "backup-ahead-commit"
+
+
+def test_sync_from_backup_skips_when_local_has_commits_backup_lacks(repo_with_ahead_backup, monkeypatch):
+    """Diverged (not a clean ancestor relationship) -- must not force/merge, just no-op."""
+    _with_sync_from_backup_config(monkeypatch)
+    (repo_with_ahead_backup / "local-only.txt").write_text("local\n")
+    _git(repo_with_ahead_backup, "add", "local-only.txt")
+    _git(repo_with_ahead_backup, "commit", "-qm", "local-only-commit")
+    before = _git(repo_with_ahead_backup, "rev-parse", "HEAD").stdout.strip()
+
+    update_cmd._maybe_sync_from_backup_remote(GIT, repo_with_ahead_backup, "old-feature")
+
+    after = _git(repo_with_ahead_backup, "rev-parse", "HEAD").stdout.strip()
+    assert before == after
+
+
+def test_sync_from_backup_skips_on_dirty_tree(repo_with_ahead_backup, monkeypatch):
+    _with_sync_from_backup_config(monkeypatch)
+    (repo_with_ahead_backup / "a.txt").write_text("dirty edit\n")
+    before = _git(repo_with_ahead_backup, "rev-parse", "HEAD").stdout.strip()
+
+    update_cmd._maybe_sync_from_backup_remote(GIT, repo_with_ahead_backup, "old-feature")
+
+    after = _git(repo_with_ahead_backup, "rev-parse", "HEAD").stdout.strip()
+    assert before == after
+    assert _git(repo_with_ahead_backup, "status", "--porcelain").stdout.strip() != ""
+
+
+def test_sync_from_backup_skips_when_remote_missing(repo_pair, monkeypatch):
+    """Config enabled but no `backup` remote configured at all -- silent no-op, no error."""
+    _with_sync_from_backup_config(monkeypatch)
+    before = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+
+    update_cmd._maybe_sync_from_backup_remote(GIT, repo_pair, "old-feature")
+
+    after = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    assert before == after

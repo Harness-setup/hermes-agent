@@ -1674,15 +1674,14 @@ def _recover_pending_flushes(runner) -> int:
 
 
 def _cron_tick_profile_homes(config: object) -> list[tuple[str, "Path"]]:
-    """Profile homes the in-process ticker visits: the served set PLUS the process-active
-    profile: ``profiles_to_serve`` lists default + every live named profile, but a ``--profile
-    <name>`` gateway's own profile may sit outside ``profiles/`` (custom HERMES_HOME). One host
-    process ticks all of them regardless of ``gateway.multiplex_profiles``. Adapter startup
-    already skips ``active``."""
+    """Profile homes the in-process ticker visits under multiplex: the served set PLUS the
+    process-active profile. ``profiles_to_serve`` starts at default + allowlist, so a
+    ``--profile <name>`` multiplexer was omitted unless allowlisted — and allowlisting it would
+    start a second adapter on its own bot token. Adapter startup already skips ``active``."""
     from hermes_cli.profiles import get_active_profile_name, get_profile_dir
 
     homes = _multiplex_profile_homes(config)
-    active = get_active_profile_name() or "default"  # launch profile, pre-identity (ticker boot)
+    active = get_active_profile_name() or "default"
     if any(name == active for name, _home in homes):
         return homes
     try:
@@ -5288,6 +5287,17 @@ def _start_gateway_make_restart_signal_handler(runner):
     return restart_signal_handler
 
 
+def _start_gateway_make_interrupt_signal_handler(runner):
+    """SIGUSR2 (Pebble's Stop All): interrupt every running agent turn; the gateway stays up."""
+    def interrupt_signal_handler():
+        logger.info("SIGUSR2 received (Stop All): interrupting running agents; the gateway keeps running.")
+        try:
+            runner._interrupt_running_agents("user_stop_all")
+        except Exception:
+            logger.warning("SIGUSR2 interrupt failed", exc_info=True)
+    return interrupt_signal_handler
+
+
 def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdown: list):
     """Build the SIGINT/SIGTERM handler; ``_signal_initiated_shutdown[0]`` records an unplanned signal."""
     planned_stop_seen = [False]
@@ -5897,6 +5907,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         handlers = [(sig, shutdown_signal_handler, (sig,)) for sig in (signal.SIGINT, signal.SIGTERM)]
         if hasattr(signal, "SIGUSR1"):
             handlers.append((signal.SIGUSR1, restart_signal_handler, ()))  # windows-footgun: ok — hasattr-guarded
+        if hasattr(signal, "SIGUSR2"):
+            handlers.append((signal.SIGUSR2, _start_gateway_make_interrupt_signal_handler(runner), ()))  # windows-footgun: ok — hasattr-guarded
         for sig, handler, args in handlers:
             with suppress(NotImplementedError):
                 loop.add_signal_handler(sig, handler, *args)  # windows-footgun: ok — suppress(NotImplementedError)

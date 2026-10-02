@@ -235,7 +235,9 @@ def _recover_final_from_stream(agent, final_response, interrupted, failed) -> Tu
     return final_response, False
 
 
-def _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream) -> None:
+def _close_transcript_tail(
+    agent, messages, final_response, interrupted, _recovered_from_stream, _response_transformed=False,
+) -> None:
     """Shape the transcript tail before the durable snapshot (scaffolding already dropped
     and ``final_response`` already stream-recovered by the caller)."""
     # An interrupt can leave a tool result as the tail; close the sequence so strict
@@ -268,6 +270,22 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
         ):
             # Pure tool-call turn or stream-recovered blank (#95514): fill the persisted
             # blank row's content rather than append a second row.
+            _tail["content"] = final_response
+            stamp_message_timestamp(_tail)
+            _tail.pop(_DB_PERSISTED_MARKER, None)
+            agent._db_flush_scan_prefix = None
+        elif _response_transformed and _tail.get("content") != final_response:
+            # A plain (non-tool-call) turn already appended its own assistant row to
+            # `messages` back in conversation_loop.py before finalize_turn ever ran
+            # (`messages.append(final_msg)` at the loop's text_response exit) -- that
+            # row satisfies the role check above (tail IS assistant) but fails the
+            # branch just above (not missing visible text, no tool_calls), so neither
+            # branch touches it. But transform_llm_output (in _persist_step, just
+            # before this call) swapped `final_response` AFTER that row was appended
+            # with the pre-swap text. Overwrite its content in place, with the same
+            # marker-pop/cursor-invalidate treatment as the pure-tool-call-tail fill
+            # above, so the row this turn persists for the first time carries the
+            # swapped text.
             _tail["content"] = final_response
             stamp_message_timestamp(_tail)
             _tail.pop(_DB_PERSISTED_MARKER, None)
@@ -596,13 +614,23 @@ def finalize_turn(
         "cleanup_task_resources", lambda: agent._cleanup_task_resources(effective_task_id),
         _cleanup_errors, logger,
     )
+    _platform = getattr(agent, "platform", None) or ""
+    _response_transformed = False
+    _pre_transform_response = None
+
     # Persist only after the transcript tail is shaped and scaffolding removed. Each
     # sub-step runs in the same order as the original inline block, and the
     # stream-recovered ``final_response`` is rebound the moment it is computed — BEFORE
     # the fallible tail-shaping / override / micro-compaction / persist calls — so a
     # raise in any of them can't drop text the user already saw (#95514, #8049).
+    #
+    # transform_llm_output fires HERE too (via _apply_transform_hook), not after persist:
+    # `_session_db.append_message` is a pure insert with no update path, so a swap applied
+    # after the one-and-only persist call for this turn can't be written back into the
+    # same row without creating a duplicate. Gated on a real, uninterrupted response --
+    # transforming nothing doesn't make sense.
     def _persist_step():
-        nonlocal final_response
+        nonlocal final_response, _response_transformed, _pre_transform_response
         _drop_transcript_scaffolding(agent, messages)
         final_response, _recovered_from_stream = _recover_final_from_stream(
             agent, final_response, interrupted, failed
@@ -611,9 +639,21 @@ def finalize_turn(
         # earlier seam transformed; the normal text turn already did this before its flush and
         # gets the recorded outcome back. Either way the tail close below writes the text the
         # user will see, never the raw model text (#44239).
+        #
+        # transformed IS threaded through to _close_transcript_tail below (unlike upstream's own
+        # call site) -- regression-caught by test_transform_llm_output_swap_is_persisted_durably:
+        # a caller that reaches finalize_turn with messages[-1] already a COMPLETE assistant row
+        # (has visible text, no tool_calls, not stream-recovered) whose content predates this
+        # fresh transform needs that row patched, same as finish_text_response's own eager-append
+        # path patches it before ever calling this function. Dropping the flag silently leaves
+        # the stale pre-transform text in the durable transcript for that shape of caller.
         if final_response and not interrupted:
-            final_response, _, _ = apply_llm_output_transform(agent, final_response, turn_id=turn_id, logger=logger)
-        _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
+            final_response, _response_transformed, _pre_transform_response = apply_llm_output_transform(
+                agent, final_response, turn_id=turn_id, logger=logger,
+            )
+        _close_transcript_tail(
+            agent, messages, final_response, interrupted, _recovered_from_stream, _response_transformed,
+        )
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger, effective_task_id)
         agent._persist_session(messages, conversation_history)
@@ -635,14 +675,20 @@ def finalize_turn(
             agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
         )
 
-    _platform = getattr(agent, "platform", None) or ""
-    _response_transformed = False
-    _pre_transform_response = None
-    if final_response and not interrupted:
-        final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
-            agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
-            turn_id=turn_id, original_user_message=original_user_message, messages=messages,
-        )
+    # Unconditional: pre_llm_call fires unconditionally at turn start, and plugins pairing
+    # the two as a turn lifecycle signal (e.g. pebble-signal's droplet state) otherwise
+    # never see "turn ended" for an interrupted or textless turn (see docstring).
+    #
+    # Also the single authoritative place this function's own response_transformed/
+    # pre_transform_response result fields (read by gateway/run_turn.py and
+    # gateway/run_turn_runner.py) get their final value: apply_llm_output_transform is
+    # idempotent per turn_id, so this either fires the transform for a response that reached
+    # no earlier seam (e.g. text that only appeared through _explain_abnormal_exit above) or
+    # cheaply returns the already-recorded outcome from finish_text_response/_persist_step.
+    final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
+        agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
+        turn_id=turn_id, original_user_message=original_user_message, messages=messages,
+    )
 
     # Context engine observation hook: the turn finished with the finalized transcript.
     # Fail-open. ``_last_turn_usage`` is the last response's canonical usage dict, or
@@ -749,14 +795,30 @@ def finalize_turn(
         interrupted=interrupted, messages=messages,
     )
 
-    # Background memory/skill review runs AFTER delivery so it never competes with the
-    # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
-    # ~30K tokens / event with no human-in-the-loop benefit. Best-effort; the review
+    # Background memory/skill review — runs AFTER the response is delivered
+    # so it never competes with the user's task for model attention.
+    # Suppressed when skip_background_review=True (e.g. cron) — review forks
+    # spawn another AIAgent (~30K tokens / event) and cron sessions have no
+    # human-in-the-loop benefit from the review. Best-effort; the review
     # clones the snapshot structurally so its sanitizers can't reach the live transcript.
+    #
+    # Also suppressed whenever persistence is disabled (uncensored mode's
+    # no-trace guarantee). _should_review_memory only checks that "memory"
+    # is in agent.valid_tool_names -- that stays true while uncensored (the
+    # tool is still listed, just blocked at call time by memory_guard.py's
+    # pre_tool_call hook), so without this the review fork would still spawn
+    # and send the full conversation to whatever model backs the review
+    # (_resolve_review_runtime defaults to the parent's own model, but
+    # auxiliary.background_review can route it to a different one -- a
+    # cloud model, if ever configured for review quality). The eventual
+    # memory write is still blocked by the same hook either way, but the
+    # conversation content reaching an LLM call at all is exactly what "no
+    # trace" promises never happens.
     if (
         final_response
         and not interrupted
         and not getattr(agent, "skip_background_review", False)
+        and not getattr(agent, "_persist_disabled", False)
         and (_should_review_memory or _should_review_skills)
     ):
         with suppress(Exception):

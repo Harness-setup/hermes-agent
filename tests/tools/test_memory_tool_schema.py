@@ -30,3 +30,17 @@ def test_memory_schema_has_no_forbidden_top_level_combinators():
             "Codex backend (chatgpt.com/backend-api/codex). Per-action "
             "required-field checks belong in the runtime handler, not the schema."
         )
+
+
+def test_memory_schema_is_json_serializable():
+    json.dumps(MEMORY_SCHEMA)
+
+
+def test_memory_schema_advertises_view_action():
+    # Real live gap, 2026-09-30: the runtime handler gained a read-only
+    # "view" action, but the schema's own action enum still only listed
+    # add/replace/remove -- the model has no way to discover an action that
+    # isn't in the enum it's shown, so it kept guessing (calling memory()
+    # with no action at all) instead of ever finding the right one.
+    action_enum = MEMORY_SCHEMA["parameters"]["properties"]["action"]["enum"]
+    assert "view" in action_enum

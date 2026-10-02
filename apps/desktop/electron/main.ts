@@ -18137,8 +18137,24 @@ const streamThrottle = createStreamThrottle(undefined, undefined, {
   keepFullscreenPainting: process.platform === 'linux' && linuxOzoneBackend(process.env, process.argv) === 'wayland'
 })
 
+// A pending slash/@ completion RPC needs the same unthrottled painting a live
+// turn gets -- Chromium's default background throttling can otherwise defer
+// the repaint that shows the fetched dropdown until some unrelated event
+// (focus change, a keystroke) forces a paint, which reads as the dropdown
+// "not working" even though the data arrived and React state updated
+// correctly (live-diagnosed 2026-08-17: Ctrl+A reliably revealed an
+// already-correct but unpainted completion list). Deliberately a SEPARATE
+// per-webContents map and IPC channel from activeWorkByWebContents, not a
+// reuse of it -- ActiveWork also drives the quit-confirmation dialog, and a
+// pending completion must never make quitting look like it would lose work.
+const completionPendingByWebContents = new Map<number, boolean>()
+
 function updateStreamThrottleFromActiveWork() {
-  streamThrottle.update(mergeActiveWork(activeWorkByWebContents.values()).count > 0)
+  const busy =
+    mergeActiveWork(activeWorkByWebContents.values()).count > 0 ||
+    Array.from(completionPendingByWebContents.values()).some(Boolean)
+
+  streamThrottle.update(busy)
 }
 
 ipcMain.on('hermes:active-work', (event, payload) => {
@@ -18154,6 +18170,20 @@ ipcMain.on('hermes:active-work', (event, payload) => {
   const work = normalizeActiveWork(payload)
   activeWorkByWebContents.set(id, work)
   lastActiveWorkSeen = work
+  updateStreamThrottleFromActiveWork()
+})
+
+ipcMain.on('hermes:completion-pending', (event, payload) => {
+  const id = event.sender.id
+
+  if (!completionPendingByWebContents.has(id)) {
+    event.sender.once('destroyed', () => {
+      completionPendingByWebContents.delete(id)
+      updateStreamThrottleFromActiveWork()
+    })
+  }
+
+  completionPendingByWebContents.set(id, Boolean(payload))
   updateStreamThrottleFromActiveWork()
 })
 

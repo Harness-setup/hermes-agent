@@ -177,7 +177,15 @@ class MCPServerRunMixin:
         in ``_mark_session_proven``) stays a WARNING; an identical repeat while still parked is
         demoted to DEBUG so a long-lived gateway's error log is not flooded (10k+ identical
         lines/month). A park for a DIFFERENT reason (auth error after connection refused) is new
-        information and warns again."""
+        information and warns again.
+
+        Direct Discord notification on a new auth-related park (Tony, 2026-09-23: "keeps on
+        asking me to reauthenticate for todoist mcp") moved out to a standalone script
+        (~/.hermes/scripts/check-mcp-auth-parks.py, run on its own cron schedule) instead of
+        living here -- "turn every local fixes that we have into plugins or scripts since that
+        is more reliable than changing core code when possible." That script does its own live
+        probe (`hermes mcp test <name>`) rather than observing this in-process park state, since
+        a separate process can't reach it anyway."""
         line = msg % args if args else msg
         if self._was_parked and line == self._last_park_line:
             logger.debug(msg, *args)
@@ -516,7 +524,9 @@ class MCPServerRunMixin:
             self._reconnect_retries, budget.backoff = 0, 1.0
             await asyncio.sleep(_jittered(1.0))
             return not self._shutdown_event.is_set()
-        # Deterministic failure on a working server: park now.
+        # Deterministic failure on a working server: park now. Reached here only after the auth
+        # grace branch above already fired once for this same task (_permanent_grace_used), or
+        # for a non-auth permanent error -- check the root cause directly rather than assuming.
         self._log_park(
             "MCP server '%s' hit a permanent error, parking without retries; will self-probe every %ds "
             "(state: connected → parked): %s: %s", self.name, _core._PARKED_RETRY_INTERVAL, type(root).__name__, root)

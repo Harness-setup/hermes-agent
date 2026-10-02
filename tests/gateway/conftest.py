@@ -202,6 +202,14 @@ def _ensure_discord_mock() -> None:
     discord_mod.Interaction = object
     discord_mod.Message = type("Message", (), {})
 
+    # Object: accept the kwargs production code uses (id=...) -- a bare MagicMock attribute
+    # returns a MagicMock instance whose .id is ALSO a MagicMock, not the id you constructed it
+    # with, which breaks any test asserting on bulk-delete/fetch id lists built via discord.Object.
+    class _FakeObject:
+        def __init__(self, *, id=None, **_):  # noqa: A002 - matches discord API
+            self.id = id
+    discord_mod.Object = _FakeObject
+
     # Embed: accept the kwargs production code / tests use
     # (title, description, color). MagicMock auto-attributes work too,
     # but some tests construct and inspect .title/.description directly.
@@ -219,6 +227,16 @@ def _ensure_discord_mock() -> None:
             self.footer = {"text": text, "icon_url": icon_url}
             return self
     discord_mod.Embed = _FakeEmbed
+
+    # Forbidden: a real Exception subclass, not a bare MagicMock attribute -- `except
+    # discord.Forbidden:` in production code raises TypeError ("catching classes that do not
+    # inherit from BaseException") against an unset MagicMock attribute. The real class's
+    # constructor needs a response object with .status/.reason; tests raising/catching this only
+    # need isinstance compatibility, so accept anything.
+    class _FakeForbidden(Exception):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args)
+    discord_mod.Forbidden = _FakeForbidden
 
     # ui.View / ui.Select / ui.Button: real classes (not MagicMock) so
     # tests that subclass ModelPickerView / iterate .children / clear

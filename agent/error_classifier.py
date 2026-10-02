@@ -63,6 +63,13 @@ class FailoverReason(enum.Enum):
     long_context_tier = "long_context_tier"    # Anthropic "extra usage" tier gate
     oauth_long_context_beta_forbidden = "oauth_long_context_beta_forbidden"  # Anthropic OAuth rejects 1M beta — disable beta and retry
     llama_cpp_grammar_pattern = "llama_cpp_grammar_pattern"  # llama.cpp grammar rejects regex `pattern`/`format` — strip from tools and retry
+    # engine_startup_aborted removed 2026-09-14: migrated to a
+    # transform_api_error_classification plugin hook
+    # (~/.hermes/plugins/mode/error_classification.py), which reuses the
+    # `timeout` reason below instead of a dedicated enum member -- see that
+    # module's docstring for why no core change was needed at all here.
+
+    # Catch-all
     unknown = "unknown"                  # Unclassifiable — retry with backoff
 
 

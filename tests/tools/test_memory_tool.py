@@ -436,6 +436,32 @@ class TestMemoryToolDispatcher:
         assert result["success"] is False
         assert "not available" in result["error"]
 
+    def test_view_returns_current_entries_without_mutating(self, store):
+        # Real live gap, 2026-09-30: there was no read-only action at all --
+        # a model that just wanted to see current memory before deciding how
+        # to consolidate (a common need once a store nears its char limit)
+        # had no valid call to make, and repeatedly called memory() with no
+        # action at all, failing every time with "Unknown action 'None'".
+        store.add("user", "fact A")
+        store.add("user", "fact B")
+        result = json.loads(memory_tool(action="view", target="user", store=store))
+        assert result["success"] is True
+        assert result["entries"] == ["fact A", "fact B"]
+        assert "usage" in result
+        # must not have mutated anything
+        assert store.user_entries == ["fact A", "fact B"]
+
+    def test_view_defaults_to_memory_target(self, store):
+        store.add("memory", "a memory entry")
+        result = json.loads(memory_tool(action="view", store=store))
+        assert result["success"] is True
+        assert result["entries"] == ["a memory entry"]
+
+    def test_view_on_empty_store_returns_empty_list(self, store):
+        result = json.loads(memory_tool(action="view", target="user", store=store))
+        assert result["success"] is True
+        assert result["entries"] == []
+
 
     def test_replace_missing_content_still_distinct_error(self, store):
         # When old_text IS present but content is missing, keep the original

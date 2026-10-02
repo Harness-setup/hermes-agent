@@ -149,8 +149,11 @@ class ComputerUseBackend(ABC):
                delivery_mode: Optional[str] = None, bring_to_front: bool = False) -> ActionResult: ...
 
     @abstractmethod
-    def type_text(self, text: str, *, delivery_mode: Optional[str] = None,
+    def type_text(self, text: str, *, delay_ms: Optional[int] = None, delivery_mode: Optional[str] = None,
                   bring_to_front: bool = False) -> ActionResult: ...
+    # delay_ms: 0-200ms between characters (driver default 30) -- real cua-driver capability
+    # (`cua-driver describe type_text`), just never threaded through here until Tony asked for
+    # slow/watchable typing in computer_use, not only the separate browser_type_slowly tool.
 
     @abstractmethod
     def key(self, keys: str, *, delivery_mode: Optional[str] = None, bring_to_front: bool = False) -> ActionResult: ...

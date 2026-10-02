@@ -103,6 +103,83 @@ def test_finalize_turn_fires_review_when_flag_unset() -> None:
     agent._spawn_background_review.assert_called_once()
 
 
+def test_finalize_turn_skips_review_when_persist_disabled() -> None:
+    """finalize_turn must NOT call _spawn_background_review when
+    agent._persist_disabled is True (uncensored mode's no-trace guarantee).
+
+    _should_review_memory only checks "memory" in valid_tool_names, which
+    stays true while uncensored (memory_guard.py blocks the call, not the
+    tool's listing) -- without this gate the review fork would still spawn
+    and send the full conversation to an LLM call (the review model,
+    possibly a configured cloud model), even though the eventual memory
+    write gets blocked downstream. Exercises the real finalizer path, not
+    a duplicated guard expression.
+    """
+    agent = _make_agent(skip_background_review=False)
+    _stub_agent_for_finalize(agent)
+    agent._persist_disabled = True
+    _run_finalize(agent)
+    agent._spawn_background_review.assert_not_called()
+
+
+def test_finalize_turn_fires_review_when_persist_not_disabled() -> None:
+    """Counterpart: with persistence enabled, finalize_turn DOES review."""
+    agent = _make_agent(skip_background_review=False)
+    _stub_agent_for_finalize(agent)
+    agent._persist_disabled = False
+    _run_finalize(agent)
+    agent._spawn_background_review.assert_called_once()
+
+
+def test_cron_construction_sets_skip_background_review() -> None:
+    """The cron scheduler MUST construct AIAgent with skip_background_review=True.
+
+    Verified via source-text inspection — the cron scheduler is heavy to
+    boot in tests, so we assert that the source declares the flag rather
+    than running the scheduler. This catches accidental removal.
+    """
+    import pathlib
+
+    scheduler_src = pathlib.Path(__file__).resolve().parents[2] / "cron" / "scheduler.py"
+    text = scheduler_src.read_text(encoding="utf-8")
+
+    assert "skip_background_review=True" in text, (
+        "cron/scheduler.py must construct AIAgent with skip_background_review=True."
+    )
+
+
+def test_uncensored_session_init_sets_skip_background_review() -> None:
+    """Tony, 2026-08-25: "did we make it so that it does not save anything
+    on memory, user memory, system memory and stuff like that?" -- the
+    explicit "memory" tool is already blocked at call-time (mode/
+    memory_guard.py's pre_tool_call hook), but that alone leaves a
+    background-review fork (turn_finalizer.py's _spawn_background_review,
+    another full AIAgent processing the conversation) free to spawn and
+    read the "private" conversation regardless of whether its own eventual
+    memory-write attempt gets blocked. agent_init.py's full session-init
+    function is heavy to construct in isolation (same reasoning as the
+    cron test above) -- verified via source-text inspection instead: the
+    uncensored-session branch must set agent.skip_background_review = True,
+    not just leave the flag at whatever the (non-uncensored-aware) caller
+    passed in.
+    """
+    import pathlib
+
+    agent_init_src = pathlib.Path(__file__).resolve().parents[2] / "agent" / "agent_init.py"
+    text = agent_init_src.read_text(encoding="utf-8")
+
+    if_block_start = text.index("if _is_uncensored_session:")
+    # The next top-level statement at the same indentation ends this
+    # if-block -- "agent._session_init_model_config" is the line
+    # immediately following it, unchanged since this was written.
+    if_block_end = text.index("agent._session_init_model_config", if_block_start)
+    if_block = text[if_block_start:if_block_end]
+
+    assert "agent.skip_background_review = True" in if_block, (
+        "agent_init.py's uncensored-session branch must set "
+        "agent.skip_background_review = True, or a background review fork "
+        "can still read/process a 'private' uncensored conversation."
+    )
 
 
 def test_persistence_failure_error_fallback_is_pinned_and_leaves_final_response_empty(monkeypatch, tmp_path) -> None:

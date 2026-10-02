@@ -680,16 +680,20 @@ class CLIChatTurnMixin:
                 _resp_text = _maybe_remap_for_light_mode("#FFF8DC")
 
             is_error_response = turn.result and (turn.result.get("failed") or turn.result.get("partial"))
+            # A transform_llm_output plugin (e.g. the refusal->uncensored swap, or this repo's own
+            # kanban dispatch relay) can replace the response with different text than what was
+            # already streamed token-by-token -- streaming renders before finalize_turn() runs that
+            # hook, so force the full Panel render in that case (see agent/turn_finalizer.py).
+            _response_transformed = bool(turn.result and turn.result.get("response_transformed"))
             # An interrupted reply that streamed before a tool-call boundary reset the segment
-            # state is already on screen (#65666). Only suppress when the response IS that text:
-            # unstreamed interrupt/status messages and completed replies still get their Panel.
+            # state is already on screen (#65666). Only suppress when the response IS that text.
             _interrupted_streamed = bool(
                 self._last_turn_interrupted and response.strip()
                 and " ".join(response.split()) in " ".join(self._streamed_text_this_turn.split())
             )
             already_streamed = (
                 (self._stream_started and self._stream_box_opened) or _interrupted_streamed
-            ) and not is_error_response
+            ) and not is_error_response and not _response_transformed
             if turn.use_streaming_tts and turn.box_opened and not is_error_response:
                 # Text already printed sentence-by-sentence; just close the box.
                 _cprint(f"\n{_ACCENT}╰{'─' * (self._scrollback_box_width() - 2)}╯{_RST}")

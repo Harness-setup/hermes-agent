@@ -1,8 +1,9 @@
 import type { Unstable_TriggerAdapter, Unstable_TriggerItem } from '@assistant-ui/core'
-import { type MutableRefObject, type RefObject, useCallback, useEffect, useRef, useState } from 'react'
+import { type MutableRefObject, type RefObject, useCallback, useEffect, useId, useRef, useState } from 'react'
 
 import { hermesDirectiveFormatter } from '@/components/assistant-ui/directive-text'
 import { desktopSlashCommandArgumentMode } from '@/lib/desktop-slash-commands'
+import { setCompletionPending, unregisterCompletionPending } from '@/store/completion-pending'
 
 import {
   COMPLETION_ACTIONS,
@@ -122,6 +123,11 @@ export function useComposerTrigger({
   setComposerText,
   slash
 }: UseComposerTriggerOptions) {
+  // Stable per-mounted-composer id for the completion-pending registry
+  // (store/completion-pending.ts) -- multiple composer instances (main
+  // window, HUD, popped-out tiles) can each have a completion in flight at
+  // once, so the registry is reference-counted by this id, not a bare bool.
+  const completionPendingId = useId()
   const [trigger, setTrigger] = useState<TriggerState | null>(null)
   const [triggerActive, setTriggerActive] = useState(0)
   // The list highlights its first row on open, which is a suggestion rather
@@ -227,6 +233,21 @@ export function useComposerTrigger({
         : trigger?.kind === ':'
           ? (emoji?.loading ?? false)
           : false
+
+  // Chromium's default background throttling can defer the repaint that
+  // shows a fetched completion list until an unrelated event forces a paint
+  // — indistinguishable from the completion "just not working" without a
+  // debugger attached (live-diagnosed 2026-08-17: Ctrl+A reliably revealed
+  // an already-correct but unpainted /mode dropdown). A live chat turn is
+  // already exempted from this throttling (electron/stream-throttle.ts);
+  // this exempts a pending completion fetch the same way. Registers only
+  // while genuinely loading, and always unregisters on unmount so a closed
+  // composer never leaves a stuck "pending" vote behind.
+  useEffect(() => {
+    setCompletionPending(completionPendingId, triggerLoading)
+
+    return () => unregisterCompletionPending(completionPendingId)
+  }, [completionPendingId, triggerLoading])
 
   // Suppress the "No matches" empty state once a slash command is past its name:
   // a no-arg command has nothing to offer, and a fully-typed arg commits on
@@ -367,10 +388,20 @@ export function useComposerTrigger({
     // already an arg pick (`/personality alice`), so it commits normally. An
     // inline (mid-message) pick never expands: it's a reference inside prose, so
     // there's no command invocation for the args to belong to.
+    //
+    // Trim before checking for that space: the backend appends a trailing
+    // space to any EXACT command-name match (so the completion menu stays
+    // open rather than looking like a no-op) -- see
+    // SlashCommandCompleter._completion_text. That trailing space carries no
+    // argument, but an untrimmed check reads it as one, so accepting a
+    // plugin-registered options command (e.g. /mode) by typing it out and
+    // pressing Space/Tab committed it as a flat chip instead of expanding to
+    // its argument dropdown -- live-confirmed 2026-08-20.
     const command = (item.metadata as { command?: string } | undefined)?.command ?? ''
 
     const argumentMode = desktopSlashCommandArgumentMode(command)
-    const expandsToArgs = trigger.kind === '/' && !trigger.inline && !serialized.includes(' ') && argumentMode !== null
+    const expandsToArgs =
+      trigger.kind === '/' && !trigger.inline && !serialized.trim().includes(' ') && argumentMode !== null
 
     const text = starter || serialized.endsWith(' ') ? serialized : `${serialized} `
     const directive = !starter && serialized.match(/^@([^:]+):(.+)$/)

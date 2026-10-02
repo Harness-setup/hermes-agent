@@ -84,6 +84,7 @@ _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.json"
+_DISCORD_UNCENSORED_STATE_FILENAME = "discord_uncensored_messages.json"
 
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
@@ -309,7 +310,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult, unauthorized_action_notice,
     cache_image_from_url, cache_image_from_bytes_async, cache_audio_from_url, cache_audio_from_bytes_async,
     cache_document_from_bytes_async, SUPPORTED_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS,
-    _prefix_within_utf16_limit, utf16_len, validate_inbound_media_size,
+    _prefix_within_utf16_limit, utf16_len, validate_inbound_media_size, _reply_anchor_for_event,
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from tools.url_safety import is_safe_url
@@ -549,6 +550,121 @@ class _DiscordNonConversationalMessageTracker:
 
     def __contains__(self, message_id: str) -> bool:
         return str(message_id or "") in self._ids
+
+
+def _current_mode_kind() -> Optional[str]:
+    """Read ``~/.hermes/mode-state.json``'s ``kind`` directly (``"cloud"``/``"local"``/
+    ``"uncensored"``), independent of the ``mode`` Hermes plugin's own package (that plugin
+    lives outside hermes-agent's import path). ``None`` on any read/parse failure — callers
+    decide fail-open vs fail-closed per their own consequence (see _DiscordUncensoredMessageTracker)."""
+    try:
+        path = _Path.home() / ".hermes" / "mode-state.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        kind = data.get("kind")
+        return str(kind) if kind else None
+    except Exception:
+        return None
+
+
+class _DiscordUncensoredMessageTracker:
+    """Tracks (channel_id, message_id) pairs sent/received while mode-state.json's ``kind`` is
+    ``"uncensored"``, and deletes them all once the fleet leaves that mode.
+
+    Tony, 2026-09-22: extends the mode plugin's existing "no trace" guarantee for uncensored mode
+    (see ~/.hermes/plugins/mode/session_summary.py -- that file already refuses to carry ANY
+    context out of an uncensored session into the next one) to Discord message history itself:
+    both his own prompts and the bot's replies sent during an uncensored exchange get deleted once
+    the fleet switches away, not just excluded from later context. Mode is fleet-global (one
+    ~/.hermes/mode-state.json, not per-session/per-channel -- see mode/__init__.py: "Switch the
+    fleet's model mode"), so this tracker is intentionally NOT session-scoped either: it just
+    records every message touched while uncensored, across every channel, and sweeps all of it on
+    the next kind transition away from uncensored, detected by simple edge-detection against the
+    persisted ``last_kind`` (no coupling to the mode plugin's own one-shot session-reset marker,
+    which session_summary.py already consumes for its own purpose).
+
+    Persisted (not just in-memory) so a gateway restart mid-uncensored-session doesn't lose track
+    of messages still pending deletion, and so a kind change that happened while the process was
+    down is still caught the next time this tracker is consulted (on connect, and per message)."""
+
+    def __init__(self) -> None:
+        state = self._load()
+        self._last_kind: Optional[str] = state.get("last_kind")
+        self._messages: list = state.get("messages") or []
+        self._persist_lock = asyncio.Lock()
+
+    def _state_path(self) -> _Path:
+        from hermes_constants import get_hermes_home
+        return (
+            get_hermes_home()
+            / _DISCORD_COMMAND_SYNC_STATE_SUBDIR
+            / _DISCORD_UNCENSORED_STATE_FILENAME
+        )
+
+    def _load(self) -> dict:
+        path = self._state_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            logger.debug("[%s] Failed to load uncensored Discord message tracker state", "Discord")
+        return {}
+
+    def _save(self) -> None:
+        try:
+            atomic_json_write(
+                self._state_path(),
+                {"last_kind": self._last_kind, "messages": self._messages},
+                indent=None,
+            )
+        except Exception:
+            logger.debug("[%s] Failed to save uncensored Discord message tracker state", "Discord", exc_info=True)
+
+    async def _persist(self) -> None:
+        async with self._persist_lock:
+            await asyncio.to_thread(self._save)
+
+    async def maybe_sweep(self) -> "list | None":
+        """Call before tracking/sending any message. Reads the current kind; if it just
+        transitioned AWAY from "uncensored" (persisted last_kind was "uncensored", current is
+        not), returns the messages to delete (and clears/persists state) -- caller does the
+        actual Discord deletes, since this class has no Discord client access. A failed current-
+        kind read is treated as "unknown, no transition" (fail toward NOT deleting -- deletion is
+        irreversible, unlike simply tracking one extra candidate message)."""
+        current = _current_mode_kind()
+        if current is None:
+            return None  # can't confirm a transition happened -- never delete on a guess
+        if self._last_kind == "uncensored" and current != "uncensored" and self._messages:
+            to_delete = self._messages
+            self._messages = []
+            self._last_kind = current
+            await self._persist()
+            return to_delete
+        if current != self._last_kind:
+            self._last_kind = current
+            await self._persist()
+        return None
+
+    async def track(self, channel_id: Any, message_id: Any) -> None:
+        """Record one message as uncensored-mode-authored. Caller already confirmed the current
+        kind is "uncensored" (via maybe_sweep's side-effected self._last_kind, or a fresh check).
+        Idempotent: _dispatch_discord_message calls _track_if_uncensored both before and after
+        the turn's own hooks run (the second call is the only way to catch a message that itself
+        triggers the switch INTO uncensored, since kind hasn't flipped yet at the first call) --
+        for an ordinary in-uncensored message already tracked by the first call, kind is
+        unchanged and the second call would otherwise append a duplicate entry, doubling the
+        sweep's delete list. A plain membership check keeps a real duplicate SEND (rare, but not
+        impossible) tracked once per distinct message id, which is all the sweep needs."""
+        entry = {"channel_id": str(channel_id), "message_id": str(message_id)}
+        if entry in self._messages:
+            return
+        self._messages.append(entry)
+        await self._persist()
+
+    def is_currently_uncensored(self) -> bool:
+        return self._last_kind == "uncensored"
 
 
 def _discord_snowflake_time(snowflake: int) -> dt.datetime:
@@ -1112,6 +1228,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
         # Threads the bot participated in (no @mention needed there); persisted across restarts.
         self._threads = ThreadParticipationTracker("discord")
+        # Lazily-created per-turn thread that tool-call progress lines get routed into when
+        # discord.thread_tool_calls is on -- keyed by the triggering event_message_id, separate
+        # from the reasoning/final-answer main-chat send path. Not persisted: a fresh process
+        # just creates a new thread on the next tool call, which is fine (#discord-thread-split).
+        self._tool_progress_threads: Dict[str, Any] = {}
+        # Set by the runner via set_voice_auto_join_handler (discord.auto_join_voice) --
+        # async (adapter, member, channel) -> None. None until wired, and always None on
+        # platforms/tests that never call the setter.
+        self._voice_auto_join_handler: Optional[Any] = None
         # Persistent typing loops per channel (DMs don't reliably show bot typing events).
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._bot_task: Optional[asyncio.Task] = None
@@ -1164,6 +1289,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._last_self_message_id: Dict[str, str] = {}
         # Bot-authored lifecycle/status message IDs that must not bound history after restart.
         self._nonconversational_messages = _DiscordNonConversationalMessageTracker()
+        # No-trace guarantee for uncensored mode (see class docstring): tracks messages sent
+        # while mode-state.json's kind is "uncensored" and deletes them once it leaves that mode.
+        self._uncensored_messages = _DiscordUncensoredMessageTracker()
         # Last truncated mid-stream preview per (chat_id, message_id): past the 2000 cap every edit
         # truncates to the SAME text, and re-sending only burns edit rate limit. Dropped on finalize.
         # Once an oversized streaming edit saturates at the 2000-char preview cap, every subsequent
@@ -1334,6 +1462,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             async def on_ready():
                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
                 await adapter_self._resolve_allowed_usernames()
+                # Catches a mode-kind change that happened while this process was down.
+                await adapter_self._sweep_uncensored_messages_if_needed()
                 adapter_self._ready_event.set()
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
                     adapter_self._post_connect_task.cancel()
@@ -1379,7 +1509,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
-                """Track voice channel join/leave events."""
+                """Track voice channel join/leave events; auto-join a real human's channel first
+                when discord.auto_join_voice is on and the bot isn't already connected there."""
+                auto_join_channel = adapter_self._voice_auto_join_target(member, before, after)
+                if auto_join_channel is not None:
+                    try:
+                        await adapter_self._voice_auto_join_handler(adapter_self, member, auto_join_channel)
+                    except Exception as e:
+                        logger.warning("[%s] voice auto-join handler failed: %s", adapter_self.name, e)
                 bot_guild_ids = set(adapter_self._voice_clients.keys())
                 if not bot_guild_ids:
                     return
@@ -1571,7 +1708,20 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not admitted:
             return False
         self._record_bot_tag_debounce(message)
-        return await self._handle_message(message, role_authorized=role_authorized)
+        await self._track_if_uncensored(message.channel.id, message.id)
+        result = await self._handle_message(message, role_authorized=role_authorized)
+        # Tony, 2026-09-28: "I also want it to erase the message that I sent to switch to
+        # uncensored mode." The pre-handle track() above runs before _handle_message's own
+        # pre_gateway_dispatch hooks (the mode plugin's deterministic switch included) ever
+        # flip mode-state.json, so a message that ITSELF triggers the switch INTO uncensored
+        # is checked while the OLD kind is still current and never gets tracked -- only
+        # messages sent AFTER the switch were ever caught. A second check here, once the
+        # turn's hooks have run, catches exactly that case: if kind is uncensored now but
+        # wasn't when the pre-check ran, this tracks the trigger message retroactively.
+        # Safe to call unconditionally -- track() is idempotent, so a message already tracked
+        # by the pre-check (kind was already uncensored before the turn) is a cheap no-op here.
+        await self._track_if_uncensored(message.channel.id, message.id)
+        return result
 
     # --- gateway_platform_event fire-sites ---
 
@@ -2997,6 +3147,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for final reaction and durable state."""
         await asyncio.to_thread(self._record_discord_processing_complete, event, outcome)
+        await self._archive_tool_progress_thread(_reply_anchor_for_event(event))
         if not self._reactions_enabled():
             return
         message = event.raw_message
@@ -3116,6 +3267,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     await self._nonconversational_messages.mark_many(message_ids)
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
+                channel_id = getattr(channel, "id", _target_id)
+                for _mid in message_ids:
+                    await self._track_if_uncensored(channel_id, _mid)
             # Connection-shaped failure (WS drop / closed session): use the ledger's runtime-retryable
             # marker so the reconnect sweep can replay this final response instead of stranding it until a
             # process restart (#95382 silent partial loss).
@@ -5247,6 +5401,113 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             logger.warning("[%s] Failed to fetch channel history: %s", self.name, e)
             return ""
 
+    async def _sweep_uncensored_messages_if_needed(self) -> None:
+        """Check for a just-happened "left uncensored mode" transition and delete every message
+        tracked during that session (both Tony's own prompts and the bot's replies -- see
+        _DiscordUncensoredMessageTracker's docstring). Called on connect (catches a kind change
+        that happened while the process was down) and around every message send/receive (catches
+        it live, essentially immediately since the /mode switch itself flows through this same
+        message pipeline). Best-effort: a delete failure for one message must never block the rest."""
+        to_delete = await self._uncensored_messages.maybe_sweep()
+        if not to_delete:
+            return
+        by_channel: Dict[str, list] = {}
+        for entry in to_delete:
+            by_channel.setdefault(entry["channel_id"], []).append(entry["message_id"])
+        deleted = 0
+        for channel_id, message_ids in by_channel.items():
+            try:
+                channel = await self._resolve_channel(channel_id)
+            except Exception as e:
+                logger.warning("[%s] uncensored cleanup: could not resolve channel %s: %s", self.name, channel_id, e)
+                continue
+            if channel is None:
+                continue
+            # Tony, 2026-09-28: "it also does not erase the thread for it ... I think when you
+            # erase the message it erases the thread as well." When the tracked channel IS a
+            # thread (the whole uncensored exchange happened inside one -- tool-progress threads,
+            # auto-created conversation threads), deleting every message the tracker knew about
+            # still leaves the thread object itself sitting in the channel's thread list, empty
+            # or not. Deleting the thread wholesale is simpler than deleting messages one by one
+            # AND satisfies the "no trace" guarantee for real: no bot-authored/permission-gated
+            # per-message delete race, just gone. Falls through to the ordinary per-message path
+            # below only if the thread delete itself fails (e.g. missing Manage Threads).
+            if isinstance(channel, discord.Thread):
+                try:
+                    await channel.delete()
+                    deleted += len(message_ids)
+                    continue
+                except discord.Forbidden:
+                    logger.warning(
+                        "[%s] uncensored cleanup: could not delete thread %s (missing 'Manage "
+                        "Threads' permission) -- falling back to deleting its tracked messages "
+                        "individually; the thread itself will remain, empty",
+                        self.name, channel_id,
+                    )
+                except Exception as e:
+                    logger.debug("[%s] uncensored cleanup: thread delete failed, falling back to "
+                                 "per-message deletes: %s", self.name, e)
+            # Bulk delete only covers messages under 14 days old and needs >=2 ids; fall back to
+            # individual deletes (both for a single id and for anything bulk delete rejects).
+            bulk_eligible = len(message_ids) >= 2
+            bulk_failed_ids = message_ids
+            if bulk_eligible and hasattr(channel, "delete_messages"):
+                try:
+                    from discord import Object as _DiscordObject
+                    await channel.delete_messages([_DiscordObject(id=int(mid)) for mid in message_ids])
+                    deleted += len(message_ids)
+                    bulk_failed_ids = []
+                except discord.Forbidden:
+                    # Caught separately below per-message (bulk Forbidden doesn't tell us WHICH
+                    # id it was for), but this path is common enough (bulk delete needs the same
+                    # Manage Messages permission as an individual delete) to skip the DEBUG-level
+                    # "fell back to individual" noise for the expected-permission-failure case.
+                    pass
+                except Exception as e:
+                    logger.debug("[%s] uncensored cleanup: bulk delete fell back to individual deletes: %s", self.name, e)
+            permission_denied = 0
+            for mid in bulk_failed_ids:
+                try:
+                    msg = await channel.fetch_message(int(mid))
+                    await msg.delete()
+                    deleted += 1
+                except discord.Forbidden:
+                    # Root-caused live 2026-09-23 (Tony: "discord uncensored mode only gets rid
+                    # of the agent message"): Discord requires the Manage Messages permission to
+                    # delete anyone ELSE's message in a channel -- a bot can always delete its
+                    # OWN messages without it. The Jarvis role had no Manage Messages grant, so
+                    # every attempt to delete TONY's own tracked prompts (never the bot's own
+                    # replies) failed silently at DEBUG level -- exactly the asymmetric "only the
+                    # agent message" symptom, invisible without deliberately checking Discord's
+                    # permission API directly the way this was actually diagnosed. Surfaced at
+                    # WARNING now, once per sweep (not once per message), with the exact fix.
+                    permission_denied += 1
+                except Exception as e:
+                    logger.debug("[%s] uncensored cleanup: could not delete message %s: %s", self.name, mid, e)
+            if permission_denied:
+                logger.warning(
+                    "[%s] uncensored cleanup: %d message(s) in channel %s could NOT be deleted -- "
+                    "the bot's Discord role is missing the 'Manage Messages' permission, which is "
+                    "required to delete anyone else's message (it can always delete its own). "
+                    "Grant 'Manage Messages' to the bot's role in Discord server settings to fix "
+                    "this for real; until then, no-trace cleanup only ever removes the bot's own "
+                    "replies, never the prompts that triggered them.",
+                    self.name, permission_denied, channel_id,
+                )
+        if deleted:
+            logger.info("[%s] Uncensored mode ended — deleted %d message(s) (no-trace cleanup)", self.name, deleted)
+
+    async def _track_if_uncensored(self, channel_id: Any, message_id: Any) -> None:
+        """Record *message_id* for later cleanup iff the fleet is currently in uncensored mode.
+        Always calls the sweep check first, so a kind transition is caught before this message
+        (already in the NEW kind) gets mistakenly tracked under the old one."""
+        try:
+            await self._sweep_uncensored_messages_if_needed()
+            if self._uncensored_messages.is_currently_uncensored():
+                await self._uncensored_messages.track(channel_id, message_id)
+        except Exception:
+            logger.debug("[%s] uncensored message tracking failed", self.name, exc_info=True)
+
     async def _resolve_channel(self, channel_id: Any) -> Any:
         """Cached ``get_channel`` first, REST ``fetch_channel`` on miss (raises on API error).
 
@@ -5395,6 +5656,146 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             self.name, last_direct_error, last_fallback_error,
         )
         return None
+
+    def _discord_thread_tool_calls_enabled(self) -> bool:
+        """Tony, 2026-09-22: split tool-call/reasoning display -- reasoning and the final answer
+        stay in the main channel (unchanged), tool-call progress lines go to a thread instead, so
+        the main channel stays readable while the detail is still one click away. Default off:
+        nothing changes for a channel/profile that hasn't opted in."""
+        return self._extra_or_env_flag("thread_tool_calls", "DISCORD_THREAD_TOOL_CALLS", "false", truthy=True)
+
+    def _discord_auto_join_voice_enabled(self) -> bool:
+        """Tony, 2026-09-22: "make it so it automatically works when I join the voice channel" --
+        join Jarvis into a real human's voice channel the moment they enter one, no /voice join
+        needed. Default off: a bot silently following every human into voice would be a real
+        surprise for anyone who hasn't opted in."""
+        return self._extra_or_env_flag("auto_join_voice", "DISCORD_AUTO_JOIN_VOICE", "false", truthy=True)
+
+    def set_voice_auto_join_handler(self, handler) -> None:
+        """Wired by the runner (gateway/run_adapters.py) to GatewayRunner._handle_voice_auto_join --
+        async (adapter, member, channel) -> None. Kept as a plain setter (matching
+        set_message_handler et al.) rather than importing gateway.run_voice here, which would be
+        a plugin-layer -> gateway-layer import cycle."""
+        self._voice_auto_join_handler = handler
+
+    def _voice_auto_join_target(self, member, before, after) -> Optional[Any]:
+        """Return the channel to auto-join for this voice-state-update, or None. Split out of
+        on_voice_state_update's closure so the decision itself is unit-testable without a live
+        discord.py client (the closure can only be exercised through a real _connect())."""
+        joined_channel = after.channel if before.channel is None and after.channel is not None else None
+        if joined_channel is None:
+            return None
+        if getattr(member, "bot", False):
+            return None
+        if self._voice_auto_join_handler is None:
+            return None
+        if not self._discord_auto_join_voice_enabled():
+            return None
+        existing = self._voice_clients.get(joined_channel.guild.id)
+        if existing and existing.is_connected():
+            return None
+        return joined_channel
+
+    async def _get_or_create_tool_progress_thread(self, chat_id: str, event_message_id: Optional[str]) -> Optional[Any]:
+        """Lazily create (once per turn, cached by event_message_id) the thread tool-call progress
+        lines land in. Mirrors _auto_create_thread's retry/fallback shape, but starts from a fetched
+        message (chat_id + event_message_id) rather than a live gateway event's Message object,
+        since the progress pipeline only carries IDs, not the discord.py object."""
+        if not event_message_id:
+            return None
+        cached = self._tool_progress_threads.get(event_message_id)
+        if cached is not None:
+            return cached
+        try:
+            channel = await self._resolve_channel(chat_id)
+            if channel is None:
+                return None
+            # Tony, 2026-09-28: "does not even show threads anymore" -- root cause was a real
+            # Discord 400 (error code 50024, "Cannot execute action on this channel type"): he
+            # was chatting INSIDE an existing thread, and Discord has no nested threads, so
+            # seed_msg.create_thread() always failed. When the source channel already IS a
+            # thread, use it as-is -- no fetch_message, no create_thread, nothing that can 50024.
+            if isinstance(channel, discord.Thread):
+                self._tool_progress_threads[event_message_id] = channel
+                return channel
+            seed_msg = await channel.fetch_message(int(event_message_id))
+        except Exception as e:
+            logger.debug("[%s] tool-progress thread: couldn't fetch seed message %s: %s", self.name, event_message_id, e)
+            return None
+        thread_name = f"\U0001f6e0️ {self._derive_auto_thread_name(seed_msg.content or '')}"
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                thread = await seed_msg.create_thread(name=thread_name, auto_archive_duration=60)
+                self._tool_progress_threads[event_message_id] = thread
+                return thread
+            except Exception as e:
+                last_error = e
+                if attempt == 0:
+                    await asyncio.sleep(0.75)
+        logger.warning("[%s] tool-progress thread creation failed: %s", self.name, last_error)
+        return None
+
+    async def _archive_tool_progress_thread(self, event_message_id: Optional[str]) -> None:
+        """Tony, 2026-09-28, in order:
+        1. "they clutter my thread list" -- each tool-progress thread is keyed to (and only
+           ever reused within) the ONE message that started this turn, never a later,
+           different message, so once this turn's processing is fully done nothing will ever
+           post to it again. First fix: archive it right away instead of waiting for
+           Discord's 60-minute auto-archive timeout (the shortest duration its API allows).
+        2. "I need to look at the thread in order for it to go away" -- archiving alone
+           doesn't clear it: Discord's client keeps listing a thread in the channel's thread
+           list for as long as the viewing user is still a MEMBER of it, regardless of
+           archived state, until they open (and thereby read) it. Tony gets auto-added as a
+           member the moment the thread is created FROM his own message (create_thread on a
+           seed message adds that message's author). "No not deleting it archive it even
+           when I don't see it" -- keep the content (never delete), instead remove every
+           non-bot member before archiving, so nothing is tracking it as unread/theirs
+           anymore and it drops out of the list without ever being opened. Best-effort,
+           called from on_processing_complete."""
+        if not event_message_id:
+            return
+        thread = self._tool_progress_threads.pop(str(event_message_id), None)
+        if thread is None:
+            logger.debug("[%s] tool-progress thread archive: no cached thread for message %s",
+                         self.name, event_message_id)
+            return
+        removed = 0
+        try:
+            members = await thread.fetch_members()
+            bot_id = getattr(getattr(self._client, "user", None), "id", None)
+            for member in members:
+                if bot_id is not None and member.id == bot_id:
+                    continue
+                try:
+                    await thread.remove_user(member)
+                    removed += 1
+                except Exception as e:
+                    logger.warning("[%s] tool-progress thread member removal failed for %s: %s",
+                                   self.name, member.id, e)
+        except Exception as e:
+            logger.warning("[%s] tool-progress thread member fetch failed: %s", self.name, e)
+        try:
+            await thread.edit(archived=True)
+            logger.info("[%s] tool-progress thread %s archived (%d member(s) removed)",
+                        self.name, getattr(thread, "id", event_message_id), removed)
+        except Exception as e:
+            logger.warning("[%s] tool-progress thread archive failed: %s", self.name, e)
+
+    async def send_tool_progress_line(self, chat_id: str, event_message_id: Optional[str], text: str) -> None:
+        """Send one tool-call progress line into the lazily-created tool-progress thread instead of
+        the main channel. Best-effort/fire-and-forget (called via _schedule from a sync callback,
+        same as play_ack_in_voice) -- a failure here must never break the turn or fall back to
+        posting the line in the main channel, since that would defeat the whole point of the split."""
+        try:
+            thread = await self._get_or_create_tool_progress_thread(chat_id, event_message_id)
+            if thread is None:
+                return
+            formatted = self.format_message(text)
+            for chunk in self._cap_split_chunks(self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)):
+                await thread.send(content=chunk)
+        except Exception as e:
+            logger.debug("[%s] tool-progress thread send failed: %s", self.name, e)
 
     async def rename_thread(
         self, thread_id: str, name: str, *, only_if_current_name: Optional[str] = None,

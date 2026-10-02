@@ -37,7 +37,30 @@ _MISSING_COMMAND_HINTS = {
 }
 
 
+def _real_tool_name_hint(missing: str) -> Optional[str]:
+    """If `missing` is a real, registered Hermes tool name, the model just tried to run a TOOL
+    as a shell command -- confirmed live 2026-09-29 (repeatedly): computer_use/desktop_preview/
+    launch_app get typed as `toolname(action=..., ...)` into terminal, get a generic 'not on
+    PATH' hint, and the model doesn't reliably self-correct from that alone. Naming the actual
+    fix inline (search first if deferred, then tool_call) is far more actionable than a
+    generic missing-binary hint that invites `which`/install attempts on something that was
+    never a binary."""
+    try:
+        from tools.registry import registry
+        if missing not in registry.get_all_tool_names():
+            return None
+    except Exception:
+        return None
+    return (f"`{missing}` is a Hermes TOOL, not a shell command -- it cannot be run in the "
+            f"terminal, ever. If it's not already in your visible tool list, call "
+            f"tool_search(queries=[{missing!r}]) to find its real schema, then invoke it via "
+            f"tool_call({{\"calls\":[{{\"name\":{missing!r},\"arguments\":{{...}}}}]}}) -- or "
+            f"directly if it's already visible. Do not retry this as a shell command.")
+
+
 def _missing_command_hint(missing: str) -> str:
+    if hint := _real_tool_name_hint(missing):
+        return hint
     return _MISSING_COMMAND_HINTS.get(missing) or (
         f"`{missing}` is not installed or not on PATH. Verify with `which {missing}`; install it "
         "or use an absolute path instead of retrying the same command.")

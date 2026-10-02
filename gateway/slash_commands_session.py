@@ -152,7 +152,9 @@ class GatewaySessionCommandsMixin:
         await self.hooks.emit("session:end", dict(hook_payload))
         await self.hooks.emit("session:reset", dict(hook_payload))
 
-    async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
+    async def _handle_reset_command(
+        self, event: MessageEvent, *, quiet: Optional[bool] = None,
+    ) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
         session_key = self._session_key_for_source(source)
@@ -197,7 +199,20 @@ class GatewaySessionCommandsMixin:
             default_header = t("gateway.reset.header_new")
         header = await asyncio.to_thread(self._telegram_topic_new_header, source) or default_header
         _title_arg = event.get_command_args().strip()
-        if _title_arg and self._session_db and new_entry:
+        # "/new --quiet": Tony, 2026-09-28 -- a plugin-triggered reset (e.g. mode plugin's
+        # natural-language switch, which already sends its own plain-sentence confirmation)
+        # rewrites the triggering message to this instead of bare "/new" when it wants the
+        # reset to actually happen without ALSO showing this command's own verbose
+        # header+model/provider/context/endpoint+tip notice on top of that sentence. The
+        # reset itself (everything above this line) is identical either way -- only the
+        # user-visible notice is skipped. ``quiet`` is also an explicit kwarg (not only a
+        # "--quiet" command-arg) so a caller that isn't dispatching a real "/new" command at
+        # all -- the mode plugin combining a switch with a real follow-up request in the same
+        # message ("go local mode and tell me what this is") -- can call this method directly
+        # against the ORIGINAL event (whose text is the user's real message, not "/new
+        # --quiet") without needing to fake the command text first.
+        _quiet = (_title_arg == "--quiet") if quiet is None else quiet
+        if _title_arg and not _quiet and self._session_db and new_entry:
             header = await self._reset_titled_header(header, new_entry.session_id, _title_arg)
         # Telegram DM topic lane: rebind (chat_id, thread_id) → session_id so the next message uses
         # the fresh session instead of switching back to the old one.
@@ -215,6 +230,8 @@ class GatewaySessionCommandsMixin:
                          old_session_id=_old_sid, new_session_id=_new_sid)
         except Exception:
             pass
+        if _quiet:
+            return EphemeralReply("")
         try:
             from hermes_cli.tips import get_random_tip
             _tip_line = t("gateway.reset.tip", tip=get_random_tip())

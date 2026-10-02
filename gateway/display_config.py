@@ -204,3 +204,34 @@ def _normalise(setting: str, value: Any) -> Any:
     """Normalise a user-supplied value for *setting*; unknown settings pass through."""
     norm = _NORMALISERS.get(setting)
     return norm(value) if norm else value
+
+
+# reasoning_style → (header line, per-line quote prefix for blank / non-blank lines).
+REASONING_QUOTE_STYLES = {
+    "subtext": ("-# 💭 Reasoning", "-# ", "-#"),
+    "blockquote": ("> 💭 **Reasoning:**", "> ", ">"),
+}
+REASONING_MAX_LINES = 15
+
+
+def format_reasoning_block(text: str, style: str, *, max_lines: int = REASONING_MAX_LINES) -> str:
+    """Render one reasoning/thinking text block per *style* ("subtext"/"blockquote"/anything
+    else falls to the "code" fenced-block style), truncating past *max_lines* the same way for
+    every caller. Single shared renderer for both the end-of-turn reasoning prepend
+    (gateway/run_turn.py::_hmwa_prepend_reasoning) and Discord's mid-turn tool-progress-thread
+    routing of "_thinking" scratch text (gateway/run_turn_runner.py::progress_callback) --
+    without one implementation, the two call sites drift out of sync on truncation length or
+    per-style formatting."""
+    lines = text.strip().splitlines()
+    if len(lines) > max_lines:
+        display_text = "\n".join(lines[:max_lines]) + f"\n_... ({len(lines) - max_lines} more lines)_"
+    else:
+        display_text = text.strip()
+    quote = REASONING_QUOTE_STYLES.get(style)
+    if quote:
+        header, prefix, empty = quote
+        quoted = "\n".join(f"{prefix}{ln}" if ln else empty for ln in display_text.splitlines())
+        return f"{header}\n{quoted}"
+    from gateway.stream_consumer_fences import escape_code_fences_for_display
+    display_text = escape_code_fences_for_display(display_text)
+    return f"💭 **Reasoning:**\n```\n{display_text}\n```"

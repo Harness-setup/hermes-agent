@@ -145,10 +145,14 @@ class _InputMixin:
         ), None)
         return refusal if refusal is not None else self._run_input_action("scroll", args, delivery_mode, bring_to_front)
 
-    def type_text(self, text: str, *, delivery_mode: Optional[str] = None, bring_to_front: bool = False) -> ActionResult:
+    def type_text(self, text: str, *, delay_ms: Optional[int] = None, delivery_mode: Optional[str] = None,
+                  bring_to_front: bool = False) -> ActionResult:
         refusal, args = self._target_args("type_text", need_window=True)
-        return refusal if refusal is not None else self._run_input_action("type_text", {**args, "text": text},
-                                                                          delivery_mode, bring_to_front)
+        if refusal is not None:
+            return refusal
+        if delay_ms is not None:
+            args = {**args, "delay_ms": delay_ms}
+        return self._run_input_action("type_text", {**args, "text": text}, delivery_mode, bring_to_front)
 
     def key(self, keys: str, *, delivery_mode: Optional[str] = None, bring_to_front: bool = False) -> ActionResult:
         refusal, args = self._target_args("key", need_window=True)

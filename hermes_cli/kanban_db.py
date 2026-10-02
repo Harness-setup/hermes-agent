@@ -2801,7 +2801,11 @@ def complete_task(
             params = (*params, int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
             return False
+        _declared_artifact_count = 0
         if isinstance(metadata, dict):
+            _raw_declared = metadata.get("artifacts")
+            if isinstance(_raw_declared, (list, tuple)):
+                _declared_artifact_count = len(_raw_declared)
             _stage_completion_artifacts(conn, task_id, metadata, now)
         run_id = _end_run(
             conn, task_id, outcome="completed", status="done", summary=handoff_summary,
@@ -2828,7 +2832,8 @@ def complete_task(
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
     recompute_ready(conn)  # separate txn so children see ``done``
-    _cleanup_workspace(conn, task_id)
+    # Clean up the scratch workspace and any stale tmux session for the worker.
+    _cleanup_workspace(conn, task_id, declared_artifact_count=_declared_artifact_count)
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
         _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)

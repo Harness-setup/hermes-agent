@@ -82,7 +82,10 @@ def test_numeric_arguments_are_validated():
 
 def test_empty_answer_means_nothing_open():
     result = json.loads(ap.drive_preview_tool(action="elements", callback=lambda _p: ""))
-    assert "open_preview" in result["error"]
+    # "open_preview" was merged into desktop_preview(action="open") -- the hint must name
+    # a tool that actually still exists (confirmed live: the stale name caused real
+    # tool-selection failures, session 20260926_135141_5fe809 and others).
+    assert 'desktop_preview(action="open"' in result["error"]
 
 
 def test_passes_the_renderer_answer_through():

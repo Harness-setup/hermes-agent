@@ -219,6 +219,148 @@ def test_interim_message_plugin_hook_does_not_count_as_stream_consumer(monkeypat
     assert agent._has_stream_consumers() is False
 
 
+def test_persist_disabled_agent_does_not_emit_any_stream_hook(monkeypatch):
+    # Tony's mega-message, 2026-08: "for live box, it is not just printing
+    # what I ask my agent, it also shows ones from memory system... I want
+    # just to see my agent talking." A background skill/memory-review fork
+    # sets _persist_disabled True (agent_init.py) -- its stream activity
+    # must not reach pebble-signal (or any other stream-observer plugin)
+    # even though its own UI callbacks (stream_delta_callback etc.) still
+    # legitimately fire for the harness's own internal use.
+    from agent.plugin_stream_hooks import shutdown_plugin_stream_hook_dispatcher
+
+    shutdown_plugin_stream_hook_dispatcher()
+    calls = []
+
+    def on_stream_start(**kwargs):
+        calls.append(("on_stream_start", kwargs))
+
+    def on_stream_end(**kwargs):
+        calls.append(("on_stream_end", kwargs))
+
+    def on_stream_delta(**kwargs):
+        calls.append(("on_stream_delta", kwargs))
+
+    def on_interim_message(**kwargs):
+        calls.append(("on_interim_message", kwargs))
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.iter_hook_callbacks",
+        _callbacks({
+            "on_stream_start": [on_stream_start],
+            "on_stream_end": [on_stream_end],
+            "on_stream_delta": [on_stream_delta],
+            "on_interim_message": [on_interim_message],
+        }),
+    )
+
+    agent = _agent()
+    agent._persist_disabled = True
+    ui_deltas = []
+    agent.stream_delta_callback = ui_deltas.append
+
+    agent._emit_stream_start()
+    agent._fire_stream_delta("harness-internal text")
+    with patch("hermes_cli.config.cfg_get", return_value=True):
+        agent._fire_reasoning_delta("harness-internal reasoning")
+    agent._emit_interim_assistant_message({"content": "harness-internal commentary"})
+    agent._emit_stream_end(final_text="done", finished=True, error=None)
+    time.sleep(0.05)  # give a wrongly-still-queued hook a chance to land
+    shutdown_plugin_stream_hook_dispatcher()
+
+    assert calls == []
+    # The direct UI callback is untouched -- only the plugin hook is gated.
+    assert ui_deltas == ["harness-internal text"]
+
+
+def test_hidden_session_agent_does_not_emit_any_stream_hook(monkeypatch):
+    # Tony's mega-message, 2026-08: "I see this random ai saying stuff that
+    # I did not ask about... I see this again after sleep or hibernation
+    # but then it disappears after a few seconds." Root cause: voice-
+    # bridge's validate_alive() resume-check runs a REAL (not persist-
+    # disabled) turn through its own hidden standalone session -- the
+    # existing persist_disabled gate never covered this. Sessions marked
+    # hidden in state.db (the same flag voice-bridge's acp_client.py
+    # already sets for that session) must be suppressed too.
+    from agent.plugin_stream_hooks import shutdown_plugin_stream_hook_dispatcher
+
+    shutdown_plugin_stream_hook_dispatcher()
+    calls = []
+    monkeypatch.setattr(
+        "hermes_cli.plugins.iter_hook_callbacks",
+        _callbacks({
+            "on_stream_start": [lambda **kw: calls.append(("on_stream_start", kw))],
+            "on_stream_delta": [lambda **kw: calls.append(("on_stream_delta", kw))],
+        }),
+    )
+
+    agent = _agent()
+    agent.session_id = "hidden-session-1"
+
+    class _FakeSessionDB:
+        def get_session(self, session_id):
+            return {"id": session_id, "hidden": 1}
+
+    with patch("hermes_state.SessionDB", return_value=_FakeSessionDB()):
+        agent._emit_stream_start()
+        agent._fire_stream_delta("reply with exactly: ok")
+    time.sleep(0.05)
+    shutdown_plugin_stream_hook_dispatcher()
+
+    assert calls == []
+
+
+def test_visible_session_agent_still_emits_stream_hooks(monkeypatch):
+    # Counterpart to the hidden-session test above: an ordinary, non-
+    # hidden session must be completely unaffected by this change.
+    from agent.plugin_stream_hooks import shutdown_plugin_stream_hook_dispatcher
+
+    shutdown_plugin_stream_hook_dispatcher()
+    calls = []
+    monkeypatch.setattr(
+        "hermes_cli.plugins.iter_hook_callbacks",
+        _callbacks({"on_stream_delta": [lambda **kw: calls.append(("on_stream_delta", kw))]}),
+    )
+
+    agent = _agent()
+    agent.session_id = "visible-session-1"
+
+    class _FakeSessionDB:
+        def get_session(self, session_id):
+            return {"id": session_id, "hidden": 0}
+
+    with patch("hermes_state.SessionDB", return_value=_FakeSessionDB()):
+        agent._emit_stream_start()
+        agent._fire_stream_delta("hello")
+    _wait_for(lambda: calls)
+    shutdown_plugin_stream_hook_dispatcher()
+
+    assert calls[0][1]["delta"] == "hello"
+
+
+def test_stream_delta_does_not_query_session_db_on_the_hot_path(monkeypatch):
+    # The real bug caught live while building the hidden-session fix
+    # above: an earlier version queried SessionDB from inside
+    # _stream_hooks_suppressed() itself, lazily-cached-or-not -- the
+    # FIRST delta of any turn still paid for a synchronous DB read on
+    # the exact path this project's stream-consumer contract requires
+    # stays sub-50ms. The real read must only ever happen from
+    # _emit_stream_start (once per LLM-call iteration), never from
+    # _fire_stream_delta directly.
+    shutdown_calls = []
+
+    class _ExplodingSessionDB:
+        def get_session(self, session_id):
+            shutdown_calls.append(session_id)
+            raise AssertionError("must not query SessionDB from the delta path")
+
+    agent = _agent()
+    agent.session_id = "some-session"
+    with patch("hermes_state.SessionDB", return_value=_ExplodingSessionDB()):
+        agent._fire_stream_delta("hello")  # no prior _emit_stream_start
+    assert shutdown_calls == []
+
+
 def test_stream_lifecycle_plugin_hooks_are_queued(monkeypatch):
     from agent.plugin_stream_hooks import shutdown_plugin_stream_hook_dispatcher
 

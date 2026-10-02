@@ -257,6 +257,12 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     argumentMode: 'mixed'
   },
 
+  {
+    name: '/mode',
+    description: 'Switch model mode: cloud|local [model]|uncensored [model]|status',
+    surface: exec(),
+    argumentMode: 'options'
+  },
   // /compress must be an action (session.compress RPC), not exec: the slash
   // worker route times out on large sessions (30s WS / 45s pipe) before the
   // LLM summarise call finishes, then command.dispatch surfaces a bogus

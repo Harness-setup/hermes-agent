@@ -384,6 +384,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   watchDirectory: dir => ipcRenderer.invoke('hermes:watchDirectory', dir),
   stopPreviewFileWatch: id => ipcRenderer.invoke('hermes:stopPreviewFileWatch', id),
   setActiveWork: payload => ipcRenderer.send('hermes:active-work', payload),
+  setCompletionPending: pending => ipcRenderer.send('hermes:completion-pending', Boolean(pending)),
   setTitleBarTheme: payload => ipcRenderer.send('hermes:titlebar-theme', payload),
   setNativeTheme: mode => ipcRenderer.send('hermes:native-theme', mode),
   setTranslucency: payload => ipcRenderer.send('hermes:translucency', payload),

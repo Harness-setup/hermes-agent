@@ -162,6 +162,12 @@ def _new_backend(permission_mode: str) -> ComputerUseBackend:
     if backend_name in {"cua", "cua-driver", ""}:
         from tools.computer_use.cua_backend import CuaDriverBackend
         return CuaDriverBackend(permission_mode=permission_mode)
+    if backend_name == "pebble":
+        # Tony, 2026-09-23: WSL gateway -> real Windows desktop bridge, since the local
+        # cua-driver this branch's sibling spawns only ever reaches WSL's own virtual
+        # desktop. See tools/computer_use/pebble_relay_backend.py's own module docstring.
+        from tools.computer_use.pebble_relay_backend import PebbleRelayBackend
+        return PebbleRelayBackend()
     if backend_name != "noop":
         raise RuntimeError(f"Unknown HERMES_COMPUTER_USE_BACKEND={backend_name!r}")
     return _NoopBackend()  # pragma: no cover
@@ -320,8 +326,12 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
     type_text, key, set_value = _noop_stub("type", "text"), _noop_stub("key", "keys"), _noop_stub("set_value", "value", "element")
     list_apps, list_windows = _noop_stub("list_apps", result=[]), _noop_stub("list_windows", result=[])
     focus_app = _noop_stub("focus_app", "app", "raise_window")
+    launch_app = _noop_stub("launch_app", "app")
 
 # ── Dispatch ────────────────────────────────────────────────────────────────
+_MAX_BATCH_SIZE = 20
+
+
 def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     """Main entry point (tools.registry): a JSON string (text-only) or a dict marked `_multimodal`. Order: hard
     blocks (_reject_unsafe) -> approval scopes (destructive action, then 'bring_to_front' — persistent focus is a
@@ -329,6 +339,8 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     action = (args.get("action") or "").strip().lower()
     if not action:
         return json.dumps({"error": "missing `action`"})
+    if action == "batch":
+        return _handle_batch(args, kwargs)
     session_id = str(kwargs.get("session_id") or "")  # approval-state / daemon-mode isolation key
     # Bot Desktop lease: while a human drives the screen every action, capture included, is refused.
     from tools.bot_desktop import lease as _bd_lease
@@ -383,6 +395,103 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     except Exception as e:
         logger.exception("computer_use %s failed", action)
         return json.dumps({"error": f"{action} failed: {e}"})
+
+def _summarize_step_result(result: Any) -> Tuple[bool, Optional[str]]:
+    """(ok, error) for one batch step's raw handle_computer_use() return.
+
+    Two distinct failure shapes exist in this module: pre-dispatch
+    validation/approval failures are ``{"error": "..."}`` (no "ok" key at
+    all), while a dispatched action's own failure is
+    ``{"ok": False, "action": ..., "message": "..."}`` from _action_payload
+    (no "error" key). Both must be treated as failure. A multimodal dict is
+    only ever produced by a capture that already succeeded (see this
+    module's own "Return contract" docstring), so its mere presence is
+    success.
+    """
+    if isinstance(result, dict) and result.get("_multimodal"):
+        return True, None
+    try:
+        parsed = json.loads(result)
+    except Exception:
+        return False, "unparseable result"
+    if not isinstance(parsed, dict):
+        return True, None
+    if "error" in parsed:
+        return False, str(parsed["error"])
+    if parsed.get("ok") is False:
+        return False, str(parsed.get("message") or "action failed")
+    return True, None
+
+
+def _format_batch_summary(steps: list, requested: int) -> str:
+    lines = [f"batch: {len(steps)}/{requested} step(s) run"]
+    for s in steps:
+        marker = "ok" if s["ok"] else "FAILED"
+        detail = f" — {s['error']}" if s.get("error") else ""
+        lines.append(f"  [{s['index']}] {s.get('action', '?')}: {marker}{detail}")
+    return "\n".join(lines)
+
+
+def _handle_batch(args: Dict[str, Any], kwargs: Dict[str, Any]) -> Any:
+    """Run a sequence of ordinary computer_use actions in one tool call.
+
+    Each entry goes through the FULL handle_computer_use() pipeline
+    (validation, per-action approval gating, dispatch) exactly as if it had
+    been called on its own — batching only removes the round-trip between
+    steps, it does not change or widen what gets auto-approved. Stops at the
+    first failing step so a bad click can't cascade into worse actions
+    against a UI state the caller no longer understands.
+    """
+    sub_actions = args.get("actions")
+    if not isinstance(sub_actions, list) or not sub_actions:
+        return json.dumps({"error": "batch requires a non-empty 'actions' list"})
+    if len(sub_actions) > _MAX_BATCH_SIZE:
+        return json.dumps({
+            "error": f"batch too large: {len(sub_actions)} entries, max {_MAX_BATCH_SIZE}",
+        })
+
+    steps: list = []
+    last_result: Any = None
+    for i, sub in enumerate(sub_actions):
+        sub_action = (sub.get("action") or "").strip().lower() if isinstance(sub, dict) else ""
+        if not sub_action:
+            steps.append({"index": i, "ok": False, "error": "each batch entry needs an 'action'"})
+            last_result = None
+            break
+        if sub_action == "batch":
+            steps.append({"index": i, "ok": False, "error": "batch cannot contain a nested batch"})
+            last_result = None
+            break
+        last_result = handle_computer_use(sub, **kwargs)
+        ok, err = _summarize_step_result(last_result)
+        step = {"index": i, "action": sub_action, "ok": ok}
+        if err:
+            step["error"] = err
+        steps.append(step)
+        if not ok:
+            break
+
+    summary_text = _format_batch_summary(steps, requested=len(sub_actions))
+
+    if isinstance(last_result, dict) and last_result.get("_multimodal"):
+        merged = dict(last_result)
+        merged["text_summary"] = summary_text
+        content = list(merged.get("content") or [])
+        if content and content[0].get("type") == "text":
+            content[0] = {"type": "text", "text": summary_text}
+        else:
+            content.insert(0, {"type": "text", "text": summary_text})
+        merged["content"] = content
+        return merged
+
+    return json.dumps({
+        "batch": True,
+        "steps": steps,
+        "completed": len(steps),
+        "requested": len(sub_actions),
+        "summary": summary_text,
+    })
+
 
 def _request_approval(action: str, args: Dict[str, Any]) -> Optional[str]:
     """None if approved, else a JSON error string. The decision (yolo bypass, session/permanent grants, CLI prompt,
@@ -472,7 +581,8 @@ _ACTIONS: Dict[str, _ActionSpec] = {
     "drag": _input(_do_drag, summarize=lambda a, args, fg: (f"drag {args.get('from_element') or args.get('from_coordinate')} → "
                                                              f"{args.get('to_element') or args.get('to_coordinate')}{fg}")),
     "scroll": _input(_do_scroll, summarize=lambda a, args, fg: f"scroll {args.get('direction', '?')} x{args.get('amount', 3)}{fg}"),
-    "type": _input(lambda backend, action, args, **delivery: backend.type_text(args.get("text", ""), **delivery),
+    "type": _input(lambda backend, action, args, **delivery: backend.type_text(
+        args.get("text", ""), delay_ms=args.get("delay_ms"), **delivery),
                    summarize=lambda a, args, fg: f"type {args.get('text', '')[:60]!r}" + ("..." if len(args.get("text", "")) > 60 else "") + fg),
     "key": _input(lambda backend, action, args, **delivery: backend.key(args.get("keys", ""), **delivery),
                   summarize=lambda a, args, fg: f"key {args.get('keys', '')!r}{fg}"),
@@ -481,8 +591,20 @@ _ACTIONS: Dict[str, _ActionSpec] = {
         else backend.set_value(value=str(args["value"]), element=args.get("element")))),
     "focus_app": _ActionSpec(lambda backend, action, args, **_: (
         json.dumps({"error": "focus_app requires `app`"}) if not args.get("app")
-        else backend.focus_app(args["app"], raise_window=bool(args.get("raise_window")))), destructive=True,
+        else _launch_response(backend.focus_app(args["app"], raise_window=bool(args.get("raise_window"))))), destructive=True,
         summarize=lambda a, args, fg: f"focus {args.get('app', '')!r}" + (" (raise)" if args.get("raise_window") else "")),
+    # Tony, 2026-09-22: "not good at opening apps, example Notion." Root cause: the backend has a
+    # real, idempotent launch_app(name=...) (cua_backend.py) that starts an app whether or not it's
+    # already running -- it was just never exposed as a callable action here, forcing the model to
+    # improvise via generic click-simulation on a taskbar/Start-menu icon, which is exactly the
+    # unreliable path this replaces. Mirrors focus_app's dispatch shape; falls back to a clear error
+    # (not an AttributeError crash) on any backend that doesn't implement it.
+    "launch_app": _ActionSpec(lambda backend, action, args, **_: (
+        json.dumps({"error": "launch_app requires `app`"}) if not args.get("app")
+        else json.dumps({"error": "launch_app is not supported by this backend"})
+        if not hasattr(backend, "launch_app")
+        else _launch_response(backend.launch_app(name=args["app"]))), destructive=True,
+        summarize=lambda a, args, fg: f"launch {args.get('app', '')!r}"),
     "capture": _ActionSpec(_do_capture),
     "wait": _ActionSpec(lambda backend, action, args, **_: _text_response(backend.wait(float(args.get("seconds", 1.0))))),
     "list_apps": _ActionSpec(partial(_do_listing, key="apps")),
@@ -553,6 +675,16 @@ def _action_payload(res: ActionResult) -> Dict[str, Any]:
 
 def _text_response(res: ActionResult) -> str:
     return json.dumps(_action_payload(res))
+
+def _launch_response(res: Any) -> str:
+    # Backend-shape split: CuaDriverBackend.launch_app()/focus_app() return a plain
+    # Dict[str, Any] ({pid, bundle_id, name, windows[]}); PebbleRelayBackend's return an
+    # ActionResult dataclass instead. Both were dispatched through a bare json.dumps(),
+    # which only ever worked for the dict shape -- confirmed live 2026-09-29 (real Pebble
+    # relay, "open clock app for me"): "Object of type ActionResult is not JSON
+    # serializable", even though the app had genuinely already launched on the real
+    # desktop by the time the error fired.
+    return _text_response(res) if isinstance(res, ActionResult) else json.dumps(res)
 
 # AX `elements` cap: dense UIs publish 500+ nodes (one capture would exhaust context); the full tree spills to a file.
 _DEFAULT_MAX_ELEMENTS = 100
@@ -677,6 +809,19 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
                       session_id: Optional[str] = None) -> Any:
     v = _capture_view(cap, max_elements)
     lines = _capture_summary_lines(v)
+    # Tony, 2026-09-22: the CDP browser tools already detect+annotate a Windows Family Safety
+    # redirect (tools/browser_cdp_tool.py's _contains_family_safety_redirect) but computer_use
+    # drives the OS window via screenshots/AX-tree, not CDP, so it never saw that signature at
+    # all -- if the AX walk captured the address bar (or any visible element) showing the
+    # redirect URL, this surfaces it. Appended to `lines` (not just a local `summary` string)
+    # because the plain-text capture path below rebuilds its own payload straight from `lines`,
+    # not from the `summary` variable the multimodal/aux-vision paths use -- both need it.
+    try:
+        from tools.browser_cdp_tool import _FAMILY_SAFETY_BLOCK_RE, _FAMILY_SAFETY_NOTICE
+        if _FAMILY_SAFETY_BLOCK_RE.search("\n".join(lines)):
+            lines.append(f"\n[FAMILY SAFETY BLOCK DETECTED] {_FAMILY_SAFETY_NOTICE}")
+    except Exception:
+        logger.debug("Family Safety scan failed", exc_info=True)
     summary, extra = "\n".join(lines), None  # multimodal/aux paths use this; text paths append notes and rebuild
     if v.has_image and session_id and _screenshot_dedup_check(
             _scoped_sid(session_id), _capture_digest(cap), (str(cap.app or ""), str(cap.window_title or ""))):

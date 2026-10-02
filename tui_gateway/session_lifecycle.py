@@ -871,6 +871,78 @@ def _ws_orphan_turn_activity_is_fresh(session: dict) -> bool:
         return False
 
 
+# Tony, 2026-09-02: "uncensored mode is not erasing the session from
+# session history... I closed and opened hermes desktop and it was still
+# there." Root cause (confirmed by investigation): the existing 3 erasure
+# triggers (agent_init.py's _reconcile_uncensored_session_tracking, fired
+# on starting a new session or resuming a DIFFERENT one; toggle.py's
+# _restore_backup, fired on switching mode away) never fire just from
+# closing the client -- reopening Desktop onto the SAME still-live
+# uncensored session is, correctly, not "abandonment" by any of those three
+# definitions. This is a 4th, independent trigger: the client disconnected
+# and never came back. Deliberately does NOT hook the existing WS-orphan
+# reap grace window directly -- that grace is tuned for "was this a
+# network blip," not "has the user actually moved on from this
+# conversation," and erasing a private session that soon after a brief
+# disconnect would be far more aggressive than intended. Uses its own,
+# independent, much longer timer instead, scheduled only once the WS-orphan
+# path has ALREADY confirmed (past its own grace) that the session is
+# genuinely torn down -- this timer adds a SEPARATE, later re-check, not a
+# replacement for the existing one.
+_UNCENSORED_ERASURE_GRACE_S = 300.0  # 5 minutes, per Tony's explicit choice
+
+
+def _check_and_erase_abandoned_uncensored_session(sid: str, *, state_path=None) -> None:
+    """The grace-window callback: erase ``sid`` iff it's STILL the tracked
+    uncensored session and STILL not reconnected. Standalone (not nested)
+    so it's directly unit-testable without touching the real Timer/threading
+    machinery -- ``_maybe_schedule_uncensored_erasure`` below is the only
+    caller in production, via a delayed Timer; tests call this directly."""
+    import json
+    try:
+        from agent.agent_init import _reconcile_uncensored_session_tracking
+        from hermes_constants import get_hermes_home
+
+        path = state_path or (get_hermes_home() / "mode-state.json")
+        data = json.loads(path.read_text())
+    except Exception:
+        return
+    if data.get("kind") != "uncensored":
+        return
+    if data.get("uncensored_session_id") != sid:
+        # Already superseded by a later session/different-session/mode-
+        # switch trigger, or was never actually the tracked one -- one of
+        # the other 3 triggers already handled it, or it's not ours.
+        return
+    with _sessions_lock:
+        current = _sessions.get(sid)
+        reconnected = current is not None and not _ws_session_is_detached(current)
+    if reconnected:
+        # Tony reopened the client and it auto-resumed this SAME session
+        # within the grace window -- genuinely still in use, not abandoned.
+        # Do nothing; a later disconnect will reschedule this same check
+        # via the WS-orphan path again.
+        return
+    _reconcile_uncensored_session_tracking(session_id=None, state_path=path)
+
+
+def _maybe_schedule_uncensored_erasure(sid: str) -> None:
+    """Schedule a delayed check: if ``sid`` is still the tracked uncensored
+    session (and hasn't been reconnected to) after the grace window, erase
+    it. Fully independent of the WS-orphan reap's own locks/timers above --
+    this only ever READS mode-state.json and _sessions, and only ever calls
+    the SAME delete path the other 3 triggers already use
+    (_reconcile_uncensored_session_tracking), so it can't introduce a new
+    class of session-lifecycle bug even if this specific check is wrong --
+    worst case it's a no-op or a redundant (already-idempotent) delete."""
+    def _fire() -> None:
+        _check_and_erase_abandoned_uncensored_session(sid)
+
+    timer = threading.Timer(_UNCENSORED_ERASURE_GRACE_S, _fire)
+    timer.daemon = True
+    timer.start()
+
+
 def _schedule_ws_orphan_reap(
     sid: str, *, delay_s: float | None = None, _expected_timer: threading.Timer | None = None,
 ) -> None:
@@ -974,6 +1046,8 @@ def _schedule_ws_orphan_reap(
         if session is not None and session.get("_client_gone_interrupt_requested"):
             logger.info("client_gone sid=%s action=reap", sid)
         _teardown_popped_session(session, end_reason="ws_orphan_reap")
+        if session is not None:
+            _maybe_schedule_uncensored_erasure(sid)
 
     with _sessions_lock:
         if _expected_timer is not None and _pending_ws_reaps.get(sid) is not _expected_timer:
@@ -1043,6 +1117,11 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
                         _schedule_ws_orphan_reap(sid)
         if claimed_for_teardown is not None:
             reaped += _teardown_popped_session(claimed_for_teardown, end_reason=end_reason)
+            # Mirrors the WS-orphan-reap path's own call (_schedule_ws_orphan_reap's _reap) --
+            # close_on_disconnect sessions (e.g. Desktop's ChatSidebar.tsx sidecar session) tear
+            # down immediately here and never go through that path at all, so without this call
+            # uncensored-session erasure coverage silently drops for any session torn down this way.
+            _maybe_schedule_uncensored_erasure(sid)
         elif should_schedule_reap:
             detached += 1
     return reaped, detached

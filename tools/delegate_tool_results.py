@@ -393,7 +393,14 @@ def _finalize_child_results(
     results: List[Dict[str, Any]], task_list: List[Dict[str, Any]], children: List[tuple[int, Dict[str, Any], Any]],
     parent_agent,
 ) -> None:
-    """Apply host-owned summary, memory, hook, and cost contracts once."""
+    """Apply host-owned summary, memory, hook, and cost contracts once.
+
+    The post-delegation parent-model restore that used to run here (a
+    direct gpu-slot.sh call keyed off delegation.model) moved 2026-09-14 to
+    a subagent_stop plugin hook (~/.hermes/plugins/mode/delegate_restore.py)
+    -- _fire_subagent_stop_hooks below already fires that hook once per
+    child, so no separate call site is needed here anymore.
+    """
     with _parent_finalization_lock(parent_agent):
         _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}

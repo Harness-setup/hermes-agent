@@ -1,5 +1,6 @@
 """Durable manual-serve handoffs, independent of gateway restart receipts."""
 
+import contextlib
 import json
 import logging
 import math
@@ -70,6 +71,43 @@ def retain_receipt_manual_serves(receipt: dict) -> list[dict]:
         if not defer_manual_serve(row) and row not in pending:
             pending.append(row)
     return pending
+
+
+def pending_manual_restart_record(pid: int) -> dict | None:
+    """The durable obligation row for *pid* (see ``defer_manual_serve``) if it's still owed and
+    the pid is confirmed alive, else ``None``. Stale/dead-pid files are pruned on the way, same
+    as ``warn_pending_manual_serves`` does when it walks this same directory.
+
+    Tony, 2026-09-22: "Restart Everything"/"Unblock Update" in Pebble call into
+    ``hermes dashboard``'s already-running attach path, which used to just print this pid and
+    exit 0 -- reporting success while still serving pre-update code. This lets that path check
+    FIRST whether the pid it's about to attach to is the exact one the update flow already
+    flagged as owing a restart, so it can kill+relaunch instead of quietly attaching to it."""
+    from hermes_cli.process_identity import _pid_alive_matches
+
+    directory = get_hermes_home() / "serve_restart_pending"
+    for path in sorted(directory.glob("*.json")):
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+            if row.get("pid") != pid:
+                continue
+            if _pid_alive_matches(row["pid"], row["create_time"]) is False:
+                path.unlink(missing_ok=True)
+                continue
+            row["_obligation_path"] = str(path)
+            return row
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            logger.debug("Could not reconcile manual serve obligation %s: %s", path, exc)
+    return None
+
+
+def clear_manual_restart_obligation(record: dict) -> None:
+    """Discharge the obligation file behind *record* (from ``pending_manual_restart_record``)
+    once its pid has actually been killed and replaced."""
+    path = record.get("_obligation_path")
+    if path:
+        with contextlib.suppress(OSError):
+            Path(path).unlink(missing_ok=True)
 
 
 def warn_pending_manual_serves(*, startup: bool = False, pending_manual: list[dict] | None = None) -> None:

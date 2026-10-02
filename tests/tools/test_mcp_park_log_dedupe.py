@@ -154,3 +154,9 @@ def test_park_for_a_different_reason_warns_again(caplog):
         task._log_park("MCP server '%s' parked: %s", "t", "OAuthError: token revoked")
     assert [r.levelno for r in caplog.records] == [
         logging.WARNING, logging.DEBUG, logging.WARNING, logging.DEBUG]
+
+
+# The direct Discord auth-park notification (formerly tested here as TestAuthParkNotification)
+# moved out to a standalone script -- see ~/.hermes/scripts/check-mcp-auth-parks.py and its own
+# test_check_mcp_auth_parks.py, per "turn every local fixes that we have into plugins or scripts
+# since that is more reliable than changing core code when possible."

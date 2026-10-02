@@ -9,6 +9,7 @@ Symbols that tests patch on ``run_agent.*`` (``OpenAI``, ``get_tool_definitions`
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -81,6 +82,201 @@ def _warn_memory_provider_unavailable(name: str, reason: str = "", say=None) -> 
     logger.warning(message)
     if say is not None:
         say(message)
+
+
+def _relay_moa_reference_event(agent: Any, event: str, **kwargs: Any) -> None:
+    """Relay MoA display events while preserving the ``-Q`` stdout contract."""
+    if not _moa_reference_output_allowed(agent):
+        return
+    cb = getattr(agent, "tool_progress_callback", None)
+    if cb is None:
+        return
+    try:
+        if event == "moa.reference":
+            cb(
+                "moa.reference",
+                str(kwargs.get("label") or ""),
+                str(kwargs.get("text") or ""),
+                None,
+                moa_index=kwargs.get("index"),
+                moa_count=kwargs.get("count"),
+            )
+        elif event == "moa.aggregating":
+            cb(
+                "moa.aggregating",
+                str(kwargs.get("aggregator") or ""),
+                None,
+                None,
+                moa_ref_count=kwargs.get("ref_count"),
+            )
+    except Exception:
+        pass
+
+
+def _normalize_route_base_url(base_url: Any) -> str:
+    """Canonicalize an endpoint URL for model-route identity comparisons."""
+    return normalize_route_base_url(base_url)
+
+
+def _uncensored_mode_persist_disabled(profile_name: str, state_path=None) -> bool:
+    """True if `profile_name` is one of the profiles /mode currently has
+    switched onto the local uncensored model (see
+    ~/.hermes/plugins/mode/state.py's kind-tagged backup dict). Reads the
+    plugin's own state file directly rather than importing its Python
+    module -- matches the established cross-plugin/cross-repo state-file-
+    read-by-path pattern (plugins/default-routing/__init__.py's dispatch
+    gate reads this same file the same way).
+
+    A missing state file (kind == "local", or no file at all) always
+    returns False -- that's not ambiguous, it's a definite "not uncensored"
+    answer, so persisting normally is correct, not a fallback.
+
+    An EXISTING-but-unreadable state file (corrupt JSON, permission error)
+    is a genuinely different situation: the file being there at all means
+    /mode has switched something, and a read failure means we simply can't
+    tell what. Privacy-first: return True (treat as uncensored) rather
+    than the reverse. This is a deliberate reversal of an earlier version
+    of this function that failed the other way (treated as not-uncensored
+    on read error) -- reasoned at the time that a wrongly-suppressed
+    ordinary session was the worse outcome, but Tony's "no trace...
+    anything that can leave trace" is an explicit hard privacy guarantee,
+    and a silent leak the user never learns happened is worse than an
+    ordinary session losing its history under a rare, self-correcting
+    failure (fix the file, the very next session behaves correctly
+    again)."""
+    path = state_path or (get_hermes_home() / "mode-state.json")
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text())
+        if data.get("kind") != "uncensored":
+            return False
+        return profile_name in data.get("backup", {})
+    except Exception:
+        return True
+
+
+def _reconcile_uncensored_session_tracking(session_id: str, state_path=None, db_path=None) -> None:
+    """Tony, 2026-08-24: "I want to see all the conversation we had [during
+    the uncensored session]. but after I go to a different session or make
+    a new one or change mode, it will erase everything including the one
+    in desktop app session history."
+
+    Uncensored-mode sessions used to simply never persist at all
+    (agent._persist_disabled) -- live-confirmed this also meant Desktop's
+    own chat view couldn't render the conversation while it was still
+    happening, since Desktop reads history from the same database nothing
+    was ever being written to. The fix is ephemeral persistence instead of
+    no persistence: write normally like any other session (so Desktop's
+    live view works), then actually delete the session once it's
+    abandoned, rather than never writing it in the first place.
+
+    This half covers two of the three abandonment triggers -- starting a
+    NEW session, or resuming a DIFFERENT existing one -- while
+    mode-state.json still says kind == "uncensored": both go through
+    agent_init.py same as this call, with a session_id that differs from
+    whichever one mode-state.json currently has recorded as "the live
+    uncensored session." The third trigger (switching mode away from
+    uncensored entirely) is handled separately in
+    ~/.hermes/plugins/mode/toggle.py's _restore_backup, which does not
+    pass through session init at all.
+
+    Read/write failures on the state file itself are silent (missing/
+    corrupt file, no filesystem access) -- there's no session identity to
+    act on in that case, so this is a genuine no-op, not a swallowed
+    privacy failure. A *delete_session* failure is a different matter and
+    is NOT silent: security review on the first version of this function
+    flagged it as fail-open (control regression) -- a failed delete still
+    advanced uncensored_session_id to the new session, permanently losing
+    track of the undeleted "private" one with no record it ever failed.
+    Fixed with retries (transient DB-lock errors are the realistic failure
+    mode) plus a persisted `uncensored_pending_cleanup` list so a session
+    that still couldn't be deleted after retries gets another real attempt
+    on every later reconcile call, and an ERROR-level log (not swallowed at
+    WARNING) so a permanently-stuck one is at least diagnosable.
+    """
+    path = state_path or (get_hermes_home() / "mode-state.json")
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return
+    if data.get("kind") != "uncensored":
+        return
+
+    pending = list(data.get("uncensored_pending_cleanup") or [])
+    tracked = data.get("uncensored_session_id")
+    if tracked and tracked != session_id and tracked not in pending:
+        pending.append(tracked)
+
+    # Defensive sweep for sessions this single `tracked` pointer already lost track of.
+    # Live incident, 2026-09-15: a session persisted under the uncensored model was found
+    # NEITHER as `uncensored_session_id` NOR in `uncensored_pending_cleanup` -- outside
+    # both of this function's own bookkeeping, so it would never get deleted no matter how
+    # many later sessions started. Root cause not fully pinned down (a `/mode` restore
+    # racing a near-simultaneous re-switch is the leading theory -- toggle.py's
+    # _restore_backup, the third abandonment trigger this function's own docstring
+    # says it does NOT cover, runs outside session init entirely), but the fix that
+    # actually closes the privacy gap doesn't require pinning it down: catch ANY stray
+    # uncensored-model session by construction, every reconcile call, regardless of how
+    # it got orphaned. Same "uncensored" substring convention already used elsewhere
+    # (system_prompt.py's lmstudio_identity_section) -- both DEFAULT_MODEL_BY_KIND
+    # entries (plugins/mode/state.py) reliably differ on exactly that substring, and
+    # core code must not import the mode plugin to get the canonical name instead.
+    with suppress(Exception):
+        import sqlite3
+        _db_path = db_path or (get_hermes_home() / "state.db")
+        if _db_path.exists():
+            conn = sqlite3.connect(f"file:{_db_path}?mode=ro", uri=True, timeout=2.0)
+            try:
+                rows = conn.execute(
+                    "SELECT id FROM sessions WHERE lower(model) LIKE '%uncensored%' "
+                    "AND id != ? AND (archived IS NULL OR archived = 0)",
+                    (session_id,),
+                ).fetchall()
+            finally:
+                conn.close()
+            for (sid,) in rows:
+                if sid != tracked and sid not in pending:
+                    pending.append(sid)
+
+    still_pending = []
+    for sid in pending:
+        if not _delete_session_with_retries(sid):
+            still_pending.append(sid)
+    data["uncensored_pending_cleanup"] = still_pending
+
+    if tracked != session_id:
+        data["uncensored_session_id"] = session_id
+    try:
+        path.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
+def _delete_session_with_retries(session_id: str, attempts: int = 3, delay: float = 0.5) -> bool:
+    """Best-effort delete with retries -- a locked SQLite database (another
+    session/turn writing concurrently) is the realistic transient failure
+    here, not a permanent one. Returns True once actually deleted (or
+    already gone); False only after every attempt failed, so the caller
+    can keep it queued for a later retry instead of silently forgetting
+    it -- see _reconcile_uncensored_session_tracking's docstring."""
+    import time as _time
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            from hermes_state import SessionDB
+            SessionDB().delete_session(session_id)
+            return True
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                _time.sleep(delay)
+    logger.error(
+        "failed to delete abandoned uncensored session %s after %d attempts "
+        "-- queued for retry on next session init (uncensored_pending_cleanup)",
+        session_id, attempts, exc_info=last_exc,
+    )
+    return False
 
 
 def _provider_default_routes(provider: str) -> set[str]:
@@ -1227,6 +1423,52 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
 
     agent._session_db = session_db  # optional SQLite store (CLI/gateway-provided)
     agent._parent_session_id = parent_session_id
+    # _persist_disabled/_session_persist_lock/etc. already defaulted above via
+    # _set_defaults(agent, _SESSION_STATE) -- only the uncensored-mode override
+    # is specific to this call site.
+    #
+    # When True, this agent NEVER persists to the canonical session store
+    # (state.db) or the JSON snapshot, regardless of session_id. Also true for
+    # any profile uncensored-mode has switched onto the local model -- Tony:
+    # "when im on uncensored mode, no memory will be saved or anything that
+    # can leave trace."
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        _uncensored_check_profile = get_active_profile_name()
+    except Exception:
+        _uncensored_check_profile = None
+    _is_uncensored_session = (
+        _uncensored_check_profile is not None
+        and _uncensored_mode_persist_disabled(_uncensored_check_profile)
+    )
+    # Tony, 2026-08-24: uncensored mode used to hard-disable persistence
+    # for the whole session (agent._persist_disabled) -- that also broke
+    # Desktop's own live chat view, which reads history from the same
+    # database nothing was ever written to. Persist normally now; the
+    # "no trace" guarantee comes from actually deleting the session once
+    # it's abandoned instead (see _reconcile_uncensored_session_tracking
+    # below + mode/toggle.py's _restore_backup for the third trigger).
+    # agent._persist_disabled itself keeps its original, narrower meaning
+    # (background skill/memory review forks only).
+    if _is_uncensored_session:
+        _reconcile_uncensored_session_tracking(agent.session_id)
+        # Tony, 2026-08-25: "did we make it so that it does not save
+        # anything on memory, user memory, system memory and stuff like
+        # that?" The explicit "memory" tool is already blocked at
+        # call-time by mode/memory_guard.py's pre_tool_call hook -- but
+        # that leaves a separate gap: turn_context.py's own
+        # should_review_memory/should_review_skills triggers still fire
+        # normally, spawning turn_finalizer.py's _spawn_background_review
+        # fork (another full AIAgent, ~30K tokens/event) to read and
+        # process the "private" conversation regardless of whether its
+        # own eventual memory-write attempt gets blocked -- the exposure
+        # is in the processing itself, not just the write. Nothing
+        # connected skip_background_review to uncensored mode before this;
+        # only cron jobs set it (cron/scheduler.py, via init_agent's own
+        # skip_background_review= param, applied earlier in init_agent
+        # before _init_session_state runs) -- OR in rather than overwrite,
+        # so this never turns a caller's True back to False.
+        agent.skip_background_review = True
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,

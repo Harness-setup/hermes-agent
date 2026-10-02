@@ -149,7 +149,25 @@ class TurnRunner:
         if event_type == "_thinking" or tool_name == "_thinking":
             thinking_text = (preview if tool_name == "_thinking" else tool_name) if ctx._thinking_enabled else None
             if thinking_text:
-                ctx.progress_queue.put(t("gateway.progress.thinking_prefix", text=thinking_text))
+                from gateway.display_config import format_reasoning_block, resolve_display_setting
+                from gateway.run import _load_gateway_config, _platform_config_key
+                try:
+                    _reasoning_style = resolve_display_setting(
+                        _load_gateway_config(), _platform_config_key(ctx.source.platform),
+                        "reasoning_style", "code",
+                    )
+                except Exception:
+                    _reasoning_style = "code"
+                rendered = format_reasoning_block(thinking_text, _reasoning_style)
+                # Tony, 2026-09-23: "it should only show the message in main message in the main
+                # chat and show tool use and reasoning in threads, we have built this but it not
+                # working" -- the ORIGINAL discord.thread_tool_calls design (see
+                # _send_to_tool_thread's own docstring) deliberately kept reasoning in the main
+                # channel and only routed tool-call progress lines to the thread. That's not what
+                # he actually wants: reasoning goes to the SAME thread now, same opt-in flag, main
+                # channel left with only the final answer.
+                if not self._send_to_tool_thread(rendered):
+                    ctx.progress_queue.put(rendered)
             return
         # Native task cards consume the ID-bearing tool_start/tool_complete callbacks instead;
         # name-correlated text events would duplicate cards and mispair concurrent same-tool calls.
@@ -303,20 +321,53 @@ class TurnRunner:
             return t("gateway.progress.tool_preview", emoji=emoji, tool=tool_name, preview=preview)
         return f"{emoji} {verb}" if verb_drops_preview(tool_name) else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
 
+    def _send_to_tool_thread(self, text: str) -> bool:
+        """Discord's discord.thread_tool_calls opt-in: tool-call progress lines AND reasoning
+        (_thinking, routed here too as of 2026-09-23 -- see progress_callback's own comment) go to
+        a lazily-created thread instead of the shared progress_queue, so the main channel only
+        ever shows the final answer. Returns True when handled (caller must not also queue/
+        native-render it); False falls through to the existing behavior unchanged (every other
+        platform, or Discord with the flag off, is untouched by this)."""
+        ctx = self._ctx
+        if ctx.source.platform != Platform.DISCORD:
+            return False
+        try:
+            adapter = self._runner._delivery_adapter_for(ctx.source)
+        except Exception:
+            return False
+        if adapter is None or not hasattr(adapter, "send_tool_progress_line"):
+            return False
+        try:
+            if not adapter._discord_thread_tool_calls_enabled():
+                return False
+        except Exception:
+            return False
+        self._schedule(
+            adapter.send_tool_progress_line(ctx.source.chat_id, ctx.event_message_id, text),
+            "discord tool-progress thread send error",
+        )
+        return True
+
     def _progress_emit(self, msg: str) -> None:
         """Dedup consecutive identical lines (execute_code boilerplate), then route to the native
-        stream bubble when the consumer accepts tool progress, else the progress queue."""
+        stream bubble when the consumer accepts tool progress, else the progress queue -- unless
+        Discord's tool-call thread split claims it first (see _send_to_tool_thread)."""
         ctx = self._ctx
         sc = self._stream_consumer()
         native = sc is not None and getattr(sc, "accepts_tool_progress", False)
         if msg == ctx.last_progress_msg[0]:
             ctx.repeat_count[0] += 1
+            rendered = f"{msg} (×{ctx.repeat_count[0] + 1})"
+            if self._send_to_tool_thread(rendered):
+                return
             if native:
-                sc.on_tool_progress(f"{msg} (×{ctx.repeat_count[0] + 1})")
+                sc.on_tool_progress(rendered)
             else:
                 ctx.progress_queue.put(("__dedup__", msg, ctx.repeat_count[0]))
             return
         ctx.last_progress_msg[0], ctx.repeat_count[0] = msg, 0
+        if self._send_to_tool_thread(msg):
+            return
         if native:
             sc.on_tool_progress(msg)
         else:

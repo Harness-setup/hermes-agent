@@ -302,6 +302,10 @@ voice = [
   "faster-whisper==1.2.1; (platform_machine != 'ARM64' or sys_platform != 'win32') and (platform_machine != 'x86_64' or platform_system != 'Darwin')",
   "sounddevice==0.5.5",
   "numpy==2.4.3",
+  # VAD fast-path silence detection (tools/vad_lite.py) -- an AudioRecorder
+  # feature, not a wake-word feature; also listed under [wake] since a
+  # wake+voice install (the common case) already needs both.
+  "silero-vad-lite==0.2.1",
 ]
 # Wake engines are optional. Bundles include the engines supported by their
 # target. PM installs the selected engine on first use for source installs.

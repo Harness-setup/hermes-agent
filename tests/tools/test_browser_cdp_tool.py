@@ -571,6 +571,54 @@ def test_page_navigate_to_private_url_blocked_before_cdp(monkeypatch):
     assert calls == []
 
 
+def test_create_target_not_blocked_by_current_page_being_private(monkeypatch):
+    # Tony, 2026-09-29: confirmed live -- Target.createTarget (open a brand NEW tab) was
+    # missing from _CDP_PRIVATE_PAGE_ALLOWED_METHODS, so it inherited the "is the CURRENT
+    # page private?" guard meant for content-reading methods. Opening a new tab to
+    # bestbuy.com was blocked because the CURRENT tab happened to be a chrome-extension
+    # page -- a false positive with nothing to do with the new tab's own destination.
+    calls = []
+    monkeypatch.setattr(browser_cdp_tool, "_resolve_cdp_endpoint",
+                        lambda: "ws://127.0.0.1:9222/devtools/browser/mock")
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda task_id: True)
+    monkeypatch.setattr(bt_eval_policy, "_current_page_private_url", lambda task_id: PRIVATE_URL)
+
+    async def fake_call(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"targetId": "new-tab-1"}
+
+    monkeypatch.setattr(browser_cdp_tool, "_cdp_call", fake_call)
+
+    result = json.loads(browser_cdp_tool.browser_cdp(
+        method="Target.createTarget", params={"url": "https://www.bestbuy.com"}, task_id="task-1"))
+
+    assert "error" not in result
+    assert calls  # the call actually reached CDP instead of being blocked
+
+
+def test_create_target_to_a_private_url_is_still_blocked(monkeypatch):
+    """The current-page check no longer applies, but the new tab's OWN destination
+    must still be guarded -- same boundary as Page.navigate, just not bypassable
+    by routing through createTarget instead."""
+    calls = []
+    monkeypatch.setattr(browser_cdp_tool, "_resolve_cdp_endpoint",
+                        lambda: "ws://127.0.0.1:9222/devtools/browser/mock")
+    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda task_id: True)
+
+    async def fake_call(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"targetId": "new-tab-1"}
+
+    monkeypatch.setattr(browser_cdp_tool, "_cdp_call", fake_call)
+
+    result = json.loads(browser_cdp_tool.browser_cdp(
+        method="Target.createTarget", params={"url": PRIVATE_URL}, task_id="task-1"))
+
+    assert "error" in result
+    assert PRIVATE_URL in result["error"]
+    assert calls == []
+
+
 def test_private_guard_inactive_does_not_probe(monkeypatch, cdp_server):
     cdp_server.on("Runtime.evaluate", lambda params, sid: {"result": {"value": "ok"}})
 
@@ -622,3 +670,90 @@ def test_check_fn_false_when_browser_requirements_fail(monkeypatch):
         bt_cdp, "_get_cdp_override_raw", lambda: "ws://localhost:9222/devtools/browser/x"
     )
     assert browser_cdp_tool._browser_cdp_check() is False
+
+
+# ---------------------------------------------------------------------------
+# Target.createTarget landed-url poll (2026-09-23)
+# ---------------------------------------------------------------------------
+# Target.createTarget's own response is just {"targetId": ...} -- the navigation it kicks off is
+# asynchronous, so a redirect (e.g. a Windows Family Safety block) is invisible to both the
+# family-safety scan and whatever the caller ends up telling the user unless something polls the
+# target's real landed URL shortly after creation.
+
+
+async def _fake_sleep(*_a, **_k) -> None:
+    return None
+
+
+def _setup_create_target(monkeypatch, *, landed_url=None, poll_raises=False):
+    monkeypatch.setattr(browser_cdp_tool, "_resolve_cdp_endpoint",
+                        lambda: "ws://127.0.0.1:9222/devtools/browser/mock")
+    monkeypatch.setattr(browser_cdp_tool.asyncio, "sleep", _fake_sleep)
+    calls = []
+
+    async def fake_call(ws_url, method, params, target_id, timeout):
+        calls.append(method)
+        if method == "Target.createTarget":
+            return {"targetId": "NEW123"}
+        if method == "Target.getTargetInfo":
+            if poll_raises:
+                raise RuntimeError("poll failed")
+            return {"targetInfo": {"targetId": "NEW123", "url": landed_url or "https://example.com/"}}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(browser_cdp_tool, "_cdp_call", fake_call)
+    return calls
+
+
+def test_create_target_polls_and_flags_a_family_safety_redirect(monkeypatch):
+    calls = _setup_create_target(
+        monkeypatch,
+        landed_url="https://sdx.microsoft.com/family/restricted-web?url=https%3A%2F%2Fexample.com",
+    )
+
+    result = json.loads(browser_cdp_tool.browser_cdp(
+        method="Target.createTarget", params={"url": "https://example.com"}, task_id="task-1"))
+
+    assert calls == ["Target.createTarget", "Target.getTargetInfo"]
+    assert result["result"]["landed_url"].startswith("https://sdx.microsoft.com/family/restricted-web")
+    assert result.get("family_safety_block_detected") is True
+    assert "same-day access" in result["notice"]
+
+
+def test_create_target_polls_a_normal_landing_with_no_false_positive(monkeypatch):
+    _setup_create_target(monkeypatch, landed_url="https://example.com/")
+
+    result = json.loads(browser_cdp_tool.browser_cdp(
+        method="Target.createTarget", params={"url": "https://example.com"}, task_id="task-1"))
+
+    assert result["result"]["landed_url"] == "https://example.com/"
+    assert "family_safety_block_detected" not in result
+
+
+def test_create_target_poll_failure_does_not_break_the_original_success(monkeypatch):
+    """The createTarget call itself already succeeded -- a poll failure must degrade to no
+    landed_url, never turn a real success into an error."""
+    _setup_create_target(monkeypatch, poll_raises=True)
+
+    result = json.loads(browser_cdp_tool.browser_cdp(
+        method="Target.createTarget", params={"url": "https://example.com"}, task_id="task-1"))
+
+    assert result["success"] is True
+    assert result["result"]["targetId"] == "NEW123"
+    assert "landed_url" not in result["result"]
+
+
+def test_non_create_target_methods_never_trigger_the_poll(monkeypatch):
+    calls = []
+    monkeypatch.setattr(browser_cdp_tool, "_resolve_cdp_endpoint",
+                        lambda: "ws://127.0.0.1:9222/devtools/browser/mock")
+
+    async def fake_call(ws_url, method, params, target_id, timeout):
+        calls.append(method)
+        return {"targetInfos": []}
+
+    monkeypatch.setattr(browser_cdp_tool, "_cdp_call", fake_call)
+
+    json.loads(browser_cdp_tool.browser_cdp(method="Target.getTargets", task_id="task-1"))
+
+    assert calls == ["Target.getTargets"]

@@ -53,7 +53,8 @@ from tools.delegate_tool_toolsets import (  # noqa: F401
     DELEGATE_BLOCKED_TOOLS, _expand_parent_toolsets, _resolve_child_toolsets, _strip_blocked_tools,
 )
 from tools.delegate_tool_results import (  # noqa: F401
-    _apply_summary_budget, _build_child_preserving_parent_tools, _run_child_lifecycle, _summarize_tool_arguments,
+    _apply_summary_budget, _build_child_preserving_parent_tools, _finalize_child_results,
+    _run_child_lifecycle, _summarize_tool_arguments,
 )
 
 _ROLES = frozenset({"leaf", "orchestrator"})

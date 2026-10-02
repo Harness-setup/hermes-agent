@@ -96,7 +96,7 @@ from hermes_cli.update_cmd_git import (  # noqa: F401
     _normalize_managed_eol, _park_detached_head, _portable_git_candidates, _print_fetch_failure,
     _print_parked_branch_kept_notice, _print_parked_branch_skip_warning,
     _prune_orphan_rescue_refs, _should_skip_upstream_prompt, _sync_fork_with_upstream,
-    _sync_with_upstream_if_needed)
+    _sync_with_upstream_if_needed, _maybe_sync_from_backup_remote)
 from hermes_cli.update_cmd_maint import (  # noqa: F401
     _PRE_UPDATE_SNAPSHOT_KEEP, _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE, _clear_stale_sqlite_sidecars,
     _checkout_version, _ensure_acp_launcher, _ensure_fhs_path_guard, _finish_dashboard_update_cleanup,
@@ -785,6 +785,30 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha, *, target_r
         print(
             f"  ⚠ Checkout is on custom branch '{_cur_branch}' — "
             f"merging origin/{branch} instead of resetting so local commits survive...")
+        # A plain `git merge` fails closed with "refusing to merge unrelated histories" when
+        # origin/<branch> shares NO common ancestor with the local checkout -- an upstream
+        # history rewrite (a squash, a repo re-init), not a normal set of new commits to
+        # reconcile. Confirmed live 2026-09-23: this repo's real upstream did exactly that,
+        # and every `hermes update` attempt that night failed identically because nothing about
+        # a plain retry changes an unrelated-histories situation. The OLD code here treated
+        # this the same as an ordinary content conflict and told the user to run `git merge
+        # origin/<branch>` by hand -- which fails the exact same way for them too, so "resolve
+        # manually" was actively misleading. Detect it up front and say what's actually true
+        # instead of attempting a doomed merge and guessing at the reason from a generic abort.
+        if _git_run(git_cmd, ["merge-base", "HEAD", f"origin/{branch}"]).returncode != 0:
+            print(
+                f"✗ origin/{branch} shares no common history with this checkout anymore — "
+                f"the upstream branch was rewritten (a squash or repo re-init), not just "
+                f"advanced with new commits. A normal merge can never succeed here; retrying "
+                f"this update will keep failing identically. Update stopped, nothing was changed."
+            )
+            print(
+                f"  This needs a deliberate decision, not an automatic merge: either adopt "
+                f"origin/{branch}'s new history (discarding the link to your current commit "
+                f"graph) or keep developing on your own fork/backup remote and stop tracking "
+                f"origin/{branch} for updates. Local work is untouched either way."
+            )
+            sys.exit(1)
         # Best-effort safety tag as a recovery anchor.
         _git_run(git_cmd, ["tag", f"pre-update-{_time.strftime('%Y%m%d-%H%M%S')}"])
         if _git_run(git_cmd, ["merge", "--no-edit", merge_ref]).returncode != 0:
@@ -1066,6 +1090,7 @@ def _prepare_checkout_for_update(
         # rewrites the user's branch. Branch-policy machinery is main-only.
         parked_branch_switched, in_place_update, switch_block_reason = False, True, None
     else:
+        _m()._maybe_sync_from_backup_remote(git_cmd, _m().PROJECT_ROOT, current_branch)
         parked_branch_switched, in_place_update, switch_block_reason = _apply_parked_branch_guard(
             git_cmd, branch, current_branch, switch_branch=switch_branch,
             _windows_gateway_resume=_windows_gateway_resume)

@@ -85,3 +85,14 @@ def test_compare_behind_network_failure_returns_none():
 def test_compare_behind_rejects_malformed_payloads(payload):
     with _patch_urlopen(payload):
         assert source_check._github_compare_behind(SHA_A, SHA_B) is None
+
+
+def test_local_only_head_counts_locally_when_compare_api_cannot_see_it():
+    """A parked-branch HEAD (local-fixes) 404s on the compare API; the target is in local history."""
+    co = type("Co", (), {"head": SHA_A, "embedded": None, "repository": "owner/repo",
+                         "root": None, "git": "git"})()
+    with patch.object(source_check, "_github_compare", return_value=None), \
+            patch.object(source_check, "_git_ok", side_effect=[False, True]), \
+            patch.object(source_check, "_git_count", return_value=7) as count:
+        assert source_check._behind_count(co, SHA_B) == (7, [])
+    count.assert_called_once_with(["rev-list", "--count", f"{SHA_A}..{SHA_B}"], cwd=None)

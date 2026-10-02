@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Dict, Optional
 
 from tools.registry import registry, tool_error
@@ -20,11 +21,66 @@ logger = logging.getLogger(__name__)
 
 CDP_DOCS_URL = "https://chromedevtools.github.io/devtools-protocol/"
 
+# Windows Family Safety's web-content filter intercepts a blocked navigation at the
+# network level and silently redirects to this Microsoft restriction page instead of
+# returning a normal 4xx/5xx -- confirmed live 2026-09-15 (example.com actually landed
+# on sdx.microsoft.com/family/restricted-web?...). Detected here, at the tool-result
+# level, rather than left to the agent noticing on its own: a skill doc alone is a
+# judgment call the model can forget to apply on any given turn, but a URL substring
+# match on the tool's own CDP result is a guarantee. See
+# .hermes/skills/browser-native/SKILL.md's "Windows Family Safety blocks" section for
+# the required response once this fires.
+_FAMILY_SAFETY_BLOCK_RE = re.compile(
+    r"sdx\.microsoft\.com/family/restricted-web|familysafety\.microsoft\.com", re.IGNORECASE
+)
+
+_FAMILY_SAFETY_NOTICE = (
+    "This request appears to have been intercepted and redirected by Windows Family "
+    "Safety's web-content filter (a restricted-web/familysafety URL was seen in this "
+    "CDP result), not a normal page load or error. Tell Tony plainly that the site was "
+    "blocked by his Family Safety settings and ask whether he wants a same-day access "
+    "request sent -- never attempt to bypass the block."
+)
+
+
+def _contains_family_safety_redirect(value: Any) -> bool:
+    """Recursively scan a CDP result for the Family Safety redirect signature, in any
+    string field at any depth (target URLs, navigated-frame URLs, evaluated
+    location.href, ...) -- no per-CDP-method field list to keep in sync."""
+    if isinstance(value, str):
+        return bool(_FAMILY_SAFETY_BLOCK_RE.search(value))
+    if isinstance(value, dict):
+        return any(_contains_family_safety_redirect(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_family_safety_redirect(v) for v in value)
+    return False
+
+
+def _annotate_family_safety_block(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Add a hard-to-miss notice field when this tool result's own data carries the
+    Family Safety redirect signature, wherever it appears in the payload (browser_cdp's
+    nested "result", browser_navigate's top-level "url"/"title", ...). Never raises --
+    a scan failure must not break a normal browser call."""
+    try:
+        if _contains_family_safety_redirect(payload):
+            payload["family_safety_block_detected"] = True
+            payload["notice"] = _FAMILY_SAFETY_NOTICE
+    except Exception:
+        logger.debug("Family Safety scan failed", exc_info=True)
+    return payload
+
 # Browser/target inspection that never reads page body/cookies/DOM/storage — stays
 # usable so the model can list tabs or navigate away from a blocked page.
+# Tony, 2026-09-29: Target.createTarget (open a NEW tab) was missing from this set,
+# so it inherited the "is the CURRENT page private?" guard meant for content-reading
+# methods (Runtime.evaluate, DOM.getDocument, ...) -- confirmed live: opening a new
+# tab to bestbuy.com was blocked with "page URL targets a private or internal
+# address (chrome-extension://...)", the CURRENT tab's URL, which has nothing to do
+# with the brand-new tab being created. Its own destination is guarded separately
+# below (_METHOD_PARAM_GUARDS), the same way Page.navigate's is.
 _CDP_PRIVATE_PAGE_ALLOWED_METHODS = {
     "Browser.getVersion", "Target.getTargets", "Target.attachToTarget", "Target.detachFromTarget",
-    "Page.navigate", "Page.reload", "Page.stopLoading",
+    "Target.createTarget", "Page.navigate", "Page.reload", "Page.stopLoading",
 }
 
 # method → result paths that are ALWAYS opaque base64 (protocol-declared binary).
@@ -122,7 +178,7 @@ def _expression_private_target(expression: str) -> Optional[str]:
 
 
 def _navigate_private_target(bt: Any, params: Dict[str, Any]) -> Optional[str]:
-    """Blocked URL literal for ``Page.navigate`` params, else ``None``."""
+    """Blocked URL literal for ``Page.navigate``/``Target.createTarget`` params, else ``None``."""
     from tools.browser_tool_eval_policy import _url_blocked
     target_url = str(params.get("url") or "").strip()
     return target_url if target_url and _url_blocked(bt, target_url) else None
@@ -132,6 +188,8 @@ def _navigate_private_target(bt: Any, params: Dict[str, Any]) -> Optional[str]:
 _METHOD_PARAM_GUARDS = {
     "Page.navigate": (_navigate_private_target,
                       "Blocked: CDP Page.navigate target is a private or internal address ({})."),
+    "Target.createTarget": (_navigate_private_target,
+                            "Blocked: CDP Target.createTarget target is a private or internal address ({})."),
     "Runtime.evaluate": (lambda bt, params: _expression_private_target(str(params.get("expression") or "")),
                          "Blocked: CDP Runtime.evaluate expression targets a private or internal address ({})."),
 }
@@ -207,6 +265,27 @@ async def _cdp_call(ws_url: str, method: str, params: Dict[str, Any], target_id:
         return msg.get("result", {})
 
 
+async def _poll_created_target_url(ws_url: str, target_id: str, timeout: float) -> Optional[str]:
+    """Where *target_id* actually landed shortly after ``Target.createTarget``, or None on any failure.
+
+    Tony, 2026-09-23: ``Target.createTarget``'s own response is just ``{"targetId": ...}`` -- the
+    navigation it kicks off is asynchronous, so nothing in that response reflects where the new tab
+    actually ends up. Confirmed live: asked to open a site that Windows Family Safety blocks, the
+    createTarget call itself "succeeded" with no hint of the redirect, and the agent reported the
+    page as loaded -- a false claim, not just a missed detection, since _annotate_family_safety_block
+    only ever sees this call's own immediate result. A brief wait plus one follow-up
+    Target.getTargetInfo call gives the redirect (which happens fast, if it happens at all) time to
+    land before the caller decides what to report. Best-effort: any failure here must never break
+    the createTarget call that already succeeded."""
+    await asyncio.sleep(0.6)
+    try:
+        info = await _cdp_call(ws_url, "Target.getTargetInfo", {"targetId": target_id}, None, timeout)
+        return info.get("targetInfo", {}).get("url")
+    except Exception:
+        logger.debug("browser_cdp: post-createTarget landed-url poll failed", exc_info=True)
+        return None
+
+
 def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params: Optional[Dict[str, Any]],
                                 timeout: float) -> str:
     """Route a CDP call through the live supervisor session for an OOPIF frame."""
@@ -253,8 +332,9 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
     except Exception as exc:
         return tool_error(f"CDP call via supervisor failed: {type(exc).__name__}: {exc}", cdp_docs=CDP_DOCS_URL)
 
-    return json.dumps({"success": True, "method": method, "frame_id": frame_id, "session_id": child_sid,
-                       "result": result_msg.get("result", {})}, ensure_ascii=False)
+    payload = _annotate_family_safety_block({"success": True, "method": method, "frame_id": frame_id,
+                                             "session_id": child_sid, "result": result_msg.get("result", {})})
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def browser_cdp(method: str, params: Optional[Dict[str, Any]] = None, target_id: Optional[str] = None,
@@ -313,11 +393,23 @@ def browser_cdp(method: str, params: Optional[Dict[str, Any]] = None, target_id:
         logger.exception("browser_cdp unexpected error")
         return tool_error(f"Unexpected error: {type(exc).__name__}: {exc}", method=method)
 
+    # Target.createTarget's own response never reflects the async navigation it kicks off (see
+    # _poll_created_target_url's docstring) -- without this, a redirect there is invisible to both
+    # the family-safety scan below and to whatever the caller ends up telling the user.
+    if method == "Target.createTarget" and isinstance(result, dict) and result.get("targetId"):
+        try:
+            landed_url = _run_async(_poll_created_target_url(endpoint, result["targetId"], safe_timeout))
+            if landed_url:
+                result["landed_url"] = landed_url
+        except Exception:
+            logger.debug("browser_cdp: landed-url poll raised", exc_info=True)
+
     payload: Dict[str, Any] = {"success": True, "method": method, "result": _redact_cdp_output(
         result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
         flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()))}
     if target_id:
         payload["target_id"] = target_id
+    payload = _annotate_family_safety_block(payload)
     return json.dumps(payload, ensure_ascii=False)
 
 
