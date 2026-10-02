@@ -464,6 +464,7 @@ class SessionManager:
 
         from run_agent import AIAgent
         from hermes_cli.config import load_config
+        from hermes_cli.fallback_config import get_fallback_chain
         from hermes_cli.runtime_provider import resolve_runtime_provider
         from hermes_constants import resolve_reasoning_config
 
@@ -488,6 +489,10 @@ class SessionManager:
             "disabled_toolsets": list(disabled_toolsets) if disabled_toolsets is not None else None,
             "model": model or default_model,
             "cwd": cwd,
+            # Same as CLI/one-shot/gateway/TUI/cron: without the chain a primary credit-exhaustion
+            # 400 has nothing to fail over to (``_has_pending_fallback()`` is False) and the raw
+            # billing error becomes the reply (spoken aloud by voice-bridge).
+            "fallback_model": get_fallback_chain(config) or None,
             # Same chokepoint as the CLI/gateway/TUI/cron: without it ``agent.reasoning_effort: none`` never
             # reaches an ACP session and the transport applies its default effort (a 400 on non-reasoning
             # models). Resolved against the session's model so per-model overrides apply.

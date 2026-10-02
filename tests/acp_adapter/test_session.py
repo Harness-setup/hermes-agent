@@ -142,6 +142,28 @@ class TestCreateSession:
         assert (seen[0]["enabled_toolsets"], seen[0]["disabled_toolsets"]) == (["hermes-acp", "mcp-cfg-server"], None)
         assert (seen[1]["enabled_toolsets"], seen[1]["disabled_toolsets"]) == (["hermes-acp", "mcp-acp-server"], ["browser"])
 
+    def test_make_agent_passes_the_configured_fallback_chain(self, monkeypatch):
+        """Every other entry point (CLI, one-shot, gateway, TUI, cron) hands the agent
+        ``fallback_providers``; without it an ACP session (voice-bridge) that hits a primary
+        credit-exhaustion 400 has nothing to fail over to and surfaces the raw error."""
+        seen: list[dict] = []
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                seen.append(kwargs)
+
+        chain = [{"provider": "lmstudio-chat", "model": "qwen/qwen3.5-9b"}]
+        config = {"model": {"default": "m", "provider": "p"}, "fallback_providers": chain}
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **_kw: {})
+        monkeypatch.setattr("hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build", lambda **_kw: None)
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
+
+        SessionManager(db=None)._make_agent(session_id="fresh", cwd=".")
+
+        assert seen[0]["fallback_model"] == chain
+
     def test_make_agent_surfaces_the_provider_resolution_failure(self, monkeypatch):
         """#91090: when ``resolve_runtime_provider`` fails, the bare-AIAgent fallback dies with the
         first-run "No LLM provider configured" text; the operator must get the swallowed cause
