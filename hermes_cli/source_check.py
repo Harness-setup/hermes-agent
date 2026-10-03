@@ -336,6 +336,14 @@ def _behind_count(co: _Checkout, target: str) -> tuple[int, list[dict]]:
         return 0, []
     if co.repository:
         payload = _github_compare(co.head, target, co.repository)
+        # A local-only HEAD (a merge commit on a parked branch like local-fixes) is a SHA GitHub
+        # has never seen, so the compare 404s and the update panel loses both the count and the
+        # change list ("Improvements and fixes" for every update). The last commit we share with
+        # upstream IS known to GitHub, and comparing from it counts exactly what we are missing.
+        if payload is None and not co.embedded:
+            base = _git_stdout(["merge-base", co.head, "refs/remotes/origin/main"], cwd=co.root, git=co.git)
+            if base and base != co.head:
+                payload = _github_compare(base, target, co.repository)
         ahead = (payload or {}).get("ahead_by")
         if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0:
             return ahead, (_quiet(lambda: _commits(payload), []) if ahead else [])

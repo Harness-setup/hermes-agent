@@ -96,3 +96,27 @@ def test_local_only_head_counts_locally_when_compare_api_cannot_see_it():
             patch.object(source_check, "_git_count", return_value=7) as count:
         assert source_check._behind_count(co, SHA_B) == (7, [])
     count.assert_called_once_with(["rev-list", "--count", f"{SHA_A}..{SHA_B}"], cwd=None)
+
+
+def test_local_only_head_compares_from_the_shared_merge_base_for_count_and_notes():
+    """HEAD is unknown to GitHub (404), but the merge-base with origin/main is not: compare from it."""
+    BASE = "c" * 40
+    co = type("Co", (), {"head": SHA_A, "embedded": None, "repository": "owner/repo",
+                         "root": None, "git": "git"})()
+    payload = {"ahead_by": 311, "commits": [
+        {"sha": SHA_B, "commit": {"message": "fix(gateway): stop dropping replies\n\nbody",
+                                  "author": {"name": "dev"}, "committer": {"date": "2026-10-02T00:00:00Z"}}}]}
+    seen = []
+
+    def fake_compare(current, target, repository="owner/repo"):
+        seen.append(current)
+        return None if current == SHA_A else payload
+
+    with patch.object(source_check, "_git_ok", return_value=False), \
+            patch.object(source_check, "_git_stdout", return_value=BASE), \
+            patch.object(source_check, "_github_compare", side_effect=fake_compare):
+        behind, commits = source_check._behind_count(co, SHA_B)
+
+    assert seen == [SHA_A, BASE]
+    assert behind == 311
+    assert commits and commits[0]["summary"] == "fix(gateway): stop dropping replies"
