@@ -313,8 +313,20 @@ async def check_hermes_update(force: bool = False, profile: Optional[str] = None
         _log.exception("Update check failed")
         behind = None
 
+    # A parked custom branch (e.g. local-fixes) that upstream does not have is not a failed
+    # check: the checker cannot count against a branch the remote never advertised, but
+    # nothing went wrong. Report it as such instead of the "couldn't reach" copy, which sent
+    # users chasing a network problem that did not exist.
+    local_only = behind is None and bool(status.get("localOnly"))
+    if local_only:
+        behind = 0
+        payload["message"] = (
+            f"Running local branch '{status.get('branch') or 'unknown'}', which upstream does not "
+            "publish. Update it with `hermes update`.")
     payload["behind"] = behind
-    if behind is None:
+    if local_only:
+        pass
+    elif behind is None:
         payload["message"] = "Couldn't reach the update source — try again later."
     elif behind == 0:
         payload["message"] = "You're on the latest version."

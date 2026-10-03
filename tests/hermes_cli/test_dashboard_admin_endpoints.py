@@ -827,6 +827,28 @@ class TestUpdateCheckEndpoint:
         assert body["can_apply"] is True
 
 
+    def test_local_only_branch_is_not_reported_as_unreachable(self, monkeypatch):
+        """A parked branch upstream never published (local-fixes) is not a failed check."""
+        monkeypatch.setattr(_cfg_mod, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr(
+            "hermes_cli.source_check.check_for_updates",
+            lambda **kw: {"behind": None, "localOnly": True, "branch": "local-fixes",
+                          "error": "branch-local-only"})
+
+        body = self.client.get("/api/hermes/update/check").json()
+        assert body["behind"] == 0
+        assert body["update_available"] is False
+        assert "local-fixes" in body["message"]
+        assert "reach" not in body["message"]
+
+    def test_no_count_without_local_only_still_reads_as_unreachable(self, monkeypatch):
+        monkeypatch.setattr(_cfg_mod, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr("hermes_cli.source_check.check_for_updates", lambda **kw: {"behind": None})
+
+        body = self.client.get("/api/hermes/update/check").json()
+        assert body["behind"] is None
+        assert "reach" in body["message"]
+
     def test_managed_runtime_dashboard_is_not_applyable(self, monkeypatch):
 
         monkeypatch.setattr(_web_server_files, "_dashboard_local_update_managed_externally", lambda: True)
