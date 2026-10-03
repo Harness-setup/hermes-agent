@@ -1090,7 +1090,7 @@ def _prepare_checkout_for_update(
         # rewrites the user's branch. Branch-policy machinery is main-only.
         parked_branch_switched, in_place_update, switch_block_reason = False, True, None
     else:
-        _m()._maybe_sync_from_backup_remote(git_cmd, _m().PROJECT_ROOT, current_branch)
+        _maybe_sync_from_backup_remote(git_cmd, _m().PROJECT_ROOT, current_branch)
         parked_branch_switched, in_place_update, switch_block_reason = _apply_parked_branch_guard(
             git_cmd, branch, current_branch, switch_branch=switch_branch,
             _windows_gateway_resume=_windows_gateway_resume)
