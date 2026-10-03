@@ -1,0 +1,74 @@
+name: Sync fork with NousResearch/hermes-agent
+
+# This repo isn't a GitHub-native fork of NousResearch/hermes-agent (just an
+# independent repo with the same history pushed in), so `gh repo sync`
+# can't auto-detect the upstream -- plain git fetch/reset/push instead.
+#
+# `main` here is meant to be a pure mirror of upstream `main`, not a place
+# for local commits: this machine's own hermes-agent checkout already gets
+# hard-reset to match upstream on every `hermes update` (confirmed
+# repeatedly), so there's no expectation of preserving divergent commits
+# directly on this branch -- any local fixes live as .patch files in the
+# harness-setup repo instead, re-applied after each update/clone. Hence a
+# force-push here: it's intentional, not destructive, for what this branch
+# is actually for.
+#
+# .github/workflows/ is deliberately excluded from the sync -- GITHUB_TOKEN
+# can never create/update/delete files under that path, full stop, no
+# `permissions:` setting changes it (confirmed live: adding `workflows:
+# write` still failed with "Unexpected value 'workflows'" -- that's not
+# even a real permission key; the actual restriction is a hard platform
+# rule on the auto-generated token, unrelated to scoping). This fork's
+# purpose is a source-code mirror for disaster recovery, not a CI replica,
+# so NousResearch's own workflow files (docker.yml, CI.yml, ...) going
+# stale here causes no real harm -- only this file itself needs to survive
+# each sync, which the explicit restore step below guarantees.
+on:
+  schedule:
+    # NousResearch merges frequently (dozens of active branches/merges
+    # observed in normal use) -- daily keeps this fork close to current
+    # without being noisy.
+    - cron: "0 9 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Fetch NousResearch and fast-forward main, preserving this fork's own .github/workflows/
+        run: |
+          set -euo pipefail
+          # Explicit backup-and-restore rather than relying on a reflog
+          # reference (e.g. main@{1}) -- untested against exactly how
+          # actions/checkout populates the local reflog, and a plain
+          # file copy has no such dependency. Verified locally (not just
+          # reviewed) against a scenario with upstream having its own
+          # different workflow file: only this fork's own file survives,
+          # upstream's is correctly excluded, app code still updates.
+          git config user.email "actions@github.com"
+          git config user.name "sync-fork workflow"
+
+          workflows_backup="$(mktemp -d)"
+          cp -r .github/workflows/. "$workflows_backup/"
+
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+          git reset --hard upstream/main
+
+          rm -rf .github/workflows
+          mkdir -p .github/workflows
+          cp -r "$workflows_backup"/. .github/workflows/
+          rm -rf "$workflows_backup"
+
+          git add -A
+          git commit -m "sync: update to NousResearch main (this fork's own .github/workflows/ preserved)" --allow-empty
+          git push origin main --force
