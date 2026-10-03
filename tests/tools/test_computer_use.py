@@ -274,7 +274,7 @@ class TestBatchAction:
                 )
 
         cu_tool.reset_backend_for_tests()
-        with patch.object(cu_tool, "_get_backend", return_value=FakeBackend()), \
+        with patch.object(cu_tool, "_new_backend", return_value=FakeBackend()), \
              patch.object(cu_tool, "_should_route_through_aux_vision",
                           return_value=False):
             out = cu_tool.handle_computer_use({"action": "batch", "actions": [
