@@ -56,7 +56,7 @@ def drive_preview_tool(
     if not raw:
         return tool_error(
             "No GUI window answered with a page: no preview tab is open. "
-            "Open a page with open_preview first. If the pane IS open, the desktop app "
+            "Open a page first with desktop_preview(action=\"open\", url=...). If the pane IS open, the desktop app "
             "may be older than this backend — its bridge-unavailable error names that case.")
     return passthrough_json(raw)
 

@@ -830,11 +830,11 @@ def test_cleanup_workspace_refuses_to_delete_when_declared_artifacts_missing(kan
     artifacts aren't verifiably durable yet, since deleting real,
     undelivered work is the actual harmful outcome to prevent.
     """
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="render chart")
         task = kb.get_task(conn, t)
-        ws = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, t, ws)
+        ws = kbw.resolve_workspace(task)
+        kbw.set_workspace_path(conn, t, ws)
         deliverable = ws / "chart.png"
         deliverable.write_bytes(b"png-bytes")
 
@@ -854,11 +854,11 @@ def test_cleanup_workspace_refuses_to_delete_when_declared_artifacts_missing(kan
 def test_cleanup_workspace_still_deletes_when_no_artifacts_were_declared(kanban_home):
     """The safety check must not block the common case: a scratch task that
     never declared any artifacts should still get cleaned up normally."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="ephemeral scratch work")
         task = kb.get_task(conn, t)
-        ws = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, t, ws)
+        ws = kbw.resolve_workspace(task)
+        kbw.set_workspace_path(conn, t, ws)
         (ws / "scratch.tmp").write_text("throwaway")
 
         kb._cleanup_workspace(conn, t, declared_artifact_count=0)
@@ -869,11 +869,11 @@ def test_cleanup_workspace_still_deletes_when_no_artifacts_were_declared(kanban_
 def test_cleanup_workspace_deletes_when_declared_artifacts_are_verified(kanban_home):
     """The safety check must not block cleanup once preservation genuinely
     succeeded -- only an unverified/missing preservation should defer it."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="render chart, verified")
         task = kb.get_task(conn, t)
-        ws = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, t, ws)
+        ws = kbw.resolve_workspace(task)
+        kbw.set_workspace_path(conn, t, ws)
         (ws / "chart.png").write_bytes(b"png-bytes")
 
         kb._insert_completion_attachment(

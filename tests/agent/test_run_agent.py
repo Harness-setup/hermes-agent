@@ -2963,7 +2963,7 @@ class TestHandleMaxIterations:
         assert leaked_controls <= agent._build_api_kwargs([{"role": "user", "content": "do stuff"}]).keys()
         bodies = []
 
-        def fake_run_codex_stream(kwargs):
+        def fake_run_codex_stream(kwargs, **_ignored):
             bodies.append(dict(kwargs))
             text = "" if len(bodies) == 1 else "Summary"
             return SimpleNamespace(
@@ -3009,7 +3009,7 @@ class TestHandleMaxIterations:
             "parallel_tool_calls": True,
         }
 
-        def fake_run_codex_stream(kwargs):
+        def fake_run_codex_stream(kwargs, **_ignored):
             bodies.append(dict(kwargs))
             # First attempt returns an empty summary so the caller takes the retry path.
             text = "" if len(bodies) == 1 else "Summary"
@@ -3061,7 +3061,7 @@ class TestHandleMaxIterations:
             "parallel_tool_calls": True,
         }
 
-        def fake_run_codex_stream(kwargs):
+        def fake_run_codex_stream(kwargs, **_ignored):
             bodies.append(dict(kwargs))
             # First attempt returns an empty summary so the caller takes the retry path.
             text = "" if len(bodies) == 1 else "Summary"

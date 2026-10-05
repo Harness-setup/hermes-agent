@@ -2,6 +2,7 @@
 import contextlib
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -268,7 +269,7 @@ def test_stash_push_retries_after_transient_index_write_failure(monkeypatch, tmp
                 )
         return real_git_run(git_cmd, args, cwd, **kwargs)
 
-    monkeypatch.setattr(update_cmd, "_git_run", flaky_git_run)
+    monkeypatch.setattr("hermes_cli.update_cmd_git._git_run", flaky_git_run)
     monkeypatch.setattr("hermes_cli.update_cmd_stash.time.sleep", lambda *a, **kw: None)
 
     stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
