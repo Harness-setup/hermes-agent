@@ -3373,6 +3373,24 @@
       }
     },
     {
+      "name": "session.interrupt_all",
+      "summary": "Authenticated backend-wide Stop All: cancel hosted work without closing sessions or services.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/Params"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionInterruptAllResult"
+        }
+      }
+    },
+    {
       "name": "session.list",
       "summary": "Human-facing stored sessions, most recent first (sub-agent / kanban sources denied).",
       "params": [
@@ -16547,6 +16565,42 @@
           "messages"
         ],
         "title": "InsightsGetResult",
+        "type": "object"
+      },
+      "InterruptAllItem": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error"
+          }
+        },
+        "required": [
+          "session_id",
+          "ok",
+          "status"
+        ],
+        "title": "InterruptAllItem",
         "type": "object"
       },
       "InterruptStatus": {
@@ -30681,6 +30735,23 @@
           "messages"
         ],
         "title": "SessionHistoryResult",
+        "type": "object"
+      },
+      "SessionInterruptAllResult": {
+        "additionalProperties": false,
+        "properties": {
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/InterruptAllItem"
+            },
+            "title": "Sessions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "sessions"
+        ],
+        "title": "SessionInterruptAllResult",
         "type": "object"
       },
       "SessionInterruptParams": {

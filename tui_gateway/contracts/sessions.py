@@ -614,6 +614,21 @@ method("session.interrupt", params=SessionInterruptParams, result=SessionInterru
        doc="Stop the running turn (and streaming TTS); retires the crash-recovery marker.")
 
 
+class InterruptAllItem(Result):
+    session_id: str
+    ok: bool
+    status: str
+    error: str | None = None
+
+
+class SessionInterruptAllResult(Result):
+    sessions: list[InterruptAllItem]
+
+
+method("session.interrupt_all", params=Params, result=SessionInterruptAllResult,
+       doc="Authenticated backend-wide Stop All: cancel hosted work without closing sessions or services.")
+
+
 class CorrectionStatus(WireEnum):
     queued = "queued"
     redirected = "redirected"

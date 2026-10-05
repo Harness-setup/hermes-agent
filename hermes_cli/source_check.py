@@ -134,7 +134,13 @@ def _request_with(url: str, accept: str, token: str | None) -> str:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=10) as response:
-        return response.read(2 * 1024 * 1024).decode("utf-8-sig").strip()
+        # Compare responses include file patches as well as commits and can exceed 2 MiB.
+        # A truncated JSON document hides otherwise valid counts and changelogs.
+        limit = 16 * 1024 * 1024
+        payload = response.read(limit + 1)
+        if len(payload) > limit:
+            raise ValueError("GitHub update response exceeds the 16 MiB limit")
+        return payload.decode("utf-8-sig").strip()
 
 
 def _branch_tip(repository: str | None, branch: str, root: Path, git: str,
@@ -342,7 +348,18 @@ def _behind_count(co: _Checkout, target: str) -> tuple[int, list[dict]]:
         # upstream IS known to GitHub, and comparing from it counts exactly what we are missing.
         if payload is None and not co.embedded:
             base = _git_stdout(["merge-base", co.head, "refs/remotes/origin/main"], cwd=co.root, git=co.git)
-            if base and base != co.head:
+            # A carried upstream merge may be newer than a stale origin/main ref (notably
+            # the second Windows checkout). Compare its public parent first so already
+            # merged commits are not counted again. GitHub must recognize the candidate.
+            merge = _git_stdout(["rev-list", "--first-parent", "--merges", "--max-count=1", co.head],
+                                cwd=co.root, git=co.git)
+            parents = (_git_stdout(["show", "-s", "--format=%P", merge], cwd=co.root, git=co.git) or "").split() if merge else []
+            for candidate in parents[1:]:
+                if base and _git_ok(["merge-base", "--is-ancestor", base, candidate], cwd=co.root, git=co.git):
+                    payload = _github_compare(candidate, target, co.repository)
+                    if payload is not None:
+                        break
+            if payload is None and base and base != co.head:
                 payload = _github_compare(base, target, co.repository)
         ahead = (payload or {}).get("ahead_by")
         if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0:

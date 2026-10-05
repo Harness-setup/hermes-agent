@@ -2382,6 +2382,37 @@ def _resume_wake_after_interrupt() -> None:
 
 
 # ── interrupt / steer / redirect ─────────────────────────────────────
+@method("session.interrupt_all")
+def _(rid, params: dict) -> dict:
+    """The backend-wide equivalent of session.interrupt, available on the authenticated RPC transport.
+
+    Snapshot once; never reattach sessions to the tray's temporary transport. Each session's existing
+    interrupt helper binds its profile, cancels queued/background work and emits to its own clients.
+    A failed target must not prevent the remaining turns from being cancelled.
+    """
+    snapshot, err = _snapshot_sessions(rid)
+    if err:
+        return err
+    _tts_stream_stop()
+    results = []
+    for sid, session in snapshot:
+        if session.get("_finalized"):
+            continue
+        try:
+            active = bool(session.get("running") or session.get("queued_prompt")
+                          or session.get("queued_prompts") or session.get("_compute_host_active"))
+            _interrupt_session_turn(sid, session, request_id=f"stop-all-{rid}-{sid}")
+            with session["history_lock"]:
+                marker = str(session.pop("_active_turn_marker_key", "") or "")
+            with _session_profile_runtime_scope(session, hydrate_secrets=False):
+                _retire_turn_marker(session, marker)
+            results.append({"session_id": sid, "ok": True, "status": "interrupted" if active else "idle"})
+        except Exception as exc:
+            logger.warning("Stop All failed for hosted session %s", sid, exc_info=True)
+            results.append({"session_id": sid, "ok": False, "status": "failed", "error": str(exc)})
+    return _ok(rid, {"sessions": results})
+
+
 @method("session.interrupt")
 def _(rid, params: dict) -> dict:
     _tts_stream_stop()  # keypress barge-in also silences streaming TTS (voice is process-global)

@@ -91,6 +91,30 @@ def _kanban_stop_nudge(agent, messages) -> Optional[str]:
         return None
 
 
+def _pre_finish_nudge(agent, final_response, messages) -> Optional[str]:
+    """Let task plugins reject a premature stop, at most twice per user turn."""
+    attempt = getattr(agent, "_pre_finish_nudges", 0)
+    if attempt >= 2 or getattr(agent, "_persist_disabled", False):
+        return None
+    try:
+        from hermes_cli.lifecycle import has_hook, invoke_hook
+        if not has_hook("pre_finish"):
+            return None
+        for result in invoke_hook(
+            "pre_finish", session_id=getattr(agent, "session_id", "") or "",
+            model=getattr(agent, "model", ""), attempt=attempt,
+            final_response=final_response, conversation_history=list(messages),
+            available_tools=sorted(getattr(agent, "valid_tool_names", set()) or []),
+        ):
+            if isinstance(result, dict) and result.get("action") == "continue":
+                message = result.get("message")
+                if isinstance(message, str) and message.strip():
+                    return message.strip()[:4000]
+    except Exception:
+        logger.warning("pre_finish hook check failed", exc_info=True)
+    return None
+
+
 def _append_interim_answer(agent, final_msg, messages, conversation_history, flush_fail_msg: str) -> None:
     """Real content: persist and emit as interim so the user sees the attempted answer;
     only the nudge is flagged synthetic (#65919)."""
@@ -128,6 +152,15 @@ def apply_stop_gates(
                 final_response or ""
             ),
         )
+
+    _finish_nudge = _pre_finish_nudge(agent, final_response, messages)
+    if _finish_nudge:
+        agent._pre_finish_nudges = getattr(agent, "_pre_finish_nudges", 0) + 1
+        final_msg["finish_reason"] = "plugin_completion_required"
+        _append_interim_answer(
+            agent, final_msg, messages, conversation_history, "pre_finish interim flush failed"
+        )
+        return _continue(_finish_nudge, "_pre_finish_synthetic")
 
     _verify_nudge = _verify_on_stop_nudge(agent)
     if _verify_nudge:

@@ -3452,6 +3452,15 @@ export interface SessionInterruptResult {
   turn_isolation?: boolean | null
 }
 export type InterruptStatus = 'interrupted' | 'not_interrupted'
+export interface SessionInterruptAllResult {
+  sessions: InterruptAllItem[]
+}
+export interface InterruptAllItem {
+  session_id: string
+  ok: boolean
+  status: string
+  error?: string | null
+}
 export interface SessionCorrectionParams {
   session_id: string
   profile?: string | null
@@ -5273,6 +5282,8 @@ export interface RpcMethods {
   'session.history': { params: SessionHistoryParams; result: SessionHistoryResult }
   /** Stop the running turn (and streaming TTS); retires the crash-recovery marker. */
   'session.interrupt': { params: SessionInterruptParams; result: SessionInterruptResult }
+  /** Authenticated backend-wide Stop All: cancel hosted work without closing sessions or services. */
+  'session.interrupt_all': { params: Params; result: SessionInterruptAllResult }
   /** Human-facing stored sessions, most recent first (sub-agent / kanban sources denied). */
   'session.list': { params: SessionListParams; result: SessionListResult }
   /** Most recent human-facing session; errors fold into a null session_id. */
@@ -5591,6 +5602,7 @@ export const RPC_METHODS = [
   'session.foreign.preview',
   'session.history',
   'session.interrupt',
+  'session.interrupt_all',
   'session.list',
   'session.most_recent',
   'session.redirect',
