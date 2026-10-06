@@ -19,7 +19,7 @@ hermes_cli.plugins.PluginManager underneath, so this test's approach
 
 from pathlib import Path
 
-import yaml
+import hermes_yaml as yaml  # Hermes runtime owns the YAML parser (ruamel); PyYAML is not shipped
 
 from agent.turn_finalizer import finalize_turn
 

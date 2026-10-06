@@ -7,6 +7,11 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 
+
+def _missing(module):
+    import importlib.util
+    return importlib.util.find_spec(module) is None
+
 from tools.smart_turn import SMART_TURN_SAMPLE_RATE, _truncate_or_pad_to_window
 
 
@@ -36,6 +41,7 @@ class TestTruncateOrPadToWindow:
         assert np.array_equal(windowed, audio)
 
 
+@pytest.mark.skipif(_missing("transformers"), reason="optional dependency 'transformers' is not installed in this environment")
 class TestTurnCompleteProbability:
     def test_applies_sigmoid_to_raw_logit_output(self):
         """The actual onnx-community/smart-turn-v3-ONNX int8 file returns a raw
@@ -89,6 +95,7 @@ class TestTurnCompleteProbability:
         assert "input_features" in call_args[0][1]
 
 
+@pytest.mark.skipif(_missing("huggingface_hub"), reason="optional dependency 'huggingface_hub' is not installed in this environment")
 class TestLoadSmartTurnModel:
     def test_builds_session_with_recommended_cpu_options(self):
         from tools.smart_turn import load_smart_turn_model

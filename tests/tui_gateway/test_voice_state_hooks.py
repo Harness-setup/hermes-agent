@@ -8,7 +8,7 @@ visual indicator.
 """
 from pathlib import Path
 
-import yaml
+import hermes_yaml as yaml  # Hermes runtime owns the YAML parser (ruamel); PyYAML is not shipped
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from tui_gateway import server

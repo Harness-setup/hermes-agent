@@ -8,6 +8,11 @@ today's RMS-only behavior, never to a more "deaf" state.
 import numpy as np
 import pytest
 
+
+def _missing(module):
+    import importlib.util
+    return importlib.util.find_spec(module) is None
+
 from tools.vad_lite import VAD_SAMPLE_RATE, load_vad_model, resample_for_vad, speech_probability
 
 
@@ -92,6 +97,7 @@ def test_windowing_falls_back_to_512_when_model_has_no_window_size_attr():
     assert speech_probability(model, chunk) == 0.5
 
 
+@pytest.mark.skipif(_missing("silero_vad_lite"), reason="optional dependency 'silero_vad_lite' is not installed in this environment")
 class TestLoadVadModel:
     def test_rejects_device_native_rate_instead_of_segfaulting(self):
         """silero-vad-lite's native constructor does not raise on an
