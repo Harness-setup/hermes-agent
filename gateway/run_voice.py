@@ -147,7 +147,7 @@ class GatewayVoiceMixin:
 
     async def _join_voice_channel_core(
         self, adapter, voice_channel, *, text_channel_id: int, voice_profile: Optional[str],
-        source_dict: Optional[dict] = None,
+        source_dict: Optional[dict] = None, guild_id: Optional[int] = None,
     ) -> Optional[str]:
         """Shared join+wiring logic behind both /voice join and voice-channel auto-join
         (discord.auto_join_voice). Returns an error message on failure, None on success.
@@ -181,6 +181,17 @@ class GatewayVoiceMixin:
         if not success:
             adapter._voice_input_callback = None
             return t("gateway.voice.channel_join_permissions")
+        # The adapter's join already binds the text channel; this keeps the binding (and dropping speech buffered for the
+        # old channel on a move) correct for adapters whose join does not -- upstream's /voice join did it here.
+        if guild_id is None:
+            guild_id = getattr(getattr(voice_channel, "guild", None), "id", None)
+        if guild_id:
+            previous = adapter._voice_text_channels.get(guild_id)
+            if previous is not None and previous != text_channel_id and hasattr(adapter, "discard_pending_voice_input"):
+                adapter.discard_pending_voice_input(guild_id)
+            adapter._voice_text_channels[guild_id] = text_channel_id
+            if source_dict is not None and hasattr(adapter, "_voice_sources"):
+                adapter._voice_sources[guild_id] = source_dict
         self._apply_voice_mode(
             adapter, self._voice_key(Platform.DISCORD, str(text_channel_id), profile=voice_profile),
             str(text_channel_id), "all",
@@ -200,7 +211,7 @@ class GatewayVoiceMixin:
         error = await self._join_voice_channel_core(
             adapter, voice_channel, text_channel_id=int(event.source.chat_id),
             voice_profile=self._adapter_profile_for_source(event.source),
-            source_dict=event.source.to_dict(),
+            source_dict=event.source.to_dict(), guild_id=guild_id,
         )
         if error:
             return error
