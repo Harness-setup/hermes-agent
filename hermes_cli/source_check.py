@@ -386,6 +386,13 @@ def _check_branch(result: dict, co: _Checkout, selected_branch: str, *,
                   else "is gone from the remote but has commits that are not in main")
         result.update(error="branch-local-only", localOnly=True,
                       message=f"Branch '{selected_branch}' {detail}; keeping it instead of switching to main.")
+        # Carried fix (local-fixes): the branch is kept, but "local-only" must not mean "no update information" --
+        # the panel showed nothing for a checkout hundreds of commits behind. Count against upstream's main.
+        main_tip, _, _ = _branch_tip(co.repository, "main", co.root, co.git, "origin")
+        if main_tip is not None:
+            behind, commits = _behind_count(co, main_tip)
+            result.update(targetSha=main_tip, behind=behind, commits=commits, updateAvailable=behind != 0,
+                          compareBranch="main")
         return
     if missing and selected_branch != "main":
         result["branch"] = "main"

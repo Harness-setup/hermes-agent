@@ -374,12 +374,37 @@ def test_never_pushed_branch_keeps_its_pin(installation, pinned_by):
     assert status["error"] == "branch-local-only"
     assert status["localOnly"] is True
     assert "never been pushed" in status["message"]
-    assert "targetSha" not in status
+    assert status["compareBranch"] == "main"      # carried fix: the pin is kept, but the count still comes from main
     if pinned_by == "desktop":
         assert json.loads(branch_file.read_text()) == {"branch": "local-work"}
     else:
         assert not branch_file.exists()
     assert requests == [MAIN_CHANNEL]
+
+
+def test_local_only_branch_still_counts_how_far_behind_upstream_main_it_is(installation):
+    """Carried fix (local-fixes): a parked branch upstream never published still gets an update count.
+
+    Upstream reports such a branch as local-only and stops, so the Desktop update panel showed nothing at all
+    for a checkout that was hundreds of commits behind. The branch is still kept (flag and message stay), but the
+    count is taken against upstream's main."""
+    from hermes_cli.source_check import check_for_updates
+    root, linked, home, base, head, responses, requests, git = installation
+    _bare_origin(installation)
+    git("branch", "local-work")
+    _commit_on(git, "local-work", "unpushed work")
+    for n in range(3):
+        git("commit", "-q", "--allow-empty", "-m", f"upstream moved {n}")
+    git("push", "-q", "origin", "main")
+    git("fetch", "-q", "origin")
+    git("checkout", "-q", "local-work")
+    status = check_for_updates(install_root=root, home=home, branch_config_path=home / "desktop-update.json")
+    assert status["branch"] == "local-work", status
+    assert status["error"] == "branch-local-only" and status["localOnly"] is True     # still kept, still explained
+    assert status["behind"] == 3, status
+    assert status["updateAvailable"] is True
+    assert status["compareBranch"] == "main"
+    assert status["targetSha"] == git("rev-parse", "origin/main")
 
 
 @pytest.mark.parametrize("merge", ["fast-forward", "rebase", "unmerged"])
