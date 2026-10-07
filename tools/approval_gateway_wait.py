@@ -24,10 +24,13 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason", "acknowledged", "settle", "cancelled")
+    __slots__ = ("event", "data", "result", "reason", "acknowledged", "settle", "cancelled", "human")
 
     def __init__(self, data: dict):
-        self.event = threading.Event()
+        from tools.human_input_hooks import HumanInputEvent
+        self.human = None
+        self.event = HumanInputEvent(lambda: (self.human,) if self.human else (),
+                                     lambda: self.result or "cancelled")
         self.data = dict(data)
         self.data.setdefault("request_id", uuid.uuid4().hex)
         self.acknowledged = False
@@ -198,7 +201,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         return choice
 
     from tools.human_input_hooks import human_input_request
-    with human_input_request("approval", prompt=payload["command"], session_key=session_key) as human:
+    with human_input_request("approval", prompt=payload["command"], session_key=session_key, request_id=entry.data["request_id"]) as human:
+        entry.human = human
+        if entry.event.is_set():
+            human.resolve(entry.result or "cancelled")
         # Plugins hear about the request before the gateway does (real-time observers).
         _ctx._fire_approval_hook("pre_approval_request", **payload)
         # Bridges sync agent thread → async gateway.
@@ -229,3 +235,14 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         extra = {"cancelled": cancelled} if cancelled else {}
         human.outcome = _hook_choice(resolved, choice, extra)
         return _finish(payload, resolved, choice, entry.reason, **extra)
+
+
+def acknowledge_approval_display(session_key: str, request_id: str) -> bool:
+    from tools import approval
+    with approval._lock:
+        entry = next((e for e in approval._gateway_queues.get(session_key, ())
+                      if e.data["request_id"] == request_id), None)
+        if entry is None or entry.event.is_set() or entry.human is None:
+            return False
+        entry.human.shown()
+        return True

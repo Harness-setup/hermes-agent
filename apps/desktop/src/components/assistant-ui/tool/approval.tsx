@@ -23,6 +23,7 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { ChevronDown, Loader2 } from '@/lib/icons'
 import { releaseApprovalKey } from '@/lib/keybinds/approval-keys'
+import { useApprovalInputShown } from '@/lib/use-input-shown'
 import { cn } from '@/lib/utils'
 import { $gateway } from '@/store/gateway'
 import { reconnectAction } from '@/store/gateway-reconnect'
@@ -245,6 +246,7 @@ const ApprovalCard: FC<ApprovalCardProps> = ({ request, total, position, stack }
   // it goes through a confirm step rather than firing straight from the menu.
   const [confirmAlways, setConfirmAlways] = useState(false)
 
+  useApprovalInputShown(request, stack.active)
   const present = stack.active
   const busy = submitting !== null || !present || stack.busy
   // Answering with the pointer moves focus onto the card, and the card then

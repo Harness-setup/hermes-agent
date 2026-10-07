@@ -26,6 +26,7 @@ class _ClarifyEntry:
     multi_select: bool = False
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
+    humans: tuple = ()
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
 
 
@@ -52,6 +53,11 @@ def register(clarify_id: str, session_key: str, question: str, choices: Optional
     Open-ended (no choices) entries start in text mode: the next message IS the response."""
     entry = _ClarifyEntry(clarify_id, session_key, question, list(choices) if choices else None,
                           bool(multi_select) and bool(choices), awaiting_text=not bool(choices))
+    from tools.human_input_hooks import current_requests, HumanInputEvent
+    entry.humans = current_requests()
+    entry.event = HumanInputEvent(lambda: entry.humans,
+                                 lambda: "cancelled" if entry.response == CANCELLED else
+                                 "skipped" if entry.response == SKIPPED else "answered")
     with _lock:
         _entries[clarify_id] = entry
         _session_index.setdefault(session_key, []).append(clarify_id)

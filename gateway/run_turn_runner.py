@@ -1397,30 +1397,8 @@ class TurnRunner:
             return False
 
     def _clarify_callback_sync(self, questions) -> dict:
-        """Answer the clarify tool's questions (clarify_tool's synchronous contract): one card per
-        question, stop at the first the user never answers. The stream/typing re-arm waits for the
-        last question — between two cards it only opens a bubble the next boundary closes."""
-        from gateway.run_turn_runner_clarify_delivery import UNDELIVERED, UNDELIVERED_DECLINED, UNDELIVERED_NO_SURFACE
-        from tools.clarify_gateway import CANCELLED, SKIPPED
-        answers: Dict[str, Any] = {}
-        reply: Dict[str, Any] = {"answers": answers, "outcome": "submitted"}
-        last = len(questions) - 1
-        for index, entry in enumerate(questions):
-            question = f"{entry['question']}\n{t('gateway.clarify.skip_hint')}"
-            raw, answered = self._ask_clarify_question(
-                question, entry["choices"], bool(entry["multi_select"]), rearm=index == last)
-            if raw == CANCELLED:
-                reply["outcome"] = "cancelled"
-                break
-            if not answered:
-                # The surface's own no-answer text ("could not be delivered", "did not respond
-                # within Nm") rides along as ``notice``: blank answers alone read as user
-                # inactivity, which is the misreport #112684 describes for an undelivered card.
-                undelivered = raw in (UNDELIVERED, UNDELIVERED_DECLINED, UNDELIVERED_NO_SURFACE)
-                reply.update(outcome="undelivered" if undelivered else "timed_out", notice=raw)
-                break
-            answers[entry["qid"]] = None if raw == SKIPPED else raw
-        return reply
+        from gateway.run_turn_runner_clarify_delivery import clarify_callback_sync
+        return clarify_callback_sync(self, questions)
 
     def _ask_clarify_question(self, question, choices, multi_select, rearm: bool = True) -> tuple[str, bool]:
         """One card: register, send, wait, then retire it (no answer) or re-arm (answer).
@@ -1532,6 +1510,8 @@ class TurnRunner:
                 )
                 if fut is None:
                     raise RuntimeError("send_exec_approval: loop unavailable")
+                from tools.human_input_hooks import watch_delivery
+                watch_delivery(fut)
                 outcome = _approval_send_outcome(fut, timeout=15)
                 if outcome == "sent":
                     # Without this, a card whose timer runs out keeps live buttons and nobody
@@ -1594,6 +1574,8 @@ class TurnRunner:
                 adapter.send(ctx._status_chat_id, msg, metadata=_interim_metadata(metadata)), "Approval text-send scheduling error",
             )
             if fut is not None:
+                from tools.human_input_hooks import watch_delivery
+                watch_delivery(fut)
                 fut.result(timeout=15)
                 # No card to edit on the text path: the prompt has no buttons to drop and carries
                 # the /approve instructions, so the timeout notice is posted as a new message.

@@ -131,8 +131,13 @@ def _detach_transport_from_sessions(transport) -> list[tuple[str, dict]]:
                     or isinstance(existing, FanoutTransport) and existing.contains(transport)
                     or transport in (session.get("viewers") or {})):
                 attached.append((sid, session))
-    return [(sid, session) for sid, session in attached
-            if not _detach_session_transport(session, transport)]
+    clientless = [(sid, session) for sid, session in attached
+                  if not _detach_session_transport(session, transport)]
+    from tui_gateway import server_requests
+    for sid, session in clientless:
+        server_requests.cancel(sid, reason="session_closed", displayed_only=True)
+        _cancel_compute_host_displayed(sid, session)
+    return clientless
 
 
 def register(server) -> None:

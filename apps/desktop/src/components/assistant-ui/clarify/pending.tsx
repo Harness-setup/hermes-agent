@@ -8,6 +8,7 @@ import { Loader } from '@/components/ui/loader'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { Loader2, MessageQuestion } from '@/lib/icons'
+import { useInputShown } from '@/lib/use-input-shown'
 import { bareChoice, type ClarifyQuestion, type ClarifyRequest, clearClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { reconnectAction } from '@/store/gateway-reconnect'
@@ -48,6 +49,7 @@ export function ClarifyToolPending({
   // fallback for display, never answerable (no ids to respond with).
   const liveQuestions = request?.questions ?? []
   const ready = Boolean(request?.requestId) && liveQuestions.length > 0
+  useInputShown(request?.sessionId, ready && !undelivered ? request?.requestId : undefined)
 
   // Preview items from the tool args: same question text/choices, synthetic
   // qids, shown disabled until the live request lands (or indefinitely when

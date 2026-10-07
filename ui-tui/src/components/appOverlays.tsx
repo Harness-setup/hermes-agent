@@ -1,10 +1,11 @@
 import { Box, stringWidth, Text } from '@hermes/ink'
 import { useStore } from '@nanostores/react'
-import type { ReactNode } from 'react'
+import { type ReactNode, useEffect } from 'react'
 
 import { useGateway } from '../app/gatewayContext.js'
 import type { AppOverlaysProps } from '../app/interfaces.js'
 import { $overlayState, hasFloatingPanel, patchOverlayState } from '../app/overlayStore.js'
+import { displayServerRequest } from '../app/serverRequestStore.js'
 import { $uiSessionId, $uiTheme } from '../app/uiStore.js'
 
 import { ActiveSessionSwitcher } from './activeSessionSwitcher.js'
@@ -31,7 +32,12 @@ const COMPLETION_WINDOW = 16
  * grid makes the prompt zone a layout-engine surface like the desktop app's
  * pane shell.
  */
-function PromptCell({ children, cols, id }: { children: ReactNode; cols: number; id: string }) {
+function PromptCell({ children, cols, id, requestId }: { children: ReactNode; cols: number; id: string; requestId?: string }) {
+  const { rpc } = useGateway()
+  useEffect(() => {
+    if (requestId) {displayServerRequest(requestId, rpc)}
+  }, [requestId, rpc])
+
   return (
     <Box flexDirection="column" flexShrink={0}>
       <WidgetGrid
@@ -83,7 +89,7 @@ export function PromptZone({
 
   if (overlay.approval) {
     return (
-      <PromptCell cols={cols} id="approval">
+      <PromptCell cols={cols} id="approval" requestId={overlay.approval?.requestId}>
         <ApprovalPrompt cols={cols} onChoice={onApprovalChoice} req={overlay.approval} t={theme} />
       </PromptCell>
     )
@@ -148,7 +154,7 @@ export function PromptZone({
 
   if (overlay.clarify) {
     return (
-      <PromptCell cols={cols} id="clarify">
+      <PromptCell cols={cols} id="clarify" requestId={overlay.clarify?.requestId}>
         <ClarifyPrompt
           cols={cols}
           onCancel={onClarifyCancel}
@@ -162,7 +168,7 @@ export function PromptZone({
 
   if (overlay.sudo) {
     return (
-      <PromptCell cols={cols} id="sudo">
+      <PromptCell cols={cols} id="sudo" requestId={overlay.sudo?.requestId}>
         <SudoPrompt cols={cols} onSubmit={onSudoSubmit} t={theme} />
       </PromptCell>
     )
@@ -170,7 +176,7 @@ export function PromptZone({
 
   if (overlay.secret) {
     return (
-      <PromptCell cols={cols} id="secret">
+      <PromptCell cols={cols} id="secret" requestId={overlay.secret?.requestId}>
         <SecretPrompt
           cols={cols}
           envVar={overlay.secret.envVar}
@@ -184,7 +190,7 @@ export function PromptZone({
 
   if (overlay.vaultUnlock) {
     return (
-      <PromptCell cols={cols} id="vault-unlock">
+      <PromptCell cols={cols} id="vault-unlock" requestId={overlay.vaultUnlock?.requestId}>
         <VaultUnlockPrompt
           cols={cols}
           displayName={overlay.vaultUnlock.displayName}
@@ -197,7 +203,7 @@ export function PromptZone({
 
   if (overlay.vaultSaveLogin) {
     return (
-      <PromptCell cols={cols} id="vault-save-login">
+      <PromptCell cols={cols} id="vault-save-login" requestId={overlay.vaultSaveLogin?.requestId}>
         <VaultSaveLoginPrompt
           cols={cols}
           onReady={onVaultSaveLoginSubmit}
@@ -210,7 +216,7 @@ export function PromptZone({
 
   if (overlay.vaultCode) {
     return (
-      <PromptCell cols={cols} id="vault-code">
+      <PromptCell cols={cols} id="vault-code" requestId={overlay.vaultCode?.requestId}>
         <VaultCodePrompt
           cols={cols}
           hint={overlay.vaultCode.hint}

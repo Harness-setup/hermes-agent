@@ -117,14 +117,16 @@ def clarify_tool(questions, callback: Optional[Callable] = None) -> str:
     if callback is None:
         return tool_error(_UNAVAILABLE)
     from tools.human_input_hooks import human_input_request
-    # Observers see the questions only; the answers stay in the tool result.
-    with human_input_request("clarify", prompt="\n".join(q["question"] for q in normalized)) as human:
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        humans = [stack.enter_context(human_input_request("clarify", prompt=q["question"], question_id=q["qid"]))
+                  for q in normalized]
         try:
             reply = callback(normalized)
-            human.outcome = str(reply.get("outcome") or "")
+            for human in humans:
+                human.outcome = str(reply.get("outcome") or "")
             return _result(normalized, reply)
         except Exception as exc:
-            human.outcome = "error"
             return tool_error(f"Failed to get user input: {exc}")
 
 
@@ -137,7 +139,8 @@ CLARIFY_SCHEMA = {
     "name": "clarify",
     "description": (
         "Ask the user one or more questions when you need a decision, "
-        "clarification, or feedback before proceeding. Pass every question "
+        "clarification, or feedback before proceeding. Always use this tool when "
+        "an answer is required to continue; a question in ordinary chat does not create a tracked prompt. Pass every question "
         f"in `questions` (1-{MAX_QUESTIONS} entries) — a single question is a "
         "one-entry array, and several INDEPENDENT questions belong in ONE "
         "call (one form beats a chain of clarify calls; if one answer would "

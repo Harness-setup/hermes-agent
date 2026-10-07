@@ -2941,6 +2941,24 @@
       }
     },
     {
+      "name": "request.shown",
+      "summary": "Confirm a rendered human prompt in the authenticated owning session.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/RequestShownParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/RequestShownResult"
+        }
+      }
+    },
+    {
       "name": "rollback.diff",
       "summary": "Diff between a checkpoint and the working tree, with an ANSI rendering sized to the TUI.",
       "params": [
@@ -27293,6 +27311,51 @@
           "reason"
         ],
         "title": "RequestCancelPayload",
+        "type": "object"
+      },
+      "RequestShownParams": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "request_id"
+        ],
+        "title": "RequestShownParams",
+        "type": "object"
+      },
+      "RequestShownResult": {
+        "additionalProperties": false,
+        "properties": {
+          "acknowledged": {
+            "title": "Acknowledged",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "acknowledged"
+        ],
+        "title": "RequestShownResult",
         "type": "object"
       },
       "ResumePhaseStatus": {

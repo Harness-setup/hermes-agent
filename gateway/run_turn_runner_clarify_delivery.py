@@ -90,6 +90,8 @@ def _clarify_send_then_wait(fut, *, clarify_id: str, session_key: str, clarify_m
     callers must not infer it from the text (a real answer may start with '[' like a sentinel)."""
     from gateway.run import _approval_send_outcome
 
+    from tools.human_input_hooks import watch_delivery
+    watch_delivery(fut)
     outcome = _approval_send_outcome(fut, timeout=SEND_ACK_WINDOW)
     if outcome == "failed" and fallback is not None:
         # The text prompt is the last resort: a late failure of ITS send has nothing to retry.
@@ -97,6 +99,7 @@ def _clarify_send_then_wait(fut, *, clarify_id: str, session_key: str, clarify_m
         # ``None`` = the fallback could not even be scheduled; the card failure already stands,
         # so re-classifying would only log a misleading "no scheduling future".
         if fut is not None:
+            watch_delivery(fut)
             outcome = _approval_send_outcome(fut, timeout=SEND_ACK_WINDOW)
         if outcome == "sent":
             logger.info("Clarify card undeliverable; plain-text prompt sent instead (id=%s)", clarify_id)
@@ -132,6 +135,8 @@ class _LateFailureWatch:
         self._clarify_id = clarify_id
         self._session_key = session_key
         self._clarify_mod = clarify_mod
+        from tools.human_input_hooks import current_requests
+        self._humans = current_requests()
         self._fallback = fallback
         # Test doubles hand the runner a bare ``.result()`` object; only a real pending
         # concurrent future can still resolve late.
@@ -175,6 +180,8 @@ class _LateFailureWatch:
         if not self._armed:
             return
         if self._outcome(fut) == "sent":
+            for human in self._humans:
+                human.shown()
             logger.info("Clarify card undeliverable; plain-text prompt sent instead (id=%s)", self._clarify_id)
             return
         self._release()
@@ -182,3 +189,34 @@ class _LateFailureWatch:
     def _release(self, notice: str = UNDELIVERED) -> None:
         self.undeliverable = notice
         self._clarify_mod.clear_session(self._session_key)
+
+
+def clarify_callback_sync(runner, questions) -> dict:
+    """Answer the clarify tool's questions (clarify_tool's synchronous contract): one card per
+    question, stop at the first the user never answers. The stream/typing re-arm waits for the
+    last question — between two cards it only opens a bubble the next boundary closes."""
+    from agent.i18n import t
+    from tools.clarify_gateway import CANCELLED, SKIPPED
+    answers: dict[str, Any] = {}
+    reply: dict[str, Any] = {"answers": answers, "outcome": "submitted"}
+    last = len(questions) - 1
+    for index, entry in enumerate(questions):
+        question = f"{entry['question']}\n{t('gateway.clarify.skip_hint')}"
+        from tools.human_input_hooks import question_scope
+        with question_scope(entry["qid"]) as handles:
+            raw, answered = runner._ask_clarify_question(
+                question, entry["choices"], bool(entry["multi_select"]), rearm=index == last)
+        for handle in handles:
+            handle.resolve("answered" if answered else "cancelled" if raw == CANCELLED else "unanswered")
+        if raw == CANCELLED:
+            reply["outcome"] = "cancelled"
+            break
+        if not answered:
+            # The surface's own no-answer text ("could not be delivered", "did not respond
+            # within Nm") rides along as ``notice``: blank answers alone read as user
+            # inactivity, which is the misreport #112684 describes for an undelivered card.
+            undelivered = raw in (UNDELIVERED, UNDELIVERED_DECLINED, UNDELIVERED_NO_SURFACE)
+            reply.update(outcome="undelivered" if undelivered else "timed_out", notice=raw)
+            break
+        answers[entry["qid"]] = None if raw == SKIPPED else raw
+    return reply

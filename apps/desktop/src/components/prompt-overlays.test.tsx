@@ -15,6 +15,9 @@ import { $activeSessionId } from '@/store/session'
 
 import { PromptOverlays } from './prompt-overlays'
 
+// Display acknowledgment is covered by use-input-shown.test.tsx; these tests isolate answer dispatch.
+vi.mock('@/lib/use-input-shown', () => ({ useInputShown: () => {} }))
+
 vi.mock('@/lib/haptics', () => ({ triggerHaptic: vi.fn() }))
 vi.mock('@/store/notifications', () => ({ notifyError: vi.fn() }))
 

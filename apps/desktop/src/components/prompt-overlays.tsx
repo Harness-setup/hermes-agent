@@ -1,3 +1,4 @@
+import { useInputShown } from '@/lib/use-input-shown'
 'use client'
 
 import { useStore } from '@nanostores/react'
@@ -62,6 +63,7 @@ function SudoDialog({ sessionId }: { sessionId: string | null }) {
     setPassword('')
     setSubmitting(false)
   }, [request?.requestId])
+  useInputShown(request?.sessionId, request?.requestId)
 
   const send = useCallback(
     async (value: string) => {
@@ -179,6 +181,7 @@ function SecretDialog({ sessionId }: { sessionId: string | null }) {
     setValue('')
     setSubmitting(false)
   }, [request?.requestId])
+  useInputShown(request?.sessionId, request?.requestId)
 
   const send = useCallback(
     async (secret: string) => {
@@ -280,6 +283,7 @@ function VaultUnlockDialog({ sessionId }: { sessionId: string | null }) {
     setValue('')
     setSubmitting(false)
   }, [request?.requestId])
+  useInputShown(request?.sessionId, request?.requestId)
 
   const send = useCallback(
     async (password: string) => {
@@ -377,6 +381,7 @@ function VaultSaveLoginDialog({ sessionId }: { sessionId: string | null }) {
     setPassword('')
     setSubmitting(false)
   }, [request?.requestId])
+  useInputShown(request?.sessionId, request?.requestId)
 
   const send = useCallback(
     async (login: string) => {
@@ -489,6 +494,7 @@ function VaultCodeDialog({ sessionId }: { sessionId: string | null }) {
     setCode('')
     setSubmitting(false)
   }, [request?.requestId])
+  useInputShown(request?.sessionId, request?.requestId)
 
   const send = useCallback(
     async (value: string) => {

@@ -85,9 +85,15 @@ def _read_choice(prompt: str, timeout_seconds: int) -> str | None:
     """Read one answer on a daemon thread; None when the user never answered."""
     result = {"choice": ""}
 
+    from tools.human_input_hooks import current_requests
+    humans = current_requests()
+
     def get_input():
         try:
-            result["choice"] = input(prompt).strip().lower()
+            print(prompt, end="", flush=True)
+            for human in humans:
+                human.shown()
+            result["choice"] = input().strip().lower()
         except (EOFError, OSError):
             result["choice"] = ""
 

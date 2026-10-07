@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 class ServerRequest:
     __slots__ = ("id", "sid", "method", "params", "event", "result", "answered", "created_at",
-                 "qids", "locked", "on_result", "declined")
+                 "qids", "locked", "on_result", "declined", "humans")
 
     def __init__(self, sid: str, method: str, params: dict, *, qids: list[str] | None = None,
                  on_result: Callable[[dict | None], None] | None = None) -> None:
@@ -66,6 +66,11 @@ class ServerRequest:
         self.on_result = on_result
         # Client transports that answered NOT_SHOWN_CODE (no window there shows this session).
         self.declined: set = set()
+        from tools.human_input_hooks import current_requests, standalone_request
+        kinds = {"approval", "clarify", "sudo", "secret", "vault.unlock", "vault.code", "vault.save_login"}
+        self.humans = tuple(h for h in current_requests() if h.payload["kind"] == method) if method in kinds else ()
+        if method in kinds and not self.humans:
+            self.humans = (standalone_request(method, sid),)
 
     def frame(self) -> dict:
         return {"jsonrpc": "2.0", "id": self.id, "method": self.method,
@@ -80,7 +85,7 @@ class ServerRequest:
         return {"id": self.id, "method": self.method, "params": params}
 
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 _open: dict[str, ServerRequest] = {}
 
 # Frame sinks, bound by ``bind_sinks`` from server.py at import time (like the method_ctx split
@@ -143,6 +148,7 @@ def _unanswerable(method: str, sid: str) -> bool:
 
 
 def _emit_cancel(req: ServerRequest, reason: str) -> None:
+    _resolve_humans(req, reason)
     _emit("request.cancel", req.sid, {"id": req.id, "method": req.method, "reason": reason})
 
 
@@ -157,7 +163,13 @@ def _register(req: ServerRequest) -> None:
         raise ValueError(problem)  # a key the renderer's typed handler would never read: our bug
     with _lock:
         _open[req.id] = req
-    _write(req.frame())
+    try:
+        _write(req.frame())
+    except BaseException:
+        with _lock:
+            _open.pop(req.id, None)
+        _resolve_humans(req, "undelivered")
+        raise
 
 
 def send(method: str, sid: str, params: dict, *, timeout: float | None,
@@ -191,6 +203,7 @@ def send(method: str, sid: str, params: dict, *, timeout: float | None,
         timed_out = _open.pop(req.id, None) is req
         answered, result, locked = req.answered, req.result, dict(req.locked)
     if answered:
+        _resolve_humans(req, _human_outcome(req))
         return result
     if timed_out:
         _emit_cancel(req, "timeout")
@@ -244,6 +257,7 @@ def _decline(rid: str, transport: Any) -> bool:
         _open.pop(rid, None)
         req.result = {"value": json.dumps({"success": False, "error": NOT_SHOWN_MESSAGE})}
         req.answered = True
+    _resolve_humans(req, _human_outcome(req))
     if req.on_result is not None:
         req.on_result(req.result)
     req.event.set()
@@ -287,6 +301,7 @@ def resolve_response(frame: dict, transport: Any = None) -> bool:
             elif req.qids:
                 req.result = {"answers": dict(req.locked), "outcome": "cancelled"}
             req.answered = True
+    _resolve_humans(req, _human_outcome(req))
     if req.on_result is not None:
         req.on_result(req.result)
     req.event.set()
@@ -304,6 +319,9 @@ def lock_answer(request_id: str, question_id: str, answer: str | None) -> list[s
         if question_id not in req.qids:
             raise ValueError(f"unknown question_id {question_id!r}")
         req.locked[question_id] = answer
+        for human in req.humans:
+            if human.payload.get("question_id") == question_id:
+                human.resolve("skipped" if answer is None else "answered")
         remaining = [qid for qid in req.qids if qid not in req.locked]
         if not remaining:
             req.result, req.answered = {"answers": dict(req.locked), "outcome": "submitted"}, True
@@ -313,13 +331,14 @@ def lock_answer(request_id: str, question_id: str, answer: str | None) -> list[s
     return remaining
 
 
-def cancel(sid: str | None = None, reason: str = "interrupted") -> int:
+def cancel(sid: str | None = None, reason: str = "interrupted", *, displayed_only: bool = False) -> int:
     """Withdraw open requests — only *sid*'s (session.interrupt must not touch other sessions'), or
     every one when *sid* is None (shutdown). Blocked waits return None (a batch returns its locked
     answers with ``outcome: cancelled``); queue-backed requests run ``on_result(None)`` so their
     owner can settle. Returns the number withdrawn."""
     with _lock:
-        targets = [req for req in _open.values() if sid is None or req.sid == sid]
+        targets = [req for req in _open.values() if (sid is None or req.sid == sid)
+                   and (not displayed_only or any(h.shown_at is not None for h in req.humans))]
         for req in targets:
             _open.pop(req.id, None)
             if req.qids is not None:
@@ -364,3 +383,30 @@ def reset_for_tests() -> None:
     with _lock:
         _open.clear()
         _answering_clients.clear()
+
+
+def _resolve_humans(req: ServerRequest, outcome: str) -> None:
+    for human in req.humans:
+        human.resolve(outcome)
+
+
+def acknowledge_display(sid: str, request_id: str) -> bool:
+    """Caller authenticates session membership; only an open request in that session can be shown."""
+    with _lock:
+        req = _open.get(request_id)
+        if req is None or req.sid != sid:
+            return False
+        for human in req.humans:
+            human.shown()
+        return bool(req.humans)
+
+
+def _human_outcome(req: ServerRequest) -> str:
+    if not req.answered:
+        return "error"
+    result = req.result or {}
+    if req.method == "approval":
+        return str(result.get("choice") or "deny")
+    if req.method == "clarify":
+        return str(result.get("outcome") or "submitted")
+    return "provided" if result.get("value") else "skipped"

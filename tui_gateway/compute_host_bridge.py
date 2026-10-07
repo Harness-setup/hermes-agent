@@ -352,6 +352,24 @@ def _adopt_late_compute_host_compress_ack(sid: str, session: dict, ack: dict, *,
     _status_update(sid, "compacted", "✓ Context compression complete")
 
 
+def _ack_compute_host_display(sid: str, session: dict, request_id: str) -> bool:
+    if not _session_uses_compute_host(session):
+        return False
+    with _history_lock(session):
+        if not _open_request_matches(session, request_id):
+            return False
+    ack = _get_compute_host_supervisor().respond(sid, {"shown": request_id})
+    return bool(((ack.get("response") or {}).get("result") or {}).get("acknowledged"))
+
+
+def _cancel_compute_host_displayed(sid: str, session: dict) -> None:
+    if _session_uses_compute_host(session) and session.get("_compute_host_open_request"):
+        try:
+            _get_compute_host_supervisor().respond(sid, {"cancel_displayed": True})
+        except Exception:
+            logger.debug("compute-host display cancellation failed sid=%s", sid, exc_info=True)
+
+
 def register(server) -> None:
     """Publish this module's helpers + handlers onto ``server``, rebound to its globals."""
     bind_module(globals(), server, skip=("_",))

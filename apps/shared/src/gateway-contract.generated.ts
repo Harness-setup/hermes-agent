@@ -2822,6 +2822,14 @@ export interface PendingApproval {
   tool_name?: string | null
   [key: string]: unknown
 }
+export interface RequestShownParams {
+  session_id: string
+  profile?: string | null
+  request_id: string
+}
+export interface RequestShownResult {
+  acknowledged: boolean
+}
 export interface ApprovalReceivedParams {
   session_id: string
   profile?: string | null
@@ -5244,6 +5252,8 @@ export interface RpcMethods {
   'reload.mcp': { params: ReloadMcpParams; result: ReloadMcpResult }
   /** Answer an open server→client request from a client that never received the frame. */
   'request.answer': { params: RequestAnswerParams; result: RequestAnswerResult }
+  /** Confirm a rendered human prompt in the authenticated owning session. */
+  'request.shown': { params: RequestShownParams; result: RequestShownResult }
   /** Diff between a checkpoint and the working tree, with an ANSI rendering sized to the TUI. */
   'rollback.diff': { params: RollbackDiffParams; result: RollbackDiffResult }
   /** Checkpoints for the session's cwd; ``enabled: false`` when checkpointing is off. */
@@ -5588,6 +5598,7 @@ export const RPC_METHODS = [
   'reload.env',
   'reload.mcp',
   'request.answer',
+  'request.shown',
   'rollback.diff',
   'rollback.list',
   'rollback.restore',

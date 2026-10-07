@@ -71,6 +71,8 @@ afterEach(() => {
   $gateway.set(null)
 })
 
+vi.mock('@/lib/use-input-shown', () => ({ useApprovalInputShown: () => {} }))
+
 describe('PendingApprovalStack', () => {
   it('retains an empty host without consuming keyboard input', () => {
     const { container } = render(<PendingApprovalStack />)

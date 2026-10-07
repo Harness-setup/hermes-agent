@@ -675,7 +675,7 @@ def _lock_in_submit_turn(
 
 
 # Per-turn client surfaces that carry a model-bound note (session_notifications._surface_note).
-_CLIENT_SURFACES = frozenset({"hud", "voice-live"})
+_CLIENT_SURFACES = frozenset({"hud", "voice-live", "voice-chat"})
 
 
 @method("prompt.submit")
@@ -1178,6 +1178,24 @@ def _(rid, params: dict) -> dict:
     if server_requests.resolve_response(frame) or _relay_compute_host_response(frame):
         return _ok(rid, {"status": "ok"})
     return _ok(rid, {"status": "expired"})
+
+
+@method("request.shown")
+def _(rid, params: dict) -> dict:
+    sid = str(params.get("session_id") or "")
+    transport, session = _current_session_steer_authority(sid)
+    if session is None:
+        return _err(rid, 4001, "display acknowledgment requires an attached session transport")
+    from tui_gateway import server_requests
+    with _session_profile_runtime_scope(session):
+        request_id = str(params.get("request_id") or "")
+        acknowledged = server_requests.acknowledge_display(sid, request_id)
+        if not acknowledged:
+            acknowledged = _ack_compute_host_display(sid, session, request_id)
+        if not acknowledged:
+            from tools.approval_gateway_wait import acknowledge_approval_display
+            acknowledged = acknowledge_approval_display(str(session.get("session_key") or ""), request_id)
+    return _ok(rid, {"acknowledged": acknowledged})
 
 
 @method("approval.pending")

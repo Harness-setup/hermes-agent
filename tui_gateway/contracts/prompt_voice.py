@@ -21,6 +21,7 @@ class ClientSurface(WireEnum):
 
     hud = "hud"
     voice_live = "voice-live"
+    voice_chat = "voice-chat"
 
 
 class PromptSubmitParams(SessionParams):
@@ -299,6 +300,18 @@ class ApprovalPendingResult(Result):
 
 method("approval.pending", params=ApprovalPendingParams, result=ApprovalPendingResult,
        doc="Replay the approvals still waiting on this session (reconnect / polling).")
+
+
+class RequestShownParams(SessionParams):
+    request_id: str
+
+
+class RequestShownResult(Result):
+    acknowledged: bool
+
+
+method("request.shown", params=RequestShownParams, result=RequestShownResult,
+       doc="Confirm a rendered human prompt in the authenticated owning session.")
 
 
 class ApprovalReceivedParams(SessionParams):

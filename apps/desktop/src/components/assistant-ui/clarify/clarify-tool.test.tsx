@@ -27,6 +27,9 @@ const gatewayMocks = vi.hoisted(() => ({
   requestGatewayForAgent: vi.fn(async () => ({ ok: true }))
 }))
 
+// Display acknowledgment is covered by use-input-shown.test.tsx; these tests isolate answer dispatch.
+vi.mock('@/lib/use-input-shown', () => ({ useInputShown: () => {} }))
+
 vi.mock('@/store/gateway', async importActual => ({
   ...(await importActual<Record<string, unknown>>()),
   requestGatewayForAgent: gatewayMocks.requestGatewayForAgent

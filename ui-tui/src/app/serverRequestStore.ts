@@ -36,3 +36,14 @@ export function hasOpenServerRequest(id: string): boolean {
 export function resetServerRequestsForTests(): void {
   open.clear()
 }
+
+export function displayServerRequest(
+  id: string,
+  rpc: (method: string, params: Record<string, unknown>) => Promise<unknown>
+): void {
+  const request = open.get(id)
+  const sessionId = request?.params.session_id
+
+  if (typeof sessionId !== 'string' || !sessionId) {return}
+  void rpc('request.shown', { session_id: sessionId, request_id: id }).catch(() => {})
+}

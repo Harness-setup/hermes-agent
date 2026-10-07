@@ -212,7 +212,13 @@ class ComputeHost:
                 self._reply("respond.error", sid, request_id, message=error)
                 return
             from tui_gateway import server_requests
-            if isinstance(params.get("lock"), dict):
+            if params.get("cancel_displayed") is True:
+                cancelled = server_requests.cancel(sid, reason="session_closed", displayed_only=True)
+                response = {"jsonrpc": "2.0", "id": request_id, "result": {"cancelled": cancelled}}
+            elif isinstance(params.get("shown"), str):
+                acknowledged = server_requests.acknowledge_display(sid, params["shown"])
+                response = {"jsonrpc": "2.0", "id": request_id, "result": {"acknowledged": acknowledged}}
+            elif isinstance(params.get("lock"), dict):
                 response = server._methods["clarify.lock"](request_id, params["lock"])
             else:
                 response_frame = params.get("frame") if isinstance(params.get("frame"), dict) else params

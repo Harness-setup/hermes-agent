@@ -16,6 +16,7 @@ import webbrowser
 
 from agent.i18n import t
 from hermes_cli.callbacks import prompt_for_secret
+from tools.human_input_hooks import observe_input
 from typing import Optional
 
 _TIMED_OUT = object()  # sentinel returned by _poll_modal_queue when the deadline passes
@@ -952,6 +953,9 @@ class CLIModalMixin:
         restore the cursor / prefill an "Other" edit. All answered → resolve the queue, tear down."""
         entry = state["questions"][state["active"]]
         state["answers"][entry["qid"]] = answer
+        for human in state.get("human_inputs", ()):
+            if human.payload.get("question_id") == entry["qid"]:
+                human.resolve("skipped" if answer is None else "answered")
         state.setdefault("answer_meta", {})[entry["qid"]] = meta or {"kind": "choice"}
         self._persist_prompt_summary("?", t("cli.clarify.label"), entry["question"], "" if answer is None else str(answer))
         total = len(state["questions"])
@@ -996,6 +1000,22 @@ class CLIModalMixin:
         self._clarify_freetext = True
         self._clarify_prefill = meta.get("other_text") or "" if meta.get("kind") == "other" else ""
 
+    def _observe_modal_display(self, state) -> None:
+        from tools.human_input_hooks import current_requests
+        humans = current_requests()
+        state["human_inputs"] = humans
+        app = getattr(self, "_app", None)
+        if not app or not humans or not hasattr(app, "after_render"):
+            return
+        def displayed(sender):
+            app.after_render -= displayed
+            if any(state is candidate for candidate in (getattr(self, "_approval_state", None),
+                   getattr(self, "_clarify_state", None), getattr(self, "_sudo_state", None),
+                   getattr(self, "_secret_state", None))):
+                for human in humans:
+                    human.shown()
+        app.after_render += displayed
+
     def _clarify_callback(self, questions):
         """Clarify-tool platform callback (agent thread, #18450): the batch panel (A-compact) shows
         all questions, one active, and blocks until the key bindings lock every answer. Returns
@@ -1019,6 +1039,7 @@ class CLIModalMixin:
             "multi_select": False,
             "selected_indices": None}
         self._clarify_state = state
+        self._observe_modal_display(state)
         self._clarify_batch_set_active(state, 0)
         self._clarify_deadline = None if timeout <= 0 else _time.monotonic() + timeout
         self._ring_bell(prompt=True, context=t("cli.clarify.bell_context"))
@@ -1042,6 +1063,7 @@ class CLIModalMixin:
         response_queue = queue.Queue()
         self._capture_modal_input_snapshot()
         self._sudo_state = {"response_queue": response_queue}
+        self._observe_modal_display(self._sudo_state)
         self._sudo_deadline = _time.monotonic() + 45
         self._ring_bell(prompt=True, context=t("cli.secret.bell_sudo"))
         self._paint_now()
@@ -1085,6 +1107,7 @@ class CLIModalMixin:
                     smart_denied=smart_denied),
                 "selected": 0,
                 "response_queue": response_queue}
+            self._observe_modal_display(self._approval_state)
             self._approval_deadline = _time.monotonic() + timeout
             self._ring_bell(prompt=True, context=t("cli.approval.bell_context"), detail=command)
             self._paint_now()
@@ -1140,6 +1163,7 @@ class CLIModalMixin:
         self._approval_state = None
         self._invalidate()
 
+    @observe_input("vault.unlock")
     def _vault_unlock_callback(self, backend_name: str, display_name: str) -> str:
         """Masked master-password prompt for an external password manager (agent thread).
         Reuses the sudo panel state so rendering, Enter/ESC handling and interrupt cleanup are shared."""
@@ -1148,6 +1172,7 @@ class CLIModalMixin:
         response_queue = queue.Queue()
         self._capture_modal_input_snapshot()
         self._sudo_state = {"response_queue": response_queue, "vault_backend": display_name}
+        self._observe_modal_display(self._sudo_state)
         self._sudo_deadline = _time.monotonic() + 120
         self._ring_bell(prompt=True, context=t("cli.secret.bell_unlock", name=display_name))
         self._paint_now()
@@ -1163,6 +1188,7 @@ class CLIModalMixin:
         _cprint(f"\n{_DIM}  {t('cli.secret.unlocking_for_session', name=display_name)}{_RST}")
         return result
 
+    @observe_input("vault.save_login")
     def _vault_save_login_callback(self, origin: str, site: str):
         """Two-step "save this login" prompt (identifier shown, password masked) on the sudo panel; the
         answer goes to the vault store, never to the model. None = declined."""
@@ -1174,6 +1200,7 @@ class CLIModalMixin:
             self._capture_modal_input_snapshot()
             self._sudo_state = {"response_queue": response_queue, "vault_save": {"site": site, "origin": origin,
                                                                                   "step": step}}
+            self._observe_modal_display(self._sudo_state)
             self._sudo_deadline = _time.monotonic() + 180
             if step == "identifier":
                 self._ring_bell(prompt=True, context=t("cli.secret.bell_save_login", site=site))
@@ -1190,6 +1217,7 @@ class CLIModalMixin:
         _cprint(f"\n{_DIM}  {t('cli.secret.login_saved', site=site)}{_RST}")
         return answer
 
+    @observe_input("vault.code")
     def _vault_code_callback(self, site: str, hint: str) -> str:
         """One-time-code prompt (shown as typed; a 6-digit code is not a secret worth masking and users
         need to see typos) on the sudo panel. "" = declined/timed out."""
@@ -1198,6 +1226,7 @@ class CLIModalMixin:
         response_queue = queue.Queue()
         self._capture_modal_input_snapshot()
         self._sudo_state = {"response_queue": response_queue, "vault_code": {"site": site, "hint": hint}}
+        self._observe_modal_display(self._sudo_state)
         self._sudo_deadline = _time.monotonic() + 180
         self._ring_bell(prompt=True, context=t("cli.secret.bell_verification_code", site=site))
         self._paint_now()
@@ -1212,6 +1241,7 @@ class CLIModalMixin:
         _cprint(f"\n{_DIM}  {t('cli.secret.code_entered', site=site)}{_RST}")
         return result
 
+    @observe_input("secret")
     def _secret_capture_callback(self, var_name: str, prompt: str, metadata=None) -> dict:
         self._capture_modal_input_snapshot()
         try:

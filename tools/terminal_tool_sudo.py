@@ -221,6 +221,7 @@ def _prompt_for_sudo_password(timeout_seconds: int = 45, *, command: str = "") -
                 "",
             )))
             print("  Password (hidden): ", end="", flush=True)
+            human.shown()
             password_thread = threading.Thread(target=_read_hidden_password, args=(result,), daemon=True)
             password_thread.start()
             from tools.approval_human_wait import human_wait_window

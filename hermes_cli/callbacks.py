@@ -73,6 +73,8 @@ def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
         "prompt": prompt,
         "metadata": metadata or {},
         "response_queue": response_queue}
+    if observe_display := getattr(cli, "_observe_modal_display", None):
+        observe_display(cli._secret_state)
     cli._secret_deadline = _time.monotonic() + 120
     if hasattr(cli, "_ring_bell"):
         cli._ring_bell(prompt=True, context=f"secret needed ({var_name})")
