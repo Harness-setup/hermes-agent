@@ -82,8 +82,8 @@ class TurnRunner:
         self._runner = runner
         self._ctx = ctx
         self._tool_progress_message_id = getattr(ctx, "event_message_id", None)
-        # A voice transcript's own message anchors its tool thread, even when
-        # steering redirects the final reply to a newer message.
+        # The transcript anchors initial voice progress; successful steering
+        # updates ctx and subsequent sends follow the newer message.
         if (getattr(ctx, "voice_input", False)
                 and ctx.source.platform == Platform.DISCORD):
             self._tool_progress_message_id = (

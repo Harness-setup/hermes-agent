@@ -490,6 +490,8 @@ class GatewayAgentCacheMixin:
             return
         state = self._peek_session_state(session_key)
         running_agent = state.turn.agent if state else None
+        interrupted_event = state.turn.event if state else None
+        interrupted_ctx = state.turn.ctx if state else None
         _generation_at_interrupt = self._interrupt_running_turn(
             session_key, interrupt_reason=interrupt_reason, invalidation_reason=invalidation_reason,
         )
@@ -522,6 +524,8 @@ class GatewayAgentCacheMixin:
         if phrase_turn is not None:
             await phrase_turn.close()
         adapter = self._delivery_adapter_for(source)
+        from gateway.run_turn_progress import close_interrupted_threads
+        await close_interrupted_threads(adapter, interrupted_event, interrupted_ctx)
         interrupt_session_activity = getattr(type(adapter), "interrupt_session_activity", None)
         if adapter and callable(interrupt_session_activity):
             metadata = self._thread_metadata_for_source(source)

@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from gateway.run import GatewayRunner
 from gateway.run_turn_runner import TurnRunner
 
 
@@ -205,7 +206,6 @@ class TestSendToToolThread:
         the real GatewayRunner class -- which raises AttributeError on an unknown attribute,
         unlike SimpleNamespace -- catches a reintroduced mismatch."""
         from unittest.mock import create_autospec
-        from gateway.run import GatewayRunner
 
         adapter = SimpleNamespace(send_tool_progress_line=AsyncMock(), _discord_thread_tool_calls_enabled=lambda: True)
         real_runner = create_autospec(GatewayRunner, instance=True)
@@ -505,13 +505,29 @@ async def test_cancelled_redirect_cleans_original_thread(monkeypatch):
     assert '456' not in adapter._tool_progress_threads
 
 
-def test_redirect_keeps_progress_in_original_thread(monkeypatch):
-    adapter = SimpleNamespace(send_tool_progress_line=AsyncMock(), _discord_thread_tool_calls_enabled=lambda: True)
+@pytest.mark.asyncio
+async def test_steering_moves_tools_and_reasoning_to_new_message_thread(monkeypatch):
+    adapter = _make_adapter()
+    adapter.config.extra['thread_tool_calls'] = True
+    channel, seed, new_thread = _fake_channel_with_message()
+    adapter._client.get_channel = lambda _id: channel
+    old_thread = SimpleNamespace(edit=AsyncMock(), fetch_members=AsyncMock(return_value=[]))
+    adapter._tool_progress_threads['456'] = old_thread
     tr, ctx = _make_runner_and_ctx(adapter=adapter)
-    monkeypatch.setattr(tr, '_schedule', _closing_schedule)
+    pending = []
+    monkeypatch.setattr(tr, '_schedule', lambda coro, *args: pending.append(coro))
     ctx.event_message_id = '789'
-    assert tr._send_to_tool_thread('tool after redirect')
-    adapter.send_tool_progress_line.assert_called_once_with('123', '456', 'tool after redirect')
+    ctx.inbound_message_id = '789'
+    tr._progress_emit('tool after steering')
+    assert tr._send_to_tool_thread('reasoning after steering')
+    for coro in pending:
+        await coro
+    old_thread.edit.assert_awaited_once_with(archived=True)
+    channel.fetch_message.assert_awaited_once_with(789)
+    seed.create_thread.assert_awaited_once()
+    assert [call.kwargs['content'] for call in new_thread.send.await_args_list] == [
+        'tool after steering', 'reasoning after steering']
+    ctx.progress_queue.put.assert_not_called()
 
 
 @pytest.mark.asyncio

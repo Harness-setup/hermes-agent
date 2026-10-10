@@ -5,6 +5,17 @@ from gateway.config import Platform
 logger = logging.getLogger("gateway.run")
 
 
+async def close_interrupted_threads(adapter, event, ctx):
+    """Close the interrupted turn's destinations before its slot can be released."""
+    close = getattr(type(adapter), "_archive_tool_progress_thread", None)
+    if not callable(close):
+        return
+    anchors = {getattr(event, "message_id", None), getattr(event, "reply_anchor_override", None),
+               getattr(ctx, "event_message_id", None), getattr(ctx, "inbound_message_id", None)}
+    for anchor in anchors - {None}:
+        await close(adapter, anchor)
+
+
 def send_to_tool_thread(turn, text: str) -> bool:
     """Discord's discord.thread_tool_calls opt-in: tool-call progress lines AND reasoning
     (_thinking, routed here too as of 2026-09-23 -- see progress_callback's own comment) go to
@@ -28,11 +39,26 @@ def send_to_tool_thread(turn, text: str) -> bool:
     except Exception:
         logger.debug("Discord progress routing unavailable", exc_info=True)
         return False
+    anchor = getattr(ctx, "inbound_message_id", None) or getattr(ctx, "event_message_id", None)
+    previous = turn._tool_progress_message_id
+    turn._tool_progress_message_id = anchor
+    send = adapter.send_tool_progress_line(ctx.source.chat_id, anchor, text)
+    if previous and previous != anchor:
+        send = _move_thread_line(adapter, previous, send)
     turn._schedule(
-        adapter.send_tool_progress_line(ctx.source.chat_id, turn._tool_progress_message_id, text),
+        send,
         "discord tool-progress thread send error",
     )
     return True
+
+
+async def _move_thread_line(adapter, previous, send):
+    # Retire the old destination before creating the thread for the correction.
+    try:
+        await adapter._archive_tool_progress_thread(previous)
+        await send
+    finally:
+        send.close()
 
 def emit_progress(turn, msg: str) -> None:
     """Dedup consecutive identical lines (execute_code boilerplate), then route to the native

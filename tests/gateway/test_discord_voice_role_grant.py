@@ -59,6 +59,9 @@ async def test_role_member_speech_passes_the_gateway_gate(
 
     assert adapter.handle_message.await_count == dispatched
     assert hook.await_count == dispatched
+    if dispatched:
+        content = channel.send.call_args.args[0]
+        assert f"<@{speaker}>" in content
     for call in adapter.handle_message.await_args_list:
         assert runner._is_user_authorized(call.args[0].source)
         assert call.args[0].message_id == "987"

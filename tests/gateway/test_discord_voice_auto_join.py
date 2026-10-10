@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.run import GatewayRunner
 
 # ── DiscordAdapter._voice_auto_join_target ──────────────────────────────────────────────────
 
@@ -234,7 +235,6 @@ async def test_owner_departure_uses_real_leave_without_flushing_speech(monkeypat
     receiver.flush_pending.return_value = [(42, b'pending')]
     adapter._voice_receivers[1] = receiver
     adapter._process_voice_input = AsyncMock()
-    from gateway.run import GatewayRunner
     runner = object.__new__(GatewayRunner)
     runner._voice_mode = {'discord:101': 'all'}
     runner._voice_phrase_turns = {}
@@ -314,11 +314,11 @@ async def test_owner_reentry_greets_and_profile_connections_are_isolated(monkeyp
         adapter._voice_text_channels[1] = 101
         adapter.claim_voice_owner(user, channel)
         await adapter._voice_greetings[1]
-    # A retained connected owner who comes back gets another greeting, exactly once.
+    # Reentering a retained connection does not repeat the startup greeting.
     first._voice_owner_channels[1] = None
     await first._handle_voice_owner_state(owner, _voice_state(), _voice_state(channel))
     await first._voice_greetings[1]
     await first._handle_voice_owner_state(owner, _voice_state(), _voice_state(channel))
-    assert speak.await_count == 3
+    assert speak.await_count == 2
     assert second._voice_owners == {1: (99, 10)}
     assert first._spoken_phrase_picker is not second._spoken_phrase_picker

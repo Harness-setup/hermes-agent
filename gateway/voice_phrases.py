@@ -12,6 +12,13 @@ from gateway.voice_profile import PhrasePicker, resolve_voice_profile
 
 logger = logging.getLogger(__name__)
 
+_DISCORD_TOOL_NOTE = (
+    "[Use dedicated tools when they support the user's task. Do not probe this computer, run shell "
+    "commands, or install packages just to answer a general question about a product, weather, or model "
+    "mode. Use terminal when the requested task actually needs shell execution. If a command is denied, "
+    "do not retry it through another shell command; explain the limitation and continue with available tools.]"
+)
+
 
 def voice_channel_enabled(runner, source, *, voice_input=False):
     if source.platform != Platform.DISCORD:
@@ -79,15 +86,10 @@ class VoicePhraseTurn:
 
     async def _filler(self):
         timing = self.profile["timing"]
-        delays = [timing["filler_delay_seconds"], timing["second_reminder_seconds"], timing["third_reminder_seconds"]]
-        for index, delay in enumerate(delays):
-            # Playback is awaited, so this silence begins after the previous audio ends.
-            await asyncio.sleep(max(timing["status_silence_seconds"], delay))
-            if not self.allowed():
-                return
-            group = "fillers" if index == 0 else "long_wait"
+        await asyncio.sleep(max(timing["status_silence_seconds"], timing["filler_delay_seconds"]))
+        if self.allowed():
             await speak_phrase(self.adapter, self.chat_id,
-                               self.picker.choose(group, self.profile["phrases"][group]), allowed=self.allowed)
+                               self.picker.choose("fillers", self.profile["phrases"]["fillers"]), allowed=self.allowed)
 
     def answer_started(self):
         # Called from the agent thread: latch first, before scheduling cancellation.
@@ -142,13 +144,14 @@ def proxy_answer_started(runner, session_key):
 def turn_reply_note(voice_input, platform=None, voice_mode=None):
     if voice_input or (platform == Platform.DISCORD and voice_mode == "all"):
         from tui_gateway.voice_reply_style import voice_chat_turn_note
-        return voice_chat_turn_note()
+        note = voice_chat_turn_note()
+        return f"{note}\n{_DISCORD_TOOL_NOTE}" if platform == Platform.DISCORD else note
     if platform == Platform.DISCORD:
         return (
             "[Discord text conversation: Reply in normal readable text. Use formatting when useful. "
             "Keep the configured persona and form of address. This message was typed, not spoken. "
             "Do not describe hearing the user, listening through a microphone, or speaking the reply aloud. "
-            "Do not carry voice-call instructions from earlier turns into this text reply.]"
+            "Do not carry voice-call instructions from earlier turns into this text reply.]\n" + _DISCORD_TOOL_NOTE
         )
     return ""
 

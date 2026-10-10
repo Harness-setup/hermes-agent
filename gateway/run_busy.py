@@ -665,6 +665,10 @@ class GatewayBusySessionMixin:
         turn = self._fold_into_running_turn(running_agent, session_key, event)
         if turn is None:
             return True  # a newer turn already owns the slot; never re-anchor it
+        self._reanchor_turn_reply(turn, event)
+        return True
+
+    def _reanchor_turn_reply(self, turn, event: MessageEvent) -> None:
         anchor = self._reply_anchor_for_event(event)
         inbound_id = str(event.message_id) if event.message_id else None
         if turn.event is not None and turn.event is not event:
@@ -673,7 +677,6 @@ class GatewayBusySessionMixin:
         if turn.ctx is not None:
             turn.ctx.event_message_id = anchor
             turn.ctx.inbound_message_id = inbound_id
-        return True
 
     def _fold_into_running_turn(self, running_agent, session_key: str, event: MessageEvent):
         """The running turn now answers *event* too (steer, redirect): if *event* was addressed to
@@ -686,6 +689,9 @@ class GatewayBusySessionMixin:
             turn.event.absorb_reply_expected(event)
             if turn.ctx is not None:
                 turn.ctx.reply_expected = turn.event.reply_expected
+        # A Discord steer owns subsequent detail output, including the thread seed.
+        if event.source.platform == Platform.DISCORD and event.message_id:
+            self._reanchor_turn_reply(turn, event)
         return turn
 
     async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> None:

@@ -293,6 +293,12 @@ matrix = [
 # here to keep the dependency local to wecom_callback's threat model.
 wecom = ["defusedxml==0.7.1"]
 tts-premium = ["elevenlabs==1.59.0"]
+speech-turn = [
+  "numpy==2.4.3; platform_machine != 'x86_64' or platform_system != 'Darwin'",
+  "onnxruntime==1.27.0; platform_machine != 'x86_64' or platform_system != 'Darwin'",
+  "transformers==5.2.0; platform_machine != 'x86_64' or platform_system != 'Darwin'",
+  "huggingface-hub==1.24.0; platform_machine != 'x86_64' or platform_system != 'Darwin'",
+]
 voice = [
   # Local STT pulls in wheel-only transitive deps (ctranslate2, onnxruntime).
   # faster-whisper's closure is prebuilt-only and missing pieces on two
@@ -599,6 +605,7 @@ wake-openwakeword = "(platform_machine != 'ARM64' or sys_platform != 'win32') an
 # Gate the extra that carries only faster-whisper; [voice] also has ungated deps (sounddevice,
 # numpy) and stays installable, see test_declared_extra_gates_match_dependency_selection.
 stt-whisper = "(platform_machine != 'ARM64' or sys_platform != 'win32') and (platform_machine != 'x86_64' or platform_system != 'Darwin')"
+speech-turn = "platform_machine != 'x86_64' or platform_system != 'Darwin'"
 # NeuTTS excludes Python 3.14.
 neutts = "python_version < '3.14'"
 # KittenTTS: onnxruntime has no Intel macOS wheel; misaki[en]'s torch has no

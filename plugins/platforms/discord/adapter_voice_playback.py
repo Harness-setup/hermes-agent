@@ -123,7 +123,7 @@ def _greet_voice_owner(adapter, guild_id):
     from gateway.voice_phrases import phrase_picker, speak_phrase
     from gateway.voice_profile import resolve_voice_profile
     existing = adapter._voice_greetings.get(guild_id)
-    if existing is not None and not existing.done():
+    if existing is not None:
         return
     owner = adapter._voice_owners[guild_id]
     profile = resolve_voice_profile()

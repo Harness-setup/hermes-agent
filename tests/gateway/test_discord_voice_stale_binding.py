@@ -23,11 +23,25 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.run import GatewayRunner
 from gateway.platforms.base import SessionSource
 from gateway.platforms.event import MessageEvent, MessageType
 from plugins.platforms.discord.adapter import DiscordAdapter, VoiceReceiver
 
 _GUILD, _USER = 1, 42
+
+
+@pytest.mark.asyncio
+async def test_other_voice_participant_is_filtered_before_stt() -> None:
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake"))
+    adapter._voice_owners[_GUILD] = (_USER, 700)
+    adapter._voice_input_callback = callback = AsyncMock()
+    with patch("tools.transcription_tools.transcribe_audio") as transcribe, \
+         patch("plugins.platforms.discord.adapter.tempfile.NamedTemporaryFile") as audio_file:
+        await adapter._process_voice_input(_GUILD, _USER + 1, b"audio", 700)
+    transcribe.assert_not_called()
+    audio_file.assert_not_called()
+    callback.assert_not_awaited()
 
 
 class _OneBatchReceiver:
@@ -88,7 +102,6 @@ def _fall_silent(receiver: VoiceReceiver) -> None:
 
 async def _voice_join_from(adapter: DiscordAdapter, chat_id: str, tmp_path: Path) -> None:
     """``/voice join`` through the gateway handler while the bot is already in the voice channel."""
-    from gateway.run import GatewayRunner
     runner = object.__new__(GatewayRunner)
     runner.adapters, runner._voice_mode = {}, {}
     runner._VOICE_MODE_PATH = tmp_path / "gateway_voice_mode.json"

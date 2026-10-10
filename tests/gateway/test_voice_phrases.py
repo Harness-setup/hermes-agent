@@ -198,7 +198,7 @@ async def test_fixed_phrase_never_becomes_attachment_after_disconnect():
 
 
 @pytest.mark.asyncio
-async def test_three_reminders_with_silence_after_playback(monkeypatch):
+async def test_one_reminder_only_during_a_voice_turn(monkeypatch):
     spoken, waits = [], []
     async def speak(adapter, chat, text, **kwargs):
         spoken.append(text)
@@ -211,9 +211,9 @@ async def test_three_reminders_with_silence_after_playback(monkeypatch):
     turn = vp.VoicePhraseTurn(SimpleNamespace(), 'chat', p, lambda: True)
     await turn.start()
     await turn._task
-    assert waits == [6, 15, 30]
-    assert len(spoken) == 3  # only working reminders; greeting is on connection
-    assert spoken[2] in p['phrases']['long_wait']
+    assert waits == [6]
+    assert len(spoken) == 1  # greeting belongs to connection, not each turn
+    assert spoken[0] in p['phrases']['fillers']
     await turn.close()
 
 

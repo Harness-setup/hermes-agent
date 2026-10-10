@@ -1217,16 +1217,8 @@ class VoiceReceiver:
             return
 
     def _buffer_pcm(self, ssrc: int, pcm: bytes) -> None:
-        """Quiet RTP frames must not postpone the end of a spoken utterance."""
-        from array import array
-        samples = array("h", pcm)
-        audible = bool(samples) and sum(value * value for value in samples) / len(samples) >= 35 ** 2
-        with self._lock:
-            if audible:
-                self._buffers[ssrc].extend(pcm)
-                self._last_packet_time[ssrc] = time.monotonic()
-            elif self._buffers.get(ssrc):
-                self._buffers[ssrc].extend(pcm)
+        from plugins.platforms.discord.adapter_voice_turns import buffer_pcm
+        buffer_pcm(self, ssrc, pcm)
 
     # --- Silence detection ---
 
@@ -1253,32 +1245,8 @@ class VoiceReceiver:
         return 0
 
     def check_silence(self) -> list:
-        """Return list of (user_id, pcm_bytes) for completed utterances."""
-        now = time.monotonic()
-        completed = []
-        with self._lock:
-            ssrc_user_map = dict(self._ssrc_to_user)
-            ssrc_list = list(self._buffers.keys())
-            for ssrc in ssrc_list:
-                last_time = self._last_packet_time.get(ssrc, now)
-                silence_duration = now - last_time
-                buf = self._buffers[ssrc]
-                # 48kHz, 16-bit, stereo = 192000 bytes/sec
-                buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
-                if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
-                    user_id = ssrc_user_map.get(ssrc, 0)
-                    if not user_id:
-                        # SSRC unmapped (SPEAKING missing after rejoin) — infer from channel.
-                        user_id = self._infer_user_for_ssrc(ssrc)
-                    if user_id:
-                        completed.append((user_id, bytes(buf)))
-                    self._buffers[ssrc] = bytearray()
-                    self._last_packet_time.pop(ssrc, None)
-                elif silence_duration >= self.SILENCE_THRESHOLD * 2:
-                    # Stale buffer with no valid user — discard
-                    self._buffers.pop(ssrc, None)
-                    self._last_packet_time.pop(ssrc, None)
-        return completed
+        from plugins.platforms.discord.adapter_voice_turns import check_silence
+        return check_silence(self)
 
     def flush_pending(self) -> list:
         """Return buffered utterances that have not yet reached silence."""
@@ -1647,6 +1615,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             # profile's runtime scope under multiplex, so the snapshot holds THIS adapter's values, immune
             # to the first-writer-wins process-global env bridge.
             self._snapshot_gate_env()
+            from plugins.platforms.discord.adapter_voice_turns import warm_detector
+            warm_detector(self)
             self._allowed_user_ids = self._get_allowed_users()
             # DISCORD_ALLOWED_ROLES: comma-separated role IDs; ANY match grants access.
             self._allowed_role_ids = self._get_allowed_roles()
@@ -3983,6 +3953,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             self._bind_voice_text_channel(guild_id, text_channel_id, source)
             try:
                 receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                from plugins.platforms.discord.adapter_voice_turns import ready_detector
+                receiver._turn_detector = await ready_detector(self)
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
@@ -4139,7 +4111,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                             vc._connection.send_packet(b'\xf8\xff\xfe')
                     except Exception:
                         pass
-                completed = receiver.check_silence()
+                completed = await asyncio.to_thread(receiver.check_silence)
                 # Each utterance keeps the binding it was collected under, not one set during an earlier STT.
                 captured_for = self._voice_text_channels.get(guild_id)
                 # Pass guild so role checks stay guild-scoped.
@@ -4158,7 +4130,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes, captured_for: int | None):
         """Convert PCM -> WAV -> STT -> callback; dropped if the binding moved off *captured_for* during STT."""
         from tools.voice_mode_transcript import is_whisper_hallucination
-        if guild_id in self._voice_owner_departing:
+        owner = self._voice_owners.get(guild_id)
+        if guild_id in self._voice_owner_departing or (owner is not None and user_id != owner[0]):
             return
         tmp_f = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_listen_", delete=False)
         wav_path = tmp_f.name
