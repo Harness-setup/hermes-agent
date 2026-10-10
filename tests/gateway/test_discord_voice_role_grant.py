@@ -40,7 +40,9 @@ async def test_role_member_speech_passes_the_gateway_gate(
     if speaker_roles is not None:
         members[speaker] = SimpleNamespace(id=speaker, roles=[SimpleNamespace(id=r) for r in speaker_roles])
     guild = SimpleNamespace(id=_GUILD, name="Hermes Server", get_member=members.get)
-    adapter._client = SimpleNamespace(get_guild=lambda _id: guild, get_channel=lambda _id: None)
+    echo = SimpleNamespace(id=987, guild=guild)
+    channel = SimpleNamespace(id=_TEXT, guild=guild, name="voice-transcripts", topic=None, parent=None, send=AsyncMock(return_value=echo))
+    adapter._client = SimpleNamespace(get_guild=lambda _id: guild, get_channel=lambda _id: channel)
     adapter._voice_text_channels = {_GUILD: _TEXT}
     joined = SessionSource(platform=Platform.DISCORD, chat_id=str(_TEXT), chat_type="group",
                            user_id=str(_JOINER), user_name="joiner", guild_id=str(_GUILD),
@@ -51,8 +53,13 @@ async def test_role_member_speech_passes_the_gateway_gate(
     runner.adapters = {Platform.DISCORD: adapter}
     runner._voice_mode, runner._session_db, runner.session_store = {}, None, MagicMock()
 
+    runner._hm_pre_gateway_dispatch_hook = hook = AsyncMock(side_effect=lambda event, source: event)
+
     await runner._handle_voice_channel_input(_GUILD, speaker, "what broke?", adapter=adapter)
 
     assert adapter.handle_message.await_count == dispatched
+    assert hook.await_count == dispatched
     for call in adapter.handle_message.await_args_list:
         assert runner._is_user_authorized(call.args[0].source)
+        assert call.args[0].message_id == "987"
+        assert call.args[0].raw_message is echo

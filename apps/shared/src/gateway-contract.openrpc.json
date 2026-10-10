@@ -26348,6 +26348,18 @@
             "default": null,
             "title": "Surface"
           },
+          "overlay_producer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Overlay Producer"
+          },
           "voice_context": {
             "anyOf": [
               {

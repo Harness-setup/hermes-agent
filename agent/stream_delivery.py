@@ -334,6 +334,7 @@ class StreamDeliveryMixin:
             "model": self.model or "",
             "provider": self.provider or "",
             "surface": self.platform or "cli",
+            "overlay_producer": getattr(self, "_overlay_producer", ""),
         }
 
     def _emit_stream_start(self) -> None:

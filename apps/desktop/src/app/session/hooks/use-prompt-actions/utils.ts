@@ -726,8 +726,9 @@ export interface SubmitTextOptions {
   displayKind?: 'hidden'
   /** Per-turn client surface the gateway turns into a model-bound note. The
    *  HUD sets `hud` from its own store; a GPT-Live delegation passes
-   *  `voice-live` (spoken transcript in, speakable prose out). */
-  surface?: 'voice-live'
+   *  `voice-live` (spoken transcript in, speakable prose out); chained voice
+   *  conversations pass `voice-chat`. Dictation stays ordinary text. */
+  surface?: 'voice-live' | 'voice-chat'
   /** With `surface: 'voice-live'`: the recent spoken exchange, appended to the
    *  model-bound note by the gateway (never persisted, never rendered). */
   voiceContext?: string

@@ -81,6 +81,13 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        self._tool_progress_message_id = getattr(ctx, "event_message_id", None)
+        # A voice transcript's own message anchors its tool thread, even when
+        # steering redirects the final reply to a newer message.
+        if (getattr(ctx, "voice_input", False)
+                and ctx.source.platform == Platform.DISCORD):
+            self._tool_progress_message_id = (
+                getattr(ctx, "inbound_message_id", None) or self._tool_progress_message_id)
 
     # ── shared thread→loop plumbing ─────────────────────────────────────────────────────────
 
@@ -322,56 +329,12 @@ class TurnRunner:
         return f"{emoji} {verb}" if verb_drops_preview(tool_name) else f"{emoji} {verb}{tool_verb_connector(tool_name)}{preview}"
 
     def _send_to_tool_thread(self, text: str) -> bool:
-        """Discord's discord.thread_tool_calls opt-in: tool-call progress lines AND reasoning
-        (_thinking, routed here too as of 2026-09-23 -- see progress_callback's own comment) go to
-        a lazily-created thread instead of the shared progress_queue, so the main channel only
-        ever shows the final answer. Returns True when handled (caller must not also queue/
-        native-render it); False falls through to the existing behavior unchanged (every other
-        platform, or Discord with the flag off, is untouched by this)."""
-        ctx = self._ctx
-        if ctx.source.platform != Platform.DISCORD:
-            return False
-        try:
-            adapter = self._runner._delivery_adapter_for(ctx.source)
-        except Exception:
-            return False
-        if adapter is None or not hasattr(adapter, "send_tool_progress_line"):
-            return False
-        try:
-            if not adapter._discord_thread_tool_calls_enabled():
-                return False
-        except Exception:
-            return False
-        self._schedule(
-            adapter.send_tool_progress_line(ctx.source.chat_id, ctx.event_message_id, text),
-            "discord tool-progress thread send error",
-        )
-        return True
+        from gateway.run_turn_progress import send_to_tool_thread
+        return send_to_tool_thread(self, text)
 
     def _progress_emit(self, msg: str) -> None:
-        """Dedup consecutive identical lines (execute_code boilerplate), then route to the native
-        stream bubble when the consumer accepts tool progress, else the progress queue -- unless
-        Discord's tool-call thread split claims it first (see _send_to_tool_thread)."""
-        ctx = self._ctx
-        sc = self._stream_consumer()
-        native = sc is not None and getattr(sc, "accepts_tool_progress", False)
-        if msg == ctx.last_progress_msg[0]:
-            ctx.repeat_count[0] += 1
-            rendered = f"{msg} (×{ctx.repeat_count[0] + 1})"
-            if self._send_to_tool_thread(rendered):
-                return
-            if native:
-                sc.on_tool_progress(rendered)
-            else:
-                ctx.progress_queue.put(("__dedup__", msg, ctx.repeat_count[0]))
-            return
-        ctx.last_progress_msg[0], ctx.repeat_count[0] = msg, 0
-        if self._send_to_tool_thread(msg):
-            return
-        if native:
-            sc.on_tool_progress(msg)
-        else:
-            ctx.progress_queue.put(msg)
+        from gateway.run_turn_progress import emit_progress
+        emit_progress(self, msg)
 
     # ── Slack-native task cards (progress-queue drain) ──────────────────────────────────────
 
@@ -819,20 +782,8 @@ class TurnRunner:
     # ── ID-bearing lifecycle callbacks (agent thread) ───────────────────────────────────────
 
     def voice_ack_callback(self, call_id, tool_name, args):
-        """tool_start_callback: speak a one-time ack in the voice channel."""
-        ctx = self._ctx
-        if ctx._voice_ack_fired[0] or ctx._voice_ack_guild[0] is None or not ctx._run_still_current():
-            return
-        ctx._voice_ack_fired[0] = True
-        adapter = self._runner.adapters.get(Platform.DISCORD)
-        if adapter is None or not hasattr(adapter, "play_ack_in_voice"):
-            return
-        try:
-            self._schedule(
-                adapter.play_ack_in_voice(ctx._voice_ack_guild[0]), "voice ack scheduling error", loop=ctx._voice_ack_loop,
-            )
-        except Exception as err:
-            logger.debug("voice ack schedule failed: %s", err)
+        """Acknowledgements belong to accepted voice turns, never tool starts."""
+        return
 
     # Slack-native task cards ride agent.tool_start_callback / tool_complete_callback so start and
     # completion correlate by the REAL tool-call id; name-correlated progress_callback text events
@@ -1022,15 +973,19 @@ class TurnRunner:
             ) if sc is not None
         ]
         stream_delta_cb = None
-        if delta_sinks:
+        if delta_sinks or ctx.voice_phrase_turn is not None:
             def stream_delta_cb(text: Optional[str]) -> None:
                 if ctx._run_still_current():
+                    if text and ctx.voice_phrase_turn is not None:
+                        ctx.voice_phrase_turn.answer_started()
                     for sink in delta_sinks:
                         sink.on_delta(text)
 
         def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
                 return
+            if text and ctx.voice_phrase_turn is not None:
+                ctx.voice_phrase_turn.answer_started()
             if stts is not None:
                 # Flush accepted deltas; completed commentary is a separate speech segment.
                 stts.on_delta(None)
@@ -1306,6 +1261,7 @@ class TurnRunner:
         runner = self._runner
         agent._notification_config = ctx.user_config
         agent._notification_platform = ctx.source.platform
+        agent._voice_input = ctx.voice_input
         # ALWAYS attached (never gated to None): its body gates each event class, and subagent-
         # failure notices must fire even with tool_progress/thinking off.
         agent.tool_progress_callback = ctx.progress_callback
@@ -1327,6 +1283,12 @@ class TurnRunner:
         # Must-deliver notes for THIS turn ride the current user message (api_content sidecar), never
         # the system prompt. Assigned unconditionally so a reused agent never replays a stale note.
         agent._gateway_turn_context_notes = "\n\n".join(runner._consume_pending_turn_sidecar_notes(ctx.session_key))
+        from gateway.voice_phrases import turn_reply_note
+        agent._gateway_turn_context_notes = "\n\n".join(
+            note for note in (agent._gateway_turn_context_notes,
+                              turn_reply_note(ctx.voice_input, ctx.source.platform,
+                                              runner._voice_mode.get(runner._voice_key_for_source(ctx.source)))) if note)
+
         agent.background_review_callback, bg_release = self._make_bg_review_callbacks()
         # Register the release hook on the adapter so base.py's finally block fires it after the
         # main response is delivered.
@@ -1487,6 +1449,8 @@ class TurnRunner:
         from gateway.run import _approval_send_outcome, _format_exec_approval_fallback, _interim_metadata, _redact_approval_command
         from gateway.run_turn_runner_approval_settle import register_timeout_notice
         ctx = self._ctx
+        if ctx.voice_phrase_turn is not None:
+            ctx.voice_phrase_turn.answer_started()
         adapter = ctx._status_adapter
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
         # /approve while "is thinking..." shows. Pausing stops _keep_typing re-setting it; resumed
@@ -1966,7 +1930,7 @@ class TurnRunner:
                 "messages": [], "api_calls": 0, "tools": [],
             }
         pr = runner._provider_routing
-        reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
+        reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model, voice_input=ctx.voice_input)
         runner._reasoning_config = reasoning_config
         runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
         stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)

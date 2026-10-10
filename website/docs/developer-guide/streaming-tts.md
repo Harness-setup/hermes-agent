@@ -97,3 +97,29 @@ All default to unsupported/no-op, so existing adapters are untouched. When a
 turn's streaming audio completes, the whole-file auto-TTS reply for that turn
 is suppressed (no double playback); when streaming fails before any audio was
 audible, the gateway falls back to the legacy whole-file voice reply.
+
+
+## Shared Jarvis voice profile
+
+Authenticated clients can read `GET /api/audio/voice-profile` (with the same optional
+`profile` query parameter as `/api/audio/speak`). The response contains `revision`,
+non-secret `tts` voice metadata, `phrases`, and `timing`. Synthesis uses the configured
+Hermes provider; this endpoint never returns provider credentials or commands.
+
+`voice.profile.phrases` overrides named groups: `acknowledgements`, `fillers`,
+`boot_fillers`, `stop`, `backend_error`, `stt_error`, `assistant_error`, and `stop_error`.
+Each group is a nonempty array of strings. `voice.profile.timing` overrides
+`filler_delay_seconds` (5), `filler_jitter_seconds` (0.5), `boot_delay_seconds` (2),
+and `boot_jitter_seconds` (0.3). Values are finite nonnegative seconds.
+
+The revision hashes the full TTS configuration, phrases, and timing. Jarvis refreshes
+it on backend connection for each turn and uses it to select a separate phrase audio
+cache. Its bundled catalog and local Piper remain available during backend outages.
+Discord reads the same profile on each accepted voice turn, speaks one acknowledgement,
+and schedules at most one delayed filler. First answer text, stop, and turn cleanup
+cancel that filler, including in-flight synthesis and active playback. Tool starts
+produce no additional acknowledgement. Fixed stop and transcription/assistant error
+phrases require a connected voice channel and enabled voice replies. Silence and
+hallucination-filtered transcriptions remain quiet. Text replies survive profile/TTS
+failures. The natural spoken-answer note is attached to the current voice turn without
+changing the cached system prompt or transcript wording.

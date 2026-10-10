@@ -267,3 +267,28 @@ def test_host_builds_the_session_agent_with_the_frame_login(monkeypatch):
     assert captured["auth_user_id"] == "basic:alice"
     assert session["auth_user_id"] == "basic:alice"
     assert server._session_auth_user_id(session) == "basic:alice"
+
+
+def test_jarvis_overlay_metadata_reaches_agent_and_resets_for_native_turn(turn_env):
+    from agent.stream_delivery import StreamDeliveryMixin
+    observed = []
+    agent = _agent(['very ', 'very ', 'good'])
+    agent.session_id, agent.model, agent.provider, agent.platform = 's1', 'test', 'test', 'desktop'
+    original = agent.run_conversation
+    def run(*args, **kwargs):
+        observed.append(StreamDeliveryMixin._stream_hook_base_payload(agent))
+        return original(*args, **kwargs)
+    agent.run_conversation = run
+    out = io.StringIO()
+    host = ComputeHost(stdout=out, heartbeat_secs=0)
+    server._sessions['s1'] = _session(agent)
+    try:
+        for request_id, metadata in [('jarvis', {'overlay_producer': 'jarvis'}), ('native', {})]:
+            host.handle_frame({'type': 'turn.start', 'sid': 's1', 'request_id': request_id,
+                               'text': 'hello', **metadata})
+            _wait(out, lambda f: f['type'] == 'turn.end' and f['request_id'] == request_id)
+    finally:
+        server._sessions.pop('s1', None)
+        host.close()
+    assert [entry['overlay_producer'] for entry in observed] == ['jarvis', '']
+    assert [entry['surface'] for entry in observed] == ['desktop', 'desktop']

@@ -96,12 +96,12 @@ async def _voice_join_from(adapter: DiscordAdapter, chat_id: str, tmp_path: Path
     runner._is_user_authorized = MagicMock(return_value=True)
     platform = MagicMock()
     platform.value = "discord"
-    source = SessionSource(chat_id=chat_id, user_id="owner", platform=platform)
+    source = SessionSource(chat_id=chat_id, user_id=str(_USER), platform=platform)
     source.thread_id = None
     event = MessageEvent(text="/voice join", message_type=MessageType.TEXT, source=source)
     event.raw_message = SimpleNamespace(guild_id=_GUILD, guild=None)
     runner.adapters[platform] = adapter
-    adapter.get_user_voice_channel = AsyncMock(return_value=SimpleNamespace(name="General"))
+    adapter.get_user_voice_channel = AsyncMock(return_value=SimpleNamespace(name="General", id=10, guild=SimpleNamespace(id=_GUILD)))
     adapter.join_voice_channel = AsyncMock(return_value=True)
     await runner._handle_voice_channel_join(event)
 

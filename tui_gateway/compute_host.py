@@ -271,8 +271,10 @@ class ComputeHost:
                 hermes_undo.on_user_message_appended(session["session_key"])
             with contextlib.suppress(Exception):
                 server._persist_branch_seed(session)
+            session["overlay_producer"] = frame.get("overlay_producer", "")
             server._run_prompt_submit(
                 request_id, sid, session, text, display_kind=frame.get("display_kind") or None,
+                voice_input=frame.get("voice_input") is True,
                 display_metadata=(frame.get("display_metadata")
                                   if isinstance(frame.get("display_metadata"), dict) else None))
             run_thread = session.get("_run_thread")

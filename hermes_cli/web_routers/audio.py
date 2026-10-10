@@ -143,6 +143,13 @@ async def transcribe_audio_upload(
     }
 
 
+@router.get("/api/audio/voice-profile")
+async def get_voice_profile(profile: Optional[str] = None):
+    """Shared phrases and cache revision; synthesis stays on /api/audio/speak."""
+    from gateway.voice_profile import resolve_voice_profile
+    return await _run_config_scoped(profile, resolve_voice_profile)
+
+
 @router.get("/api/audio/voice-config")
 async def get_client_voice_config(profile: Optional[str] = None):
     """The active profile's STT/TTS config for CLIENT-DIRECT voice.

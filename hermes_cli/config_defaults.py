@@ -1213,6 +1213,7 @@ DEFAULT_CONFIG = {
     },
 
     "voice": {
+        "profile": {"phrases": {}, "timing": {}},  # shared Jarvis catalog/timing overrides
         # How the Desktop voice conversation is wired:
         #   chained  — STT → Hermes turn → TTS (the stt.* / tts.* providers below)
         #   gpt-live — one full-duplex voice model (OpenAI GPT-Live) owns the mic and speaker and
@@ -1250,8 +1251,7 @@ DEFAULT_CONFIG = {
         "barge_in_grace_seconds": 0.5,
         # Speech trigger = quiet-room floor x this (floor calibrated BEFORE playback).
         "barge_in_threshold_multiplier": 3.0,
-        # Saying EXACTLY one of these (case-insensitive, punctuation ignored) ends the voice chat
-        # instead of going to the agent. [] disables.
+        # Exact stop phrases end voice chat (case/punctuation ignored); [] disables.
         "stop_phrases": ["stop"],
     },
     # Native vision embeds (vision_analyze / browser screenshots on vision-capable main models) ride

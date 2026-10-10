@@ -801,7 +801,9 @@ def _collect_pre_llm_call_context(
             is_first_turn=(not bool(conversation_history)),
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
+            voice_input=bool(getattr(agent, "_voice_input", False)),
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
+            overlay_producer=getattr(agent, "_overlay_producer", ""),
             sender_id=getattr(agent, "_user_id", None) or "",
             fallback_activated=getattr(agent, "_fallback_activated", False),
         )

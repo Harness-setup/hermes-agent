@@ -229,7 +229,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
         self._scale_to_zero_note_real_inbound()
-        event = await self._hm_pre_gateway_dispatch_hook(event, source)
+        if not (event.message_type == MessageType.VOICE
+                and (event.metadata or {}).pop("_voice_pre_dispatch_done", False) is True):
+            event = await self._hm_pre_gateway_dispatch_hook(event, source)
         if event is None:
             return None
         source = event.source

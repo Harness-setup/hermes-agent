@@ -174,9 +174,9 @@ class GatewayConfigLoadersMixin:
 
     def _resolve_session_reasoning_config(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
-        model: str = "",
+        model: str = "", voice_input: bool = False,
     ) -> dict | None:
-        """Session ``/reasoning --session`` > per-model ``agent.reasoning_overrides`` > global.
+        """Session ``/reasoning --session`` > voice default off > per-model overrides > global.
 
         ``model`` must be the session's *effective* model (session ``/model`` override included);
         empty uses ``model.default``.
@@ -186,7 +186,16 @@ class GatewayConfigLoadersMixin:
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+        if voice_input:
+            return {"enabled": False}
         return self._load_reasoning_config(model)
+
+    def _proxy_turn_reasoning(self, source, session_key, voice_input: bool) -> dict:
+        """Keep remote text defaults; send the voice policy with proxied Discord turns."""
+        if not voice_input:
+            return {}
+        return {"reasoning": self._resolve_session_reasoning_config(
+            source=source, session_key=session_key, voice_input=True)}
 
     def _set_session_reasoning_override(self, session_key: str, reasoning_config: Optional[dict]) -> None:
         """Set or clear the session-scoped reasoning override."""

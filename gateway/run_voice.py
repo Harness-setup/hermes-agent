@@ -173,7 +173,7 @@ class GatewayVoiceMixin:
                 voice_channel, text_channel_id=text_channel_id, source=source_dict,
             )
         except Exception as e:
-            logger.warning("Failed to join voice channel: %s", e)
+            logger.warning("Failed to join voice channel: %s", e, exc_info=True)
             adapter._voice_input_callback = None
             if not any(tok in str(e).lower() for tok in ("pynacl", "nacl", "davey")):
                 return t("gateway.voice.channel_join_failed", error=e)
@@ -215,6 +215,8 @@ class GatewayVoiceMixin:
         )
         if error:
             return error
+        if hasattr(adapter, "claim_voice_owner"):
+            adapter.claim_voice_owner(SimpleNamespace(id=event.source.user_id), voice_channel)
         return t("gateway.voice.channel_joined", name=voice_channel.name)
 
     async def _handle_voice_auto_join(self, adapter, member, channel) -> None:
@@ -223,9 +225,9 @@ class GatewayVoiceMixin:
         binds to the configured discord.auto_join_voice_text_channel instead."""
         try:
             from hermes_cli.config import load_config
-            discord_cfg = (load_config() or {}).get("platforms", {}).get("discord") or {}
+            discord_cfg = (await asyncio.to_thread(load_config) or {}).get("platforms", {}).get("discord") or {}
         except Exception as exc:
-            logger.debug("auto_join_voice: config read failed: %s", exc)
+            logger.debug("auto_join_voice: config read failed: %s", exc, exc_info=True)
             return
         text_channel_id = discord_cfg.get("auto_join_voice_text_channel")
         if not text_channel_id:
@@ -243,6 +245,9 @@ class GatewayVoiceMixin:
                 "Voice auto-join failed for %s in %s: %s",
                 getattr(member, "display_name", member), getattr(channel, "name", channel), error,
             )
+
+        elif hasattr(adapter, "claim_voice_owner"):
+            adapter.claim_voice_owner(member, channel)
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
         adapter = self._delivery_adapter_for(event.source)
@@ -269,6 +274,9 @@ class GatewayVoiceMixin:
             adapter = self.adapters.get(Platform.DISCORD)
         key = self._voice_key(Platform.DISCORD, chat_id,
                               profile=getattr(adapter, "_owner_profile", None))
+        for turn in list(getattr(self, "_voice_phrase_turns", {}).values()):
+            if turn.adapter is adapter and str(turn.chat_id) == str(chat_id):
+                turn.answer_started()
         self._apply_voice_mode(adapter, key, chat_id, "off")
 
     def _is_duplicate_voice_transcript(self, binding: tuple, user_id: int, transcript: str) -> bool:
@@ -344,7 +352,7 @@ class GatewayVoiceMixin:
         return source
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str, *, adapter=None
+        self, guild_id: int, user_id: int, transcript: str, *, adapter=None, error: Optional[str] = None
     ):
         """Handle transcribed voice from a voice channel. ``adapter`` captured the audio; under
         multiplexing each profile's bot dispatches through its own adapter, never the default's."""
@@ -376,18 +384,23 @@ class GatewayVoiceMixin:
         if not self._is_user_authorized_for_source(source):
             logger.debug("Unauthorized voice input from user %d, ignoring", user_id)
             return
+        if error == "stt_error":
+            from gateway.voice_phrases import speak_event_phrase
+            await speak_event_phrase(self, source, "stt_error", voice_input=True)
+            return
         binding = (getattr(adapter, "_owner_profile", None), guild_id, text_ch_id)
         if self._is_duplicate_voice_transcript(binding, user_id, transcript):
             logger.info("Suppressing duplicate voice transcript for guild=%s user=%s: %s",
                         guild_id, user_id, transcript[:100])
             return
+        transcript_message = None
         # Echo the transcript into the text channel (after auth, with mention sanitization).
         with suppress(Exception):
             channel = adapter._client.get_channel(text_ch_id)
             if channel:
                 safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone")
                 safe_text = safe_text.replace("@here", "@\u200bhere")
-                await channel.send(t("gateway.voice.transcript_echo", user=user_id, text=safe_text))
+                transcript_message = await channel.send(t("gateway.voice.transcript_echo", user=user_id, text=safe_text))
         # Bound text channel's channel_prompt and skills: voice input gets the same per-channel
         # context, and a first spoken turn opens the session, the only point skills load.
         # A thread inherits its parent's bindings, as its typed messages do.
@@ -400,12 +413,20 @@ class GatewayVoiceMixin:
         if callable(skills := getattr(adapter, "_resolve_channel_skills", None)):
             bound = skills(str(text_ch_id), parent_id)
             auto_skill = bound if isinstance(bound, list) else None
-        # Synthetic MessageEvent for the normal pipeline; the SimpleNamespace raw_message lets
-        # _get_guild_id() extract guild_id so _send_voice_reply() plays audio in the voice channel.
+        # The transcript echo anchors progress threads just like a typed message.
+        # Without an echo, keep the guild identity for voice delivery.
         event = MessageEvent(
             source=source, text=transcript, message_type=MessageType.VOICE,
-            raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
+            message_id=str(transcript_message.id) if transcript_message is not None else None,
+            raw_message=transcript_message or SimpleNamespace(guild_id=guild_id, guild=None),
             channel_prompt=channel_prompt, auto_skill=auto_skill)
+        # Voice controls must reach the deterministic hooks while old speech is playing,
+        # rather than waiting behind the base adapter's active-session queue.
+        with self._profile_scope_for_source(source):
+            event = await self._hm_pre_gateway_dispatch_hook(event, source)
+        if event is None:
+            return
+        event.metadata = {**(event.metadata or {}), "_voice_pre_dispatch_done": True}
         await adapter.handle_message(event)
 
     def _should_send_voice_reply(
@@ -452,7 +473,22 @@ class GatewayVoiceMixin:
     def _should_echo_stt_transcripts(self) -> bool:
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
-    async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
+    async def _send_queued_voice_reply(self, ctx, adapter, result, text) -> None:
+        """Queued voice replies bypass base auto-TTS; speak their final text once."""
+        if not getattr(ctx, "voice_input", False) or adapter is None or result.get("voice_reply_delivered"):
+            return
+        if adapter._streaming_tts_turn_completed(ctx.session_key, ctx.run_generation):
+            return
+        event = MessageEvent(
+            source=ctx.source, text="", message_type=MessageType.VOICE,
+            raw_message=SimpleNamespace(guild_id=getattr(ctx.source, "guild_id", None)),
+        )
+        if not self._should_send_voice_reply(event, text, result.get("messages") or [], already_sent=True):
+            return
+        if await self._send_voice_reply(event, text):
+            result["voice_reply_delivered"] = True
+
+    async def _send_voice_reply(self, event: MessageEvent, text: str) -> bool:
         """Generate TTS audio and send as a voice message before the text reply. The TTS tool
         may return one combined file or several separately valid ones (combination unavailable /
         over a platform limit); legacy single-file results keep working."""
@@ -462,7 +498,7 @@ class GatewayVoiceMixin:
             from tools.tts_tool import text_to_speech_tool
             tts_text = _strip_markdown_for_tts(text)
             if not tts_text:
-                return
+                return False
             # Platforms whose native voice bubbles require Ogg/Opus (OPUS_VOICE_PLATFORMS) get an
             # explicit .ogg path; the TTS tool's container repair guarantees real Ogg/Opus bytes.
             audio_path = build_auto_tts_output_path(event.source.platform)
@@ -473,16 +509,18 @@ class GatewayVoiceMixin:
             except (json.JSONDecodeError, TypeError):
                 logger.warning("Auto voice reply TTS returned invalid JSON: %s",
                                raw[:200] if raw else raw)
-                return
+                return False
             candidates = result.get("file_paths") or [result.get("file_path", audio_path)]
             paths = [str(p) for p in candidates if p and os.path.isfile(p)]
             if not result.get("success") or not paths:
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
-                return
+                return False
             actual_paths = paths
             await self._deliver_voice_reply(event, actual_paths)
+            return True
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
+            return False
         finally:
             for p in ({audio_path, *actual_paths} - {None}):
                 with suppress(OSError):

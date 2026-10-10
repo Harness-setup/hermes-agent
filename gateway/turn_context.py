@@ -15,6 +15,8 @@ from typing import Any, Callable, List, Optional
 class TurnContext:
     # read-only turn identity / wiring
     source: Any = None
+    voice_phrase_turn: Any = None
+    voice_input: bool = False
     reply_expected: Optional[bool] = None
     # Scheduled heartbeats are proactive work, not replies to the source message that
     # registered the watch.  Their routine delivery surfaces stay quiet.

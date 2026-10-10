@@ -2645,6 +2645,7 @@ export interface PromptSubmitParams {
   interrupted?: boolean | null
   queued?: boolean | null
   surface?: string | null
+  overlay_producer?: string | null
   voice_context?: string | null
   title_preview?: string | null
   truncate_before_user_ordinal?: number | null

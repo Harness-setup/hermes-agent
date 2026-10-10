@@ -21,9 +21,10 @@ from agent.session_activity import format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
+from gateway.run_turn_context import GatewayTurnContextMixin
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
+from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome, MessageType
 from gateway.platforms.event import MessageEvent
 from gateway.response_filters import (
     display_kind_for_event, is_machinery_display_kind, reply_expected_metadata, silence_allowed,
@@ -165,7 +166,7 @@ def hygiene_no_commit_reason(agent) -> str:
     return "in-place commit did not complete"
 
 
-class GatewayTurnMixin:
+class GatewayTurnMixin(GatewayTurnContextMixin):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
     def _resolve_session_agent_runtime(
@@ -1935,7 +1936,7 @@ class GatewayTurnMixin:
         _streaming_tts_done = adapter is not None and bool(
             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
         )
-        if not _streaming_tts_done and self._should_send_voice_reply(
+        if not _streaming_tts_done and not agent_result.get("voice_reply_delivered") and self._should_send_voice_reply(
             event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
             await self._send_voice_reply(event, response)
@@ -1975,6 +1976,8 @@ class GatewayTurnMixin:
         turn once and close it, and build the sanitized user-facing error reply."""
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
+        from gateway.voice_phrases import speak_event_phrase
+        await speak_event_phrase(self, source, "assistant_error", voice_input=event.message_type == MessageType.VOICE)
         logger.exception("Agent error in session %s", session_key)
         status_code = getattr(e, "status_code", None)
         if status_code in {400, 500} and len(prepared.history) > 50:
@@ -2757,7 +2760,7 @@ class GatewayTurnMixin:
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],
         source: "SessionSource", session_id: str, session_key: str = None,
         run_generation: Optional[int] = None, event_message_id: Optional[str] = None,
-        scheduled_heartbeat: bool = False,
+        scheduled_heartbeat: bool = False, voice_input: bool = False,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of running a local AIAgent.
 
@@ -2773,7 +2776,6 @@ class GatewayTurnMixin:
         if not proxy_url:
             return self._proxy_error_result(t("gateway.proxy.url_missing"))
 
-        # The proxy key is a per-profile credential: honor the installed secret scope under multiplex.
         # Only UnscopedSecretError (the unscoped default-profile path) falls back to the env; any
         # other get_secret() error propagates (same as BASE) rather than silently degrading to the
         # ambient key, which may hold another profile's credential.
@@ -2796,14 +2798,14 @@ class GatewayTurnMixin:
                 "history_offset": len(history), "session_id": session_id, "response_previewed": False,
             }
 
-        # OpenAI chat format. The remote keeps continuity via X-Hermes-Session-Id; send the current
-        # message plus a compact text-only history for a remote that has none yet.
+        # The remote keeps continuity via X-Hermes-Session-Id; include history for a fresh remote.
         api_messages: List[Dict[str, str]] = [{"role": "system", "content": context_prompt}] if context_prompt else []
         api_messages += [
             {"role": msg.get("role"), "content": msg.get("content")}
             for msg in history if msg.get("role") in {"user", "assistant"} and msg.get("content")
         ]
-        api_messages.append({"role": "user", "content": message})
+        from gateway.voice_phrases import spoken_turn_message
+        api_messages.append({"role": "user", "content": spoken_turn_message(message, voice_input, source.platform, self._voice_mode.get(self._voice_key_for_source(source)))})
 
         headers: Dict[str, str] = {"Content-Type": "application/json"}
         if proxy_key:
@@ -2811,6 +2813,7 @@ class GatewayTurnMixin:
         if session_id:
             headers["X-Hermes-Session-Id"] = session_id
         body = {"model": "hermes-agent", "messages": api_messages, "stream": True}
+        body.update(self._proxy_turn_reasoning(source, session_key, voice_input))
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
         _stream_consumer = (
@@ -2846,6 +2849,8 @@ class GatewayTurnMixin:
             except (json.JSONDecodeError, TypeError, AttributeError, IndexError):
                 return False
             if content:
+                from gateway.voice_phrases import proxy_answer_started
+                proxy_answer_started(self, session_key)
                 full_response += content
                 if _stream_consumer:
                     _stream_consumer.on_delta(content)
@@ -3060,57 +3065,6 @@ class GatewayTurnMixin:
         "user_config", "enabled_toolsets", "disabled_toolsets", "log_mode_enabled",
         "interim_assistant_messages_enabled", "needs_progress_queue", "_native_slack_task_cards",
     )
-
-    def _run_agent_build_turn_context(
-        self, disp: "GatewayRunner._RunAgentDisplay", AIAgent: Any, *, message: str, source: SessionSource,
-        session_key: Optional[str], run_generation: Optional[int], **turn_params,
-    ) -> Tuple[TurnContext, TurnRunner, Any]:
-        """Build the ``TurnContext`` and its ``TurnRunner``; ``turn_params`` (history, context_prompt,
-        session_id, persist_user_*, …) are stored verbatim. Returns ``(turn_ctx, turn_runner,
-        cleanup_adapter)``."""
-        from gateway.run_turn_runner import TurnRunner
-        # Discord voice "verbal ack" on the FIRST tool call (discord.voice_fx.enabled): resolve the
-        # guild whose voice connection is bound to this text channel (mirrors DiscordAdapter.play_tts).
-        _voice_ack_guild: List[Optional[int]] = [None]
-        if source.platform == Platform.DISCORD:
-            _va = self.adapters.get(Platform.DISCORD)
-            _vtc = getattr(_va, "_voice_text_channels", None)
-            if isinstance(_vtc, dict) and hasattr(_va, "voice_mixer_active"):
-                _voice_ack_guild[0] = next(
-                    (_gid for _gid, _tc in _vtc.items() if str(_tc) == str(source.chat_id) and _va.voice_mixer_active(_gid)),
-                    None,
-                )
-
-        # Auto-cleanup of temporary progress bubbles needs a real ``delete_message`` (getattr on the
-        # type: a fake adapter without it means "can't delete", not a crash).
-        _cleanup_progress = bool(
-            disp.resolve_display_setting(disp.user_config, disp.platform_key, "cleanup_progress")
-        )
-        _cleanup_adapter = self._delivery_adapter_for(source) if _cleanup_progress else None
-        if _cleanup_adapter is not None and getattr(type(_cleanup_adapter), "delete_message", None) in (
-            None, BasePlatformAdapter.delete_message,
-        ):
-            _cleanup_progress = False
-            _cleanup_adapter = None
-
-        # The one-slot progress/holder containers shared with the callbacks are TurnContext defaults.
-        turn_ctx = TurnContext(
-            source=source, message=message, AIAgent=AIAgent, session_key=session_key,
-            run_generation=run_generation, _cleanup_progress=_cleanup_progress,
-            _run_still_current=self._run_still_current_fn(session_key, run_generation),
-            progress_queue=queue.Queue() if disp.needs_progress_queue else None,
-            _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
-            **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
-        )
-        turn_runner = TurnRunner(self, turn_ctx)
-        turn_ctx.mute_notification_reply = diagnostic_turn_muted(
-            turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config)
-        # Agent tool-lifecycle callbacks live on the runner (bound methods, same signatures).
-        turn_ctx.progress_callback = turn_runner.progress_callback
-        turn_ctx.voice_ack_callback = turn_runner.voice_ack_callback
-        turn_ctx.native_tool_start_callback = turn_runner.combined_tool_start_callback
-        turn_ctx.native_tool_complete_callback = turn_runner.native_tool_complete_callback
-        return turn_ctx, turn_runner, _cleanup_adapter
 
     def _thread_metadata_for_progress(
         self, source: SessionSource, event_message_id: Optional[str], _progress_thread_id: Any,
@@ -3807,6 +3761,12 @@ class GatewayTurnMixin:
                     # The queued lane already uploaded this response's MEDIA: attachments; without
                     # this the completion path's already_sent rescan uploads every file twice.
                     result["media_already_delivered"] = _deliver_media
+
+            # This lane sends directly, so the base adapter's auto-TTS path never runs.
+            with suppress(Exception):
+                await self._send_queued_voice_reply(turn_ctx, adapter, _delivery_result, first_response)
+                if _delivery_result.get("voice_reply_delivered") and isinstance(result, dict):
+                    result["voice_reply_delivered"] = True
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):
@@ -4285,12 +4245,23 @@ class GatewayTurnMixin:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
+        voice_input = source.platform == Platform.DISCORD and str(getattr(message_type, "value", message_type)).lower() == "voice"
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
-                message=message, context_prompt=context_prompt, history=history, source=source,
-                session_id=session_id, session_key=session_key, run_generation=run_generation,
-                event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
-            )
+            from gateway.voice_phrases import make_voice_phrase_turn
+            phrases = make_voice_phrase_turn(
+                self, source, voice_input and not scheduled_heartbeat,
+                self._run_still_current_fn(session_key, run_generation), session_key)
+            try:
+                if phrases is not None:
+                    await phrases.start()
+                return await self._run_agent_via_proxy(
+                    message=message, context_prompt=context_prompt, history=history, source=source,
+                    session_id=session_id, session_key=session_key, run_generation=run_generation,
+                    event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat, voice_input=voice_input,
+                )
+            finally:
+                if phrases is not None:
+                    await phrases.close()
 
         from run_agent import AIAgent
 
@@ -4321,6 +4292,12 @@ class GatewayTurnMixin:
             persist_user_display_metadata=persist_user_display_metadata,
             scheduled_heartbeat=scheduled_heartbeat,
         )
+        turn_ctx.voice_input = voice_input
+        from gateway.voice_phrases import make_voice_phrase_turn
+        if not (scheduled_heartbeat or turn_ctx.mute_notification_reply):
+            turn_ctx.voice_phrase_turn = make_voice_phrase_turn(
+                self, source, voice_input, turn_ctx._run_still_current, session_key)
+
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
@@ -4329,7 +4306,6 @@ class GatewayTurnMixin:
             self._run_agent_start_streaming_tts(
                 source, message_type, _status_thread_metadata, turn_ctx.streaming_tts_consumer_holder,
             )
-
         # Progress sender drains BOTH tool-progress lines and thinking bubbles (needs_progress_queue).
         spawn = asyncio.create_task
         progress_task = spawn(turn_runner.send_progress_messages()) if disp.needs_progress_queue else None
@@ -4347,10 +4323,17 @@ class GatewayTurnMixin:
         )
 
         try:
+            if turn_ctx.voice_phrase_turn is not None:
+                await turn_ctx.voice_phrase_turn.start()
             # run_sync is TurnRunner.run_sync (bound method; executor call unchanged).
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running
             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+            if turn_ctx.voice_phrase_turn is not None:
+                await turn_ctx.voice_phrase_turn.close()
+                if isinstance(response, dict) and (response.get("error") or str(response.get("final_response", "")).startswith("Error:")):
+                    from gateway.voice_phrases import speak_event_phrase
+                    await speak_event_phrase(self, source, "assistant_error", voice_input=True)
             if isinstance(response, dict):
                 response["_notification_reply_muted"] = turn_ctx.mute_notification_reply
             self._run_agent_evict_on_fallback(turn_ctx)
@@ -4365,6 +4348,8 @@ class GatewayTurnMixin:
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )
         finally:
+            if turn_ctx.voice_phrase_turn is not None:
+                await turn_ctx.voice_phrase_turn.close()
             await self._run_agent_cleanup_turn_tasks(
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,
                 _notify_task=_notify_task, tracking_task=tracking_task, stream_task=stream_task,

@@ -114,3 +114,18 @@ async def test_base_auto_tts_skips_playback_when_tool_reports_failure():
     adapter.play_tts.assert_not_awaited()
     # Text reply still goes out.
     assert adapter.sent and adapter.sent[0]["content"] == "reply text"
+
+
+@pytest.mark.asyncio
+async def test_discord_text_arrives_before_synthesis_and_playback():
+    adapter = _DummyAdapter(Platform.DISCORD)
+    adapter._keep_typing = _hold_typing()
+    adapter._should_auto_tts_for_chat = lambda _chat_id: True
+    adapter.set_message_handler(lambda _event: asyncio.sleep(0, result='final answer'))
+    event = _make_voice_event(Platform.DISCORD)
+    async def synthesize(text):
+        assert adapter.sent[0]['content'] == 'final answer'
+        return [], None
+    adapter._synthesize_auto_tts = synthesize
+    await adapter._process_message_background(event, build_session_key(event.source))
+    assert len(adapter.sent) == 1

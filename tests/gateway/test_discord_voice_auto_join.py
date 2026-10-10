@@ -162,3 +162,163 @@ class TestHandleVoiceAutoJoin:
 
         # Must not raise -- this is fire-and-forget from the adapter's event handler.
         await runner._handle_voice_auto_join(SimpleNamespace(), _member(), _channel())
+
+
+@pytest.mark.asyncio
+async def test_owner_greeting_duplicates_departure_and_guild_isolation(monkeypatch):
+    import asyncio
+    from plugins.platforms.discord import adapter_voice_playback as playback
+    adapter = _make_adapter()
+    adapter._owner_profile = 'test-profile'
+    channels = [SimpleNamespace(id=10, guild=SimpleNamespace(id=1)),
+                SimpleNamespace(id=20, guild=SimpleNamespace(id=2))]
+    member = SimpleNamespace(id=42, guild=channels[0].guild)
+    for ch in channels:
+        adapter._voice_clients[ch.guild.id] = SimpleNamespace(is_connected=lambda: True, channel=ch)
+        adapter._voice_text_channels[ch.guild.id] = 100 + ch.guild.id
+    spoken = []
+    async def speak(*args, **kwargs):
+        spoken.append(args[2])
+    monkeypatch.setattr('gateway.voice_phrases.speak_phrase', speak)
+    from gateway.voice_profile import DEFAULT_PHRASES
+    monkeypatch.setattr('gateway.voice_profile.resolve_voice_profile', lambda: {'phrases': DEFAULT_PHRASES})
+    adapter.claim_voice_owner(member, channels[0])
+    adapter.claim_voice_owner(member, channels[0])
+    await adapter._voice_greetings[1]
+    await adapter._handle_voice_owner_state(member, _voice_state(), _voice_state(channels[0]))
+    assert len(spoken) == 1
+    second = SimpleNamespace(id=99, guild=channels[1].guild)
+    adapter.claim_voice_owner(second, channels[1])
+    await adapter._voice_greetings[2]
+    adapter.discard_pending_voice_input = lambda gid: order.append(('discard', gid))
+    adapter._on_voice_disconnect = lambda chat: order.append(('cleanup', chat))
+    adapter.leave_voice_channel = AsyncMock(side_effect=lambda gid: order.append(('leave', gid)))
+    order = []
+    unrelated = SimpleNamespace(id=7, guild=member.guild)
+    await adapter._handle_voice_owner_state(unrelated, _voice_state(channels[0]), _voice_state())
+    assert order == []
+    # Others still present does not change the owner's departure rule.
+    channels[0].members = [unrelated]
+    await adapter._handle_voice_owner_state(member, _voice_state(channels[0]), _voice_state(channels[1]))
+    assert order == [('discard', 1), ('cleanup', '101'), ('leave', 1)]
+    assert adapter._voice_owners[2][0] == 99
+
+
+@pytest.mark.asyncio
+async def test_failed_connection_cannot_claim_owner(monkeypatch):
+    adapter = _make_adapter()
+    channel = SimpleNamespace(id=10, guild=SimpleNamespace(id=1))
+    adapter.claim_voice_owner(SimpleNamespace(id=42), channel)
+    assert not adapter._voice_owners
+    assert not adapter._voice_greetings
+
+
+@pytest.mark.asyncio
+async def test_owner_departure_uses_real_leave_without_flushing_speech(monkeypatch):
+    from unittest.mock import MagicMock
+    from gateway.voice_profile import DEFAULT_PHRASES
+    monkeypatch.setattr('gateway.voice_profile.resolve_voice_profile', lambda: {'phrases': DEFAULT_PHRASES})
+    monkeypatch.setattr('gateway.voice_phrases.speak_phrase', AsyncMock())
+    adapter = _make_adapter()
+    adapter._client = SimpleNamespace(get_guild=lambda gid: SimpleNamespace())
+    channel = SimpleNamespace(id=10, guild=SimpleNamespace(id=1), members=[SimpleNamespace(id=7)])
+    vc = MagicMock()
+    vc.channel = channel
+    vc.is_connected.return_value = True
+    vc.is_playing.return_value = True
+    vc.disconnect = AsyncMock()
+    adapter._voice_clients[1] = vc
+    adapter._voice_text_channels[1] = 101
+    receiver = MagicMock()
+    # Even speech captured after discard must not become a leave-flush response.
+    receiver.flush_pending.return_value = [(42, b'pending')]
+    adapter._voice_receivers[1] = receiver
+    adapter._process_voice_input = AsyncMock()
+    from gateway.run import GatewayRunner
+    runner = object.__new__(GatewayRunner)
+    runner._voice_mode = {'discord:101': 'all'}
+    runner._voice_phrase_turns = {}
+    runner._save_voice_modes = MagicMock()
+    adapter._on_voice_disconnect = MagicMock(side_effect=lambda chat: runner._handle_voice_timeout_cleanup(chat, adapter=adapter))
+    member = SimpleNamespace(id=42, guild=channel.guild)
+    adapter.claim_voice_owner(member, channel)
+    await adapter._handle_voice_owner_state(member, _voice_state(channel), _voice_state())
+    receiver.discard_pending.assert_called_once()
+    adapter._process_voice_input.assert_not_awaited()
+    vc.stop.assert_called_once()
+    vc.disconnect.assert_awaited_once()
+    adapter._on_voice_disconnect.assert_called_once_with('101')
+    assert runner._voice_mode['discord:101'] == 'off'
+    runner._save_voice_modes.assert_called_once()
+    assert '101' in adapter._auto_tts_disabled_chats
+    assert not adapter._voice_owners
+    assert not adapter._voice_greetings
+
+
+@pytest.mark.asyncio
+async def test_duplicate_join_events_connect_and_greet_once(monkeypatch):
+    import asyncio
+    from unittest.mock import MagicMock
+    from plugins.platforms.discord import adapter as discord
+    from plugins.platforms.discord.adapter_voice_playback import handle_voice_state_update
+    from gateway.voice_profile import DEFAULT_PHRASES
+    adapter = _make_adapter()
+    adapter._client = SimpleNamespace(user=SimpleNamespace(id=999))
+    guild = SimpleNamespace(id=1)
+    channel = SimpleNamespace(id=10, name='General', guild=guild)
+    member = SimpleNamespace(id=42, display_name='Tony', bot=False, guild=guild)
+    connected = asyncio.Event()
+    release = asyncio.Event()
+    vc = MagicMock()
+    vc.channel = channel
+    vc.is_connected.return_value = True
+    async def connect():
+        connected.set()
+        await release.wait()
+        return vc
+    channel.connect = AsyncMock(side_effect=connect)
+    monkeypatch.setattr(discord, 'DISCORD_AVAILABLE', True)
+    monkeypatch.setattr(discord, 'VoiceReceiver', MagicMock())
+    monkeypatch.setattr(adapter, '_voice_listen_loop', AsyncMock())
+    monkeypatch.setattr(adapter, '_reset_voice_timeout', MagicMock())
+    monkeypatch.setattr('gateway.voice_profile.resolve_voice_profile', lambda: {'phrases': DEFAULT_PHRASES})
+    speak = AsyncMock()
+    monkeypatch.setattr('gateway.voice_phrases.speak_phrase', speak)
+    async def auto_join(adapter, member, channel):
+        assert await adapter.join_voice_channel(channel, text_channel_id=101)
+        adapter.claim_voice_owner(member, channel)
+    adapter._voice_auto_join_handler = auto_join
+    events = [asyncio.create_task(handle_voice_state_update(adapter, member, _voice_state(), _voice_state(channel)))
+              for _ in range(2)]
+    await asyncio.wait_for(connected.wait(), 2)
+    release.set()
+    await asyncio.gather(*events)
+    await adapter._voice_greetings[1]
+    channel.connect.assert_awaited_once()
+    speak.assert_awaited_once()
+    assert adapter._voice_owners == {1: (42, 10)}
+
+
+@pytest.mark.asyncio
+async def test_owner_reentry_greets_and_profile_connections_are_isolated(monkeypatch):
+    from gateway.voice_profile import DEFAULT_PHRASES
+    from unittest.mock import MagicMock
+    monkeypatch.setattr('gateway.voice_profile.resolve_voice_profile', lambda: {'phrases': DEFAULT_PHRASES})
+    speak = AsyncMock()
+    monkeypatch.setattr('gateway.voice_phrases.speak_phrase', speak)
+    first, second = _make_adapter(), _make_adapter()
+    channel = SimpleNamespace(id=10, guild=SimpleNamespace(id=1))
+    owner = SimpleNamespace(id=42, guild=channel.guild)
+    for adapter, user in [(first, owner), (second, SimpleNamespace(id=99))]:
+        adapter._voice_clients[1] = SimpleNamespace(is_connected=lambda: True, channel=channel)
+        adapter._voice_text_channels[1] = 101
+        adapter.claim_voice_owner(user, channel)
+        await adapter._voice_greetings[1]
+    # A retained connected owner who comes back gets another greeting, exactly once.
+    first._voice_owner_channels[1] = None
+    await first._handle_voice_owner_state(owner, _voice_state(), _voice_state(channel))
+    await first._voice_greetings[1]
+    await first._handle_voice_owner_state(owner, _voice_state(), _voice_state(channel))
+    assert speak.await_count == 3
+    assert second._voice_owners == {1: (99, 10)}
+    assert first._spoken_phrase_picker is not second._spoken_phrase_picker

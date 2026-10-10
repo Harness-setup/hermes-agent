@@ -143,8 +143,8 @@ _NATIVE_SLASH_COMMAND_SPECS: tuple = (
     ("reload-skills", "platform.discord.command.reload_skills.description", (), "/reload-skills", None),
     ("voice", "platform.discord.command.voice.description",
      (("mode", str, "", "platform.discord.command.voice.arg_mode",
-       # `join` and `channel` both hit _handle_voice_channel_join; expose both to match docs.
-       (("platform.discord.command.voice.choice_join", "join"), ("platform.discord.command.voice.choice_channel", "channel"),
+       # Manual join is optional when automatic joining is configured.
+       (("platform.discord.command.voice.choice_join", "join"),
         ("platform.discord.command.voice.choice_leave", "leave"), ("platform.discord.command.voice.choice_mode_on", "on"),
         ("platform.discord.command.voice.choice_tts", "tts"), ("platform.discord.command.voice.choice_mode_off", "off"),
         ("platform.discord.command.voice.choice_status", "status"))),),
@@ -820,7 +820,7 @@ class VoiceReceiver:
     """Captures voice audio from a Discord voice channel: hooks the VoiceClient socket, decrypts
     RTP (NaCl + DAVE E2EE), decodes Opus per user; a polling loop delivers utterances on silence."""
 
-    SILENCE_THRESHOLD = 1.5    # seconds of silence → end of utterance
+    SILENCE_THRESHOLD = 0.8    # seconds of silence → end of utterance
     MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
@@ -1209,14 +1209,24 @@ class VoiceReceiver:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
             self._decode_ok += 1
-            with self._lock:
-                self._buffers[ssrc].extend(pcm)
-                self._last_packet_time[ssrc] = time.monotonic()
+            self._buffer_pcm(ssrc, pcm)
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
             logger.debug("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)
             return
+
+    def _buffer_pcm(self, ssrc: int, pcm: bytes) -> None:
+        """Quiet RTP frames must not postpone the end of a spoken utterance."""
+        from array import array
+        samples = array("h", pcm)
+        audible = bool(samples) and sum(value * value for value in samples) / len(samples) >= 35 ** 2
+        with self._lock:
+            if audible:
+                self._buffers[ssrc].extend(pcm)
+                self._last_packet_time[ssrc] = time.monotonic()
+            elif self._buffers.get(ssrc):
+                self._buffers[ssrc].extend(pcm)
 
     # --- Silence detection ---
 
@@ -1448,10 +1458,16 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         # from the reasoning/final-answer main-chat send path. Not persisted: a fresh process
         # just creates a new thread on the next tool call, which is fine (#discord-thread-split).
         self._tool_progress_threads: Dict[str, Any] = {}
+        self._tool_progress_locks = {}
+        self._closed_tool_progress_turns = {}
         # Set by the runner via set_voice_auto_join_handler (discord.auto_join_voice) --
         # async (adapter, member, channel) -> None. None until wired, and always None on
         # platforms/tests that never call the setter.
         self._voice_auto_join_handler: Optional[Any] = None
+        self._voice_owners = {}
+        self._voice_owner_channels = {}
+        self._voice_greetings = {}
+        self._voice_owner_departing = set()
         self._semantic_thread_renames = SemanticThreadRenames()
         # Persistent typing loops per channel (DMs don't reliably show bot typing events).
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -1729,51 +1745,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
-                """Track voice channel join/leave events; auto-join a real human's channel first
-                when discord.auto_join_voice is on and the bot isn't already connected there."""
-                auto_join_channel = adapter_self._voice_auto_join_target(member, before, after)
-                if auto_join_channel is not None:
-                    try:
-                        await adapter_self._voice_auto_join_handler(adapter_self, member, auto_join_channel)
-                    except Exception as e:
-                        logger.warning("[%s] voice auto-join handler failed: %s", adapter_self.name, e)
-                bot_guild_ids = set(adapter_self._voice_clients.keys())
-                if not bot_guild_ids:
-                    return
-                guild_id = member.guild.id
-                if guild_id not in bot_guild_ids:
-                    return
-                if member == adapter_self._client.user:
-                    return
-                joined = before.channel is None and after.channel is not None
-                left = before.channel is not None and after.channel is None
-                switched = (
-                    before.channel is not None
-                    and after.channel is not None
-                    and before.channel != after.channel
-                )
-                if joined or left or switched:
-                    logger.info(
-                        "Voice state: %s (%d) %s (guild %d)",
-                        member.display_name,
-                        member.id,
-                        "joined " + after.channel.name if joined
-                        else "left " + before.channel.name if left
-                        else f"moved {before.channel.name} -> {after.channel.name}",
-                        guild_id,
-                    )
-                    # Any membership change in the bot's channel bumps the
-                    # DAVE (E2EE) epoch — re-resolve the receiver's decryption
-                    # state so it never decodes against a stale session.
-                    vc = adapter_self._voice_clients.get(guild_id)
-                    receiver = adapter_self._voice_receivers.get(guild_id)
-                    if vc is not None and receiver is not None:
-                        bot_channel = getattr(vc, "channel", None)
-                        if bot_channel is not None and (
-                            before.channel == bot_channel
-                            or after.channel == bot_channel
-                        ):
-                            receiver.refresh_credentials("membership change")
+                from plugins.platforms.discord.adapter_voice_playback import handle_voice_state_update
+                await handle_voice_state_update(adapter_self, member, before, after)
 
             # Register slash commands
             if self._slash_commands:
@@ -3388,8 +3361,10 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for final reaction and durable state."""
+        await self._archive_tool_progress_thread(event.message_id)
+        if _reply_anchor_for_event(event) != event.message_id:
+            await self._archive_tool_progress_thread(_reply_anchor_for_event(event))
         await asyncio.to_thread(self._record_discord_processing_complete, event, outcome)
-        await self._archive_tool_progress_thread(_reply_anchor_for_event(event))
         if not self._reactions_enabled():
             return
         message = event.raw_message
@@ -3777,11 +3752,14 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
 
     async def play_tts(self, chat_id: str, audio_path: str, **kwargs) -> SendResult:
         """Play auto-TTS audio: in the guild's VC if joined, else as a file attachment."""
+        allowed = kwargs.pop("allowed", None)
         for gid, text_ch_id in self._voice_text_channels.items():
             if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
                 logger.info("[%s] Playing TTS in voice channel (guild=%d)", self.name, gid)
-                success = await self.play_in_voice_channel(gid, audio_path)
+                success = await self.play_in_voice_channel(gid, audio_path, allowed=allowed)
                 return SendResult(success=success)
+        if allowed is not None:  # fixed turn phrases belong only in the connected voice channel
+            return SendResult(success=False)
         return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
 
 
@@ -4023,10 +4001,17 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
+            self._voice_owners.pop(guild_id, None)
+            self._voice_owner_channels.pop(guild_id, None)
+            greeting = self._voice_greetings.pop(guild_id, None)
+            if greeting is not None:
+                greeting.cancel()
             receiver = self._voice_receivers.pop(guild_id, None)
             pending_inputs = []
             if receiver:
                 pending_inputs = receiver.flush_pending()
+                if guild_id in self._voice_owner_departing:
+                    pending_inputs = []
                 receiver.stop()
             listen_task = self._voice_listen_tasks.pop(guild_id, None)
             if listen_task:
@@ -4053,78 +4038,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
 
-    async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
-        """Play audio in the VC: via the mixer (layered over the ambient bed, ducking it)
-        when installed, else the legacy one-shot FFmpegPCMAudio path."""
-        vc = self._voice_clients.get(guild_id)
-        if not vc or not vc.is_connected():
-            return False
-        # Playback counts as activity: suspend the inactivity timer, re-arm in finally.
-        self._cancel_voice_timeout(guild_id)
-        try:
-            playback_timeout = await self._playback_timeout_for_audio(audio_path)
-            # ── Mixer path (overlap + ducking) ──────────────────────────────
-            mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
-            if mixer is not None:
-                decode_to_pcm = _voice_mixer_module().decode_to_pcm
-                pcm = await asyncio.to_thread(decode_to_pcm, audio_path)
-                if pcm:
-                    speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
-                    mixer.play_speech(self._lead_silence_bytes() + pcm, gain=speech_gain)
-                    # Block until speech drains so callers serialise replies; ambient keeps playing.
-                    wait_start = time.monotonic()
-                    while mixer.speech_active:
-                        if time.monotonic() - wait_start > playback_timeout:
-                            logger.warning("Mixer speech playback timed out after %.1fs", playback_timeout)
-                            mixer.stop_speech()
-                            break
-                        await asyncio.sleep(0.05)
-                    return True
-                logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
-            # Legacy one-shot path: pause receiver while playing (echo prevention).
-            receiver = self._voice_receivers.get(guild_id)
-            if receiver:
-                receiver.pause()
-            try:
-                wait_start = time.monotonic()
-                while vc.is_playing():
-                    if time.monotonic() - wait_start > playback_timeout:
-                        logger.warning("Timed out waiting for previous playback to finish")
-                        vc.stop()
-                        break
-                    await asyncio.sleep(0.1)
-                done = asyncio.Event()
-                loop = asyncio.get_running_loop()
-
-                def _after(error):
-                    if error:
-                        logger.error("Voice playback error: %s", error)
-                    loop.call_soon_threadsafe(done.set)
-                # Lead silence so socket warm-up doesn't clip the first word (mirrors mixer path).
-                ffmpeg_opts: Dict[str, Any] = {}
-                _fx_cfg = getattr(self, "_voice_fx_cfg", None) or {}
-                try:
-                    lead_ms = int(_fx_cfg.get("lead_silence_ms", 0) or 0)
-                except (TypeError, ValueError):
-                    lead_ms = 0
-                if lead_ms > 0:
-                    ffmpeg_opts["options"] = f"-af adelay={lead_ms}:all=1"
-                source = discord.FFmpegPCMAudio(
-                    audio_path, executable=resolve_ffmpeg_executable(), **ffmpeg_opts,
-                )
-                source = discord.PCMVolumeTransformer(source, volume=1.0)
-                vc.play(source, after=_after)
-                try:
-                    await asyncio.wait_for(done.wait(), timeout=playback_timeout)
-                except asyncio.TimeoutError:
-                    logger.warning("Voice playback timed out after %.1fs", playback_timeout)
-                    vc.stop()
-                return True
-            finally:
-                if receiver:
-                    receiver.resume()
-        finally:
-            self._reset_voice_timeout(guild_id)
+    async def play_in_voice_channel(self, guild_id: int, audio_path: str, *, allowed=None) -> bool:
+        from plugins.platforms.discord.adapter_voice_playback import play_in_voice_channel
+        return await play_in_voice_channel(self, guild_id, audio_path, allowed=allowed)
 
     async def get_user_voice_channel(self, guild_id: int, user_id: str):
         """Return the voice channel the user is currently in, or None."""
@@ -4242,6 +4158,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
     async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes, captured_for: int | None):
         """Convert PCM -> WAV -> STT -> callback; dropped if the binding moved off *captured_for* during STT."""
         from tools.voice_mode_transcript import is_whisper_hallucination
+        if guild_id in self._voice_owner_departing:
+            return
         tmp_f = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_listen_", delete=False)
         wav_path = tmp_f.name
         tmp_f.close()
@@ -4250,12 +4168,18 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             from tools.transcription_tools import transcribe_audio
             result = await asyncio.to_thread(transcribe_audio, wav_path)
             if not result.get("success"):
+                if (self._voice_input_callback and self._voice_text_channels.get(guild_id) == captured_for
+                        and guild_id not in self._voice_owner_departing
+                        and "empty transcript" not in str(result.get("error", "")).lower()):
+                    await self._voice_input_callback(
+                        guild_id=guild_id, user_id=user_id, transcript="", error="stt_error")
                 return
             transcript = result.get("transcript", "").strip()
             if not transcript or is_whisper_hallucination(transcript):
                 return
             logger.info("Voice input from user %d: %s", user_id, transcript[:100])
-            if getattr(self, "_voice_text_channels", {}).get(guild_id) != captured_for:
+            if (guild_id in self._voice_owner_departing
+                    or getattr(self, "_voice_text_channels", {}).get(guild_id) != captured_for):
                 logger.info("Dropping voice input from user %d: binding moved during transcription", user_id)
                 return
             if self._voice_input_callback:
@@ -5827,6 +5751,14 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         nothing changes for a channel/profile that hasn't opted in."""
         return self._extra_or_env_flag("thread_tool_calls", "DISCORD_THREAD_TOOL_CALLS", "false", truthy=True)
 
+    def claim_voice_owner(self, member, channel):
+        from plugins.platforms.discord.adapter_voice_playback import claim_voice_owner
+        claim_voice_owner(self, member, channel)
+
+    async def _handle_voice_owner_state(self, member, before, after):
+        from plugins.platforms.discord.adapter_voice_playback import handle_voice_owner_state
+        await handle_voice_owner_state(self, member, before, after)
+
     def _discord_auto_join_voice_enabled(self) -> bool:
         """Tony, 2026-09-22: "make it so it automatically works when I join the voice channel" --
         join Jarvis into a real human's voice channel the moment they enter one, no /voice join
@@ -5860,105 +5792,16 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         return joined_channel
 
     async def _get_or_create_tool_progress_thread(self, chat_id: str, event_message_id: Optional[str]) -> Optional[Any]:
-        """Lazily create (once per turn, cached by event_message_id) the thread tool-call progress
-        lines land in. Mirrors _auto_create_thread's retry/fallback shape, but starts from a fetched
-        message (chat_id + event_message_id) rather than a live gateway event's Message object,
-        since the progress pipeline only carries IDs, not the discord.py object."""
-        if not event_message_id:
-            return None
-        cached = self._tool_progress_threads.get(event_message_id)
-        if cached is not None:
-            return cached
-        try:
-            channel = await self._resolve_channel(chat_id)
-            if channel is None:
-                return None
-            # Tony, 2026-09-28: "does not even show threads anymore" -- root cause was a real
-            # Discord 400 (error code 50024, "Cannot execute action on this channel type"): he
-            # was chatting INSIDE an existing thread, and Discord has no nested threads, so
-            # seed_msg.create_thread() always failed. When the source channel already IS a
-            # thread, use it as-is -- no fetch_message, no create_thread, nothing that can 50024.
-            if isinstance(channel, discord.Thread):
-                self._tool_progress_threads[event_message_id] = channel
-                return channel
-            seed_msg = await channel.fetch_message(int(event_message_id))
-        except Exception as e:
-            logger.debug("[%s] tool-progress thread: couldn't fetch seed message %s: %s", self.name, event_message_id, e)
-            return None
-        thread_name = f"\U0001f6e0️ {self._derive_auto_thread_name(seed_msg.content or '')}"
-        last_error: Exception | None = None
-        for attempt in range(2):
-            try:
-                thread = await seed_msg.create_thread(name=thread_name, auto_archive_duration=60)
-                self._tool_progress_threads[event_message_id] = thread
-                return thread
-            except Exception as e:
-                last_error = e
-                if attempt == 0:
-                    await asyncio.sleep(0.75)
-        logger.warning("[%s] tool-progress thread creation failed: %s", self.name, last_error)
-        return None
+        from plugins.platforms.discord.adapter_progress_threads import get_or_create
+        return await get_or_create(self, chat_id, event_message_id)
 
     async def _archive_tool_progress_thread(self, event_message_id: Optional[str]) -> None:
-        """Tony, 2026-09-28, in order:
-        1. "they clutter my thread list" -- each tool-progress thread is keyed to (and only
-           ever reused within) the ONE message that started this turn, never a later,
-           different message, so once this turn's processing is fully done nothing will ever
-           post to it again. First fix: archive it right away instead of waiting for
-           Discord's 60-minute auto-archive timeout (the shortest duration its API allows).
-        2. "I need to look at the thread in order for it to go away" -- archiving alone
-           doesn't clear it: Discord's client keeps listing a thread in the channel's thread
-           list for as long as the viewing user is still a MEMBER of it, regardless of
-           archived state, until they open (and thereby read) it. Tony gets auto-added as a
-           member the moment the thread is created FROM his own message (create_thread on a
-           seed message adds that message's author). "No not deleting it archive it even
-           when I don't see it" -- keep the content (never delete), instead remove every
-           non-bot member before archiving, so nothing is tracking it as unread/theirs
-           anymore and it drops out of the list without ever being opened. Best-effort,
-           called from on_processing_complete."""
-        if not event_message_id:
-            return
-        thread = self._tool_progress_threads.pop(str(event_message_id), None)
-        if thread is None:
-            logger.debug("[%s] tool-progress thread archive: no cached thread for message %s",
-                         self.name, event_message_id)
-            return
-        removed = 0
-        try:
-            members = await thread.fetch_members()
-            bot_id = getattr(getattr(self._client, "user", None), "id", None)
-            for member in members:
-                if bot_id is not None and member.id == bot_id:
-                    continue
-                try:
-                    await thread.remove_user(member)
-                    removed += 1
-                except Exception as e:
-                    logger.warning("[%s] tool-progress thread member removal failed for %s: %s",
-                                   self.name, member.id, e)
-        except Exception as e:
-            logger.warning("[%s] tool-progress thread member fetch failed: %s", self.name, e)
-        try:
-            await thread.edit(archived=True)
-            logger.info("[%s] tool-progress thread %s archived (%d member(s) removed)",
-                        self.name, getattr(thread, "id", event_message_id), removed)
-        except Exception as e:
-            logger.warning("[%s] tool-progress thread archive failed: %s", self.name, e)
+        from plugins.platforms.discord.adapter_progress_threads import close
+        await close(self, event_message_id)
 
     async def send_tool_progress_line(self, chat_id: str, event_message_id: Optional[str], text: str) -> None:
-        """Send one tool-call progress line into the lazily-created tool-progress thread instead of
-        the main channel. Best-effort/fire-and-forget (called via _schedule from a sync callback,
-        same as play_ack_in_voice) -- a failure here must never break the turn or fall back to
-        posting the line in the main channel, since that would defeat the whole point of the split."""
-        try:
-            thread = await self._get_or_create_tool_progress_thread(chat_id, event_message_id)
-            if thread is None:
-                return
-            formatted = self.format_message(text)
-            for chunk in self._cap_split_chunks(self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)):
-                await thread.send(content=chunk)
-        except Exception as e:
-            logger.debug("[%s] tool-progress thread send failed: %s", self.name, e)
+        from plugins.platforms.discord.adapter_progress_threads import send
+        await send(self, chat_id, event_message_id, text)
 
     async def rename_thread(
         self, thread_id: str, name: str, *, only_if_current_name: Optional[str] = None,

@@ -67,7 +67,7 @@ def voice_session(monkeypatch, tmp_path):
 
     agent = types.SimpleNamespace(
         session_id="session-key", run_conversation=run_conversation, clear_interrupt=lambda: None,
-        valid_tool_names=set(), _cached_system_prompt="SYSTEM PROMPT v1")
+        valid_tool_names=set(), reasoning_config={"enabled": True}, _cached_system_prompt="SYSTEM PROMPT v1")
     session = {
         "agent": agent, "session_key": "session-key", "history": [], "history_lock": threading.Lock(),
         "history_version": 0, "running": False, "attached_images": [], "image_counter": 0, "cols": 80,
@@ -108,3 +108,16 @@ def test_voice_chat_turn_leaves_the_system_prompt_alone(voice_session):
 
     assert agent._cached_system_prompt == before == "SYSTEM PROMPT v1"
     assert "system_message" not in calls[0] and "system_prompt" not in calls[0]
+
+
+def test_jarvis_producer_is_explicit_and_does_not_leak_to_native_voice(voice_session):
+    session, calls = voice_session
+    session['agent'].reasoning_config = {'enabled': True}
+    assert 'result' in _submit('hello', surface='voice-chat', overlay_producer='jarvis')
+    assert session['agent']._overlay_producer == 'jarvis'
+    session['running'] = False
+    assert 'result' in _submit('hello again', surface='voice-chat')
+    assert session['agent']._overlay_producer == ''
+    session['running'] = False
+    assert 'result' in _submit('typed', overlay_producer='jarvis')
+    assert session['agent']._overlay_producer == ''

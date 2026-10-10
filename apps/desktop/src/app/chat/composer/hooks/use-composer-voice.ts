@@ -178,7 +178,7 @@ export function useComposerVoice({
     triggerHaptic('submit')
     resetBrowseState(sessionId)
     clearDraft()
-    await onSubmit(text)
+    await onSubmit(text, { surface: 'voice-chat' })
   }
 
   /** A GPT-Live delegation → Hermes turn. The bubble and the persisted row are

@@ -482,3 +482,105 @@ class TestArchiveToolProgressThread:
 
         thread.edit.assert_awaited_once_with(archived=True)
         assert "456" not in adapter._tool_progress_threads
+
+
+@pytest.mark.asyncio
+async def test_cancelled_redirect_cleans_original_thread(monkeypatch):
+    from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+    from gateway.session import SessionSource
+
+    adapter = _make_adapter()
+    adapter._reactions_enabled = lambda: False
+    thread = SimpleNamespace(edit=AsyncMock(), remove_user=AsyncMock(),
+                             fetch_members=AsyncMock(return_value=[_fake_thread_member(111)]))
+    adapter._tool_progress_threads['456'] = thread
+    monkeypatch.setattr(adapter, '_record_discord_processing_complete', lambda *a, **kw: None)
+    event = MessageEvent(text='task', source=SessionSource(platform=Platform.DISCORD, chat_id='123', user_id='111'),
+                         message_id='456', message_type=MessageType.TEXT)
+    event.reply_anchor_override = '789'
+    await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)
+    thread.remove_user.assert_awaited_once()
+    thread.edit.assert_awaited_once_with(archived=True)
+    await adapter.send_tool_progress_line('123', '456', 'late output')
+    assert '456' not in adapter._tool_progress_threads
+
+
+def test_redirect_keeps_progress_in_original_thread(monkeypatch):
+    adapter = SimpleNamespace(send_tool_progress_line=AsyncMock(), _discord_thread_tool_calls_enabled=lambda: True)
+    tr, ctx = _make_runner_and_ctx(adapter=adapter)
+    monkeypatch.setattr(tr, '_schedule', _closing_schedule)
+    ctx.event_message_id = '789'
+    assert tr._send_to_tool_thread('tool after redirect')
+    adapter.send_tool_progress_line.assert_called_once_with('123', '456', 'tool after redirect')
+
+
+@pytest.mark.asyncio
+async def test_stop_waits_for_thread_creation_then_removes_members():
+    import asyncio
+
+    adapter = _make_adapter()
+    entered, release = asyncio.Event(), asyncio.Event()
+    thread = SimpleNamespace(send=AsyncMock(), edit=AsyncMock(), remove_user=AsyncMock(),
+                             fetch_members=AsyncMock(return_value=[_fake_thread_member(111)]))
+    async def create(**kwargs):
+        entered.set()
+        await release.wait()
+        return thread
+    channel, seed, _ = _fake_channel_with_message()
+    seed.create_thread = create
+    adapter._client.get_channel = lambda _id: channel
+    sending = asyncio.create_task(adapter.send_tool_progress_line('123', '456', 'first'))
+    await entered.wait()
+    closing = asyncio.create_task(adapter._archive_tool_progress_thread('456'))
+    await asyncio.sleep(0)
+    late = asyncio.create_task(adapter.send_tool_progress_line('123', '456', 'late'))
+    release.set()
+    await asyncio.gather(sending, closing, late)
+    thread.remove_user.assert_awaited_once()
+    thread.edit.assert_awaited_once_with(archived=True)
+    assert thread.send.await_count == 1
+    assert '456' not in adapter._tool_progress_threads
+
+
+@pytest.mark.asyncio
+async def test_reuses_discord_thread_after_gateway_restart():
+    adapter = _make_adapter()
+    existing = SimpleNamespace(archived=True, edit=AsyncMock(), send=AsyncMock())
+    channel, seed, _ = _fake_channel_with_message()
+    seed.thread = existing
+    adapter._client.get_channel = lambda _id: channel
+    await adapter.send_tool_progress_line('123', '456', 'resumed tool')
+    existing.edit.assert_awaited_once_with(archived=False)
+    existing.send.assert_awaited_once()
+    seed.create_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_spoken_turn_tools_and_reasoning_stay_in_its_thread(monkeypatch):
+    import asyncio
+    adapter = _make_adapter()
+    adapter.config.extra['thread_tool_calls'] = True
+    channel, seed, thread = _fake_channel_with_message()
+    adapter._client.get_channel = lambda _id: channel
+    tr, ctx = _make_runner_and_ctx(adapter=adapter)
+    ctx.voice_input = True
+    ctx.inbound_message_id = '456'  # actual Discord transcript message
+    ctx.event_message_id = '789'  # final answer redirected during steering
+    tr = TurnRunner(tr._runner, ctx)
+    pending = []
+    monkeypatch.setattr(tr, '_schedule', lambda coro, *args: pending.append(asyncio.create_task(coro)))
+    tr._progress_emit('terminal: checking files')
+    assert tr._send_to_tool_thread('Reasoning display for the spoken request')
+    await asyncio.gather(*pending)
+    channel.fetch_message.assert_awaited_once_with(456)
+    seed.create_thread.assert_awaited_once()
+    assert [call.kwargs['content'] for call in thread.send.await_args_list] == [
+        'terminal: checking files', 'Reasoning display for the spoken request']
+    ctx.progress_queue.put.assert_not_called()
+
+
+def test_voice_thread_falls_back_to_reply_anchor_when_no_inbound_id():
+    tr, ctx = _make_runner_and_ctx()
+    ctx.voice_input = True
+    ctx.inbound_message_id = None
+    assert TurnRunner(tr._runner, ctx)._tool_progress_message_id == '456'

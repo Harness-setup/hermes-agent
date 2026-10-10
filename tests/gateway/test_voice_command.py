@@ -678,6 +678,10 @@ class TestDiscordVoiceChannelMethods:
         adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
+        adapter._voice_owners = {}
+        adapter._voice_owner_channels = {}
+        adapter._voice_owner_departing = set()
+        adapter._voice_greetings = {}
         adapter._voice_timeout_tasks = {}
         adapter._voice_receivers = {}
         adapter._voice_listen_tasks = {}
@@ -1034,6 +1038,10 @@ class TestVoiceTimeoutCleansRunnerState:
         adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
+        adapter._voice_owners = {}
+        adapter._voice_owner_channels = {}
+        adapter._voice_owner_departing = set()
+        adapter._voice_greetings = {}
         adapter._voice_timeout_tasks = {}
         adapter._voice_receivers = {}
         adapter._voice_listen_tasks = {}
@@ -1093,6 +1101,10 @@ class TestPlaybackTimeout:
         adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
+        adapter._voice_owners = {}
+        adapter._voice_owner_channels = {}
+        adapter._voice_owner_departing = set()
+        adapter._voice_greetings = {}
         adapter._voice_timeout_tasks = {}
         adapter._voice_receivers = {}
         adapter._voice_listen_tasks = {}
@@ -1151,6 +1163,10 @@ class TestVoiceChannelAwareness:
         adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
+        adapter._voice_owners = {}
+        adapter._voice_owner_channels = {}
+        adapter._voice_owner_departing = set()
+        adapter._voice_greetings = {}
         adapter._voice_receivers = {}
         adapter._client = MagicMock()
         adapter._client.user = SimpleNamespace(id=99999, name="HermesBot")
@@ -1327,7 +1343,7 @@ class TestVoiceReception:
     def _inject_mock_decoder(self, receiver, ssrc):
         """Pre-inject a mock Opus decoder for the given SSRC."""
         mock_decoder = MagicMock()
-        mock_decoder.decode.return_value = b"\x00" * 3840
+        mock_decoder.decode.return_value = b"\x00\x01" * 1920
         receiver._decoders[ssrc] = mock_decoder
         return mock_decoder
 
@@ -1367,6 +1383,10 @@ class TestVoiceTTSPlayback:
         adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
+        adapter._voice_owners = {}
+        adapter._voice_owner_channels = {}
+        adapter._voice_owner_departing = set()
+        adapter._voice_greetings = {}
         adapter._voice_receivers = {}
         return adapter
 
@@ -1382,7 +1402,7 @@ class TestVoiceTTSPlayback:
         adapter._voice_text_channels[111] = 123
 
         played = []
-        async def fake_play(gid, path):
+        async def fake_play(gid, path, *, allowed=None):
             played.append((gid, path))
             return True
         adapter.play_in_voice_channel = fake_play
@@ -1467,6 +1487,10 @@ class TestUDPKeepalive:
         adapter._voice_locks = {}
         adapter._voice_text_channels = {}
         adapter._voice_sources = {}
+        adapter._voice_owners = {}
+        adapter._voice_owner_channels = {}
+        adapter._voice_owner_departing = set()
+        adapter._voice_greetings = {}
         adapter._voice_receivers = {}
         adapter._voice_listen_tasks = {}
 

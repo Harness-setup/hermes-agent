@@ -4598,6 +4598,12 @@ class BasePlatformAdapter(ABC):
                 text_content, media_files = extracted.text_content, extracted.media_files
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _text_first = self.platform == Platform.DISCORD and bool(text_content)
+                if _text_first:
+                    self.pause_typing_for_chat(event.source.chat_id)
+                    await self._send_final_text(
+                        event, session_key, text_content, _final_thread_metadata,
+                        is_ephemeral_response, _ephemeral_ttl, _record_delivery)
                 _tts_paths, _tts_requested_path = [], None
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):
@@ -4627,7 +4633,7 @@ class BasePlatformAdapter(ABC):
                 if text_content or extracted.images or extracted.media_files or extracted.local_files \
                         or _tts_paths or _tts_caption_delivered:
                     self.pause_typing_for_chat(event.source.chat_id)
-                if text_content and not _tts_caption_delivered:
+                if text_content and not _tts_caption_delivered and not _text_first:
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
                         is_ephemeral_response, _ephemeral_ttl, _record_delivery)

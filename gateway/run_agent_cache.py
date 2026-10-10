@@ -518,6 +518,9 @@ class GatewayAgentCacheMixin:
                 )
             except Exception:
                 logger.debug("agent_loop_stopped hook dispatch failed", exc_info=True)
+        phrase_turn = getattr(self, "_voice_phrase_turns", {}).get(session_key)
+        if phrase_turn is not None:
+            await phrase_turn.close()
         adapter = self._delivery_adapter_for(source)
         interrupt_session_activity = getattr(type(adapter), "interrupt_session_activity", None)
         if adapter and callable(interrupt_session_activity):
@@ -526,6 +529,9 @@ class GatewayAgentCacheMixin:
                 await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
+        if running_agent and interrupt_reason == "Stop requested":
+            from gateway.voice_phrases import speak_event_phrase
+            await speak_event_phrase(self, source, "stop", voice_input=True)
         if adapter and hasattr(adapter, "get_pending_message"):
             # Discard a stale human follow-up (the slot held only user text when /stop started doing
             # this, 59575d6a917) — but an internal wake (async-delegation completion, notify+wake)
